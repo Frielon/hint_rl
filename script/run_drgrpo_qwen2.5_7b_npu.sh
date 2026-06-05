@@ -68,7 +68,7 @@ fi
 export WANDB_API_KEY="${WANDB_API_KEY:-${wandb_key:-}}"
 
 project_name='Dr-GRPO-Qwen2.5-7B-Instruct'
-exp_name='Dr-GRPO-Qwen2.5-7B-Instruct'
+exp_name="Dr-GRPO-Qwen2.5-7B-Instruct-MATH-5582-$(date +%Y%m%d-%H%M%S)"
 wandb_project=${wandb_project:-"hint_rl"}
 
 adv_estimator=grpo
@@ -79,8 +79,9 @@ use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.0
-# Dr. GRPO uses the standard symmetric PPO clip (no clip-higher / dual-clip).
-clip_ratio=0.2
+# DAPO-style asymmetric clip (clip-higher): lower clip 0.2, upper clip 0.3.
+clip_ratio_low=0.2
+clip_ratio_high=0.3
 max_prompt_length=$((1024 * 2))
 max_response_length=$((1024 * 20))
 # Dr. GRPO: sum the per-token loss and normalize by a constant (max length)
@@ -95,9 +96,9 @@ N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 
 # No dynamic-sampling oversample here, so the generation batch equals the
 # training batch (the trainer generates train_prompt_bsz prompts per step).
-train_prompt_bsz=16
+train_prompt_bsz=32
 n_resp_per_prompt=16
-train_prompt_mini_bsz=1
+train_prompt_mini_bsz=4
 
 # Ray
 VERL_HOME=${VERL_HOME:-"${PROJECT_HOME}/verl"}
@@ -110,7 +111,7 @@ WORKING_DIR=${WORKING_DIR:-"${VERL_HOME}"}
 # Paths
 MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Qwen2.5-7B-Instruct"}
 CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/debug_rl_dataset_verl.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dapo_17k.parquet"}
 TEST_FILE=${TEST_FILE:-"${HINT_RL_HOME}/dataset/aime2024.parquet"}
 
 # Custom reward function (loaded by verl via custom_reward_function.path/.name)
@@ -122,9 +123,10 @@ REWARD_FN_NAME=${REWARD_FN_NAME:-"compute_score"}
 #   - CONSOLE_LOG: full stdout/stderr of the training driver (text)
 RUN_ID=${RUN_ID:-"$(date +%Y%m%d-%H%M%S)"}
 LOG_DIR=${LOG_DIR:-"${HINT_RL_HOME}/logs"}
-LOG_FILE=${LOG_FILE:-"${LOG_DIR}/${exp_name}.jsonl"}
-CONSOLE_LOG=${CONSOLE_LOG:-"${LOG_DIR}/${exp_name}.${RUN_ID}.console.log"}
-mkdir -p "${LOG_DIR}"
+EXP_LOG_DIR=${EXP_LOG_DIR:-"${LOG_DIR}/${exp_name}"}
+LOG_FILE=${LOG_FILE:-"${EXP_LOG_DIR}/${exp_name}.jsonl"}
+CONSOLE_LOG=${CONSOLE_LOG:-"${EXP_LOG_DIR}/${exp_name}.${RUN_ID}.console.log"}
+mkdir -p "${EXP_LOG_DIR}"
 
 # Algorithm
 temperature=1.0
@@ -186,7 +188,8 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
-    actor_rollout_ref.actor.clip_ratio=${clip_ratio} \
+    actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
+    actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     actor_rollout_ref.actor.use_torch_compile=False \
     actor_rollout_ref.ref.use_torch_compile=False \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -243,7 +246,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     trainer.test_freq=5 \
     trainer.save_freq=1000000000 \
     trainer.max_actor_ckpt_to_keep=1 \
-    trainer.total_epochs=10 \
+    trainer.total_epochs=1 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.rollout_data_dir="${LOG_DIR}/${exp_name}/rollouts" \
     trainer.validation_data_dir="${LOG_DIR}/${exp_name}/val_rollouts" \

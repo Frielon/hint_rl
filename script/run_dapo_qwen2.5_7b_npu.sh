@@ -47,7 +47,7 @@ fi
 export WANDB_API_KEY="${WANDB_API_KEY:-${wandb_key:-}}"
 
 project_name='DAPO-Qwen2.5-7B-Instruct'
-exp_name='DAPO-Qwen2.5-7B-Instruct-17k'
+exp_name="DAPO-Qwen2.5-7B-Instruct-17k-$(date +%Y%m%d-%H%M%S)"
 wandb_project=${wandb_project:-"hint_rl"}
 
 adv_estimator=grpo
@@ -103,9 +103,10 @@ REWARD_FN_NAME=${REWARD_FN_NAME:-"compute_score"}
 #   - CONSOLE_LOG: full stdout/stderr of the training driver (text)
 RUN_ID=${RUN_ID:-"$(date +%Y%m%d-%H%M%S)"}
 LOG_DIR=${LOG_DIR:-"${HINT_RL_HOME}/logs"}
-LOG_FILE=${LOG_FILE:-"${LOG_DIR}/${exp_name}.jsonl"}
-CONSOLE_LOG=${CONSOLE_LOG:-"${LOG_DIR}/${exp_name}.${RUN_ID}.console.log"}
-mkdir -p "${LOG_DIR}"
+EXP_LOG_DIR=${EXP_LOG_DIR:-"${LOG_DIR}/${exp_name}"}
+LOG_FILE=${LOG_FILE:-"${EXP_LOG_DIR}/${exp_name}.jsonl"}
+CONSOLE_LOG=${CONSOLE_LOG:-"${EXP_LOG_DIR}/${exp_name}.${RUN_ID}.console.log"}
+mkdir -p "${EXP_LOG_DIR}"
 
 # Algorithm
 temperature=1.0
