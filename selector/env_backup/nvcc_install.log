@@ -1,0 +1,11 @@
+Collecting nvidia-cuda-nvcc-cu12==12.8.93
+  Downloading nvidia_cuda_nvcc_cu12-12.8.93-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl.metadata (1.7 kB)
+Collecting nvidia-cuda-cccl-cu12
+  Downloading nvidia_cuda_cccl_cu12-12.9.27-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (1.7 kB)
+Downloading nvidia_cuda_nvcc_cu12-12.8.93-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl (40.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 40.1/40.1 MB 76.2 MB/s  0:00:00
+Downloading nvidia_cuda_cccl_cu12-12.9.27-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (3.2 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3.2/3.2 MB 96.6 MB/s  0:00:00
+Installing collected packages: nvidia-cuda-nvcc-cu12, nvidia-cuda-cccl-cu12
+
+Successfully installed nvidia-cuda-cccl-cu12-12.9.27 nvidia-cuda-nvcc-cu12-12.8.93

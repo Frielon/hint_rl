@@ -1,0 +1,149 @@
+[2026-06-08 21:26:57] START sampling: 132 problems  model=Qwen3.5-27B  n=16  base_url=http://127.0.0.1:30000/v1  out=/xutao/project/hint_rl/selector/selector_Qwen3.5-27B/run_20260608_211809
+[2026-06-08 21:29:21] [1/132] DAPO-Math-17k-Processed_filtered-request-100-5: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 3237 gen-toks)  | 144s elapsed, ETA 18842s
+[2026-06-08 21:29:24] [2/132] DAPO-Math-17k-Processed_filtered-request-1-94: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 3637 gen-toks)  | 147s elapsed, ETA 9532s
+[2026-06-08 21:29:32] [3/132] DAPO-Math-17k-Processed_filtered-request-100-59: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 4078 gen-toks)  | 155s elapsed, ETA 6661s
+[2026-06-08 21:29:36] [4/132] DAPO-Math-17k-Processed_filtered-request-10-37: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 3875 gen-toks)  | 159s elapsed, ETA 5073s
+[2026-06-08 21:30:00] [5/132] DAPO-Math-17k-Processed_filtered-request-10-47: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 3906 gen-toks)  | 183s elapsed, ETA 4653s
+[2026-06-08 21:30:31] [6/132] DAPO-Math-17k-Processed_filtered-request-10-55: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 4769 gen-toks)  | 214s elapsed, ETA 4484s
+[2026-06-08 21:30:32] [7/132] DAPO-Math-17k-Processed_filtered-request-10-28: ok  self=1.00 agree=1.00 maj=Y (15/16 parsed, 0 truncated, 5973 gen-toks)  | 215s elapsed, ETA 3837s
+[2026-06-08 21:30:38] [8/132] DAPO-Math-17k-Processed_filtered-request-1-90: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5244 gen-toks)  | 221s elapsed, ETA 3426s
+[2026-06-08 21:30:38] [9/132] DAPO-Math-17k-Processed_filtered-request-100-52: ok  self=1.00 agree=1.00 maj=Y (12/16 parsed, 0 truncated, 5972 gen-toks)  | 221s elapsed, ETA 3021s
+[2026-06-08 21:30:54] [10/132] DAPO-Math-17k-Processed_filtered-request-100-56: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 6289 gen-toks)  | 237s elapsed, ETA 2889s
+[2026-06-08 21:31:26] [11/132] DAPO-Math-17k-Processed_filtered-request-1-100: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5292 gen-toks)  | 269s elapsed, ETA 2961s
+[2026-06-08 21:31:30] [12/132] DAPO-Math-17k-Processed_filtered-request-100-83: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 3621 gen-toks)  | 273s elapsed, ETA 2728s
+[2026-06-08 21:31:31] [13/132] DAPO-Math-17k-Processed_filtered-request-1-67: ok  self=0.94 agree=0.94 maj=Y (16/16 parsed, 0 truncated, 5519 gen-toks)  | 274s elapsed, ETA 2506s
+[2026-06-08 21:31:31] [14/132] DAPO-Math-17k-Processed_filtered-request-100-64: ok  self=0.69 agree=0.31 maj=n (16/16 parsed, 0 truncated, 6951 gen-toks)  | 274s elapsed, ETA 2309s
+[2026-06-08 21:31:46] [15/132] DAPO-Math-17k-Processed_filtered-request-100-71: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 3937 gen-toks)  | 289s elapsed, ETA 2257s
+[2026-06-08 21:31:54] [16/132] DAPO-Math-17k-Processed_filtered-request-1-79: ok  self=0.44 agree=0.00 maj=n (16/16 parsed, 0 truncated, 7751 gen-toks)  | 297s elapsed, ETA 2153s
+[2026-06-08 21:31:56] [17/132] DAPO-Math-17k-Processed_filtered-request-10-21: ok  self=0.69 agree=0.31 maj=n (16/16 parsed, 0 truncated, 7232 gen-toks)  | 299s elapsed, ETA 2020s
+[2026-06-08 21:32:03] [18/132] DAPO-Math-17k-Processed_filtered-request-10-17: ok  self=0.62 agree=0.06 maj=n (16/16 parsed, 0 truncated, 6674 gen-toks)  | 306s elapsed, ETA 1935s
+[2026-06-08 21:32:46] [19/132] DAPO-Math-17k-Processed_filtered-request-101-12: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 3383 gen-toks)  | 349s elapsed, ETA 2075s
+[2026-06-08 21:33:20] [20/132] DAPO-Math-17k-Processed_filtered-request-100-73: ok  self=0.94 agree=0.06 maj=n (16/16 parsed, 0 truncated, 6294 gen-toks)  | 383s elapsed, ETA 2147s
+[2026-06-08 21:33:42] [21/132] DAPO-Math-17k-Processed_filtered-request-101-18: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5068 gen-toks)  | 405s elapsed, ETA 2141s
+[2026-06-08 21:33:53] [22/132] DAPO-Math-17k-Processed_filtered-request-101-25: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 4000 gen-toks)  | 416s elapsed, ETA 2080s
+[2026-06-08 21:34:11] [23/132] DAPO-Math-17k-Processed_filtered-request-100-87: ok  self=0.81 agree=0.19 maj=n (16/16 parsed, 0 truncated, 7108 gen-toks)  | 434s elapsed, ETA 2056s
+[2026-06-08 21:34:20] [24/132] DAPO-Math-17k-Processed_filtered-request-100-79: ok  self=0.50 agree=0.00 maj=n (16/16 parsed, 0 truncated, 7334 gen-toks)  | 443s elapsed, ETA 1995s
+[2026-06-08 21:34:28] [25/132] DAPO-Math-17k-Processed_filtered-request-101-50: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 4312 gen-toks)  | 451s elapsed, ETA 1928s
+[2026-06-08 21:34:59] [26/132] DAPO-Math-17k-Processed_filtered-request-100-91: ok  self=0.82 agree=0.82 maj=Y (11/16 parsed, 0 truncated, 7488 gen-toks)  | 482s elapsed, ETA 1967s
+[2026-06-08 21:35:05] [27/132] DAPO-Math-17k-Processed_filtered-request-101-56: ok  self=1.00 agree=0.00 maj=n (15/16 parsed, 0 truncated, 5365 gen-toks)  | 488s elapsed, ETA 1899s
+[2026-06-08 21:35:11] [28/132] DAPO-Math-17k-Processed_filtered-request-101-100: ok  self=0.93 agree=0.93 maj=Y (14/16 parsed, 0 truncated, 6191 gen-toks)  | 494s elapsed, ETA 1837s
+[2026-06-08 21:35:22] [29/132] DAPO-Math-17k-Processed_filtered-request-101-2: ok  self=0.81 agree=0.81 maj=Y (16/16 parsed, 0 truncated, 7198 gen-toks)  | 505s elapsed, ETA 1792s
+[2026-06-08 21:35:38] [30/132] DAPO-Math-17k-Processed_filtered-request-101-69: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 4440 gen-toks)  | 521s elapsed, ETA 1771s
+[2026-06-08 21:35:52] [31/132] DAPO-Math-17k-Processed_filtered-request-100-89: ok  self=0.88 agree=0.88 maj=Y (16/16 parsed, 0 truncated, 8280 gen-toks)  | 535s elapsed, ETA 1744s
+[2026-06-08 21:35:57] [32/132] DAPO-Math-17k-Processed_filtered-request-101-64: ok  self=0.62 agree=0.62 maj=Y (16/16 parsed, 0 truncated, 6342 gen-toks)  | 540s elapsed, ETA 1686s
+[2026-06-08 21:36:02] [33/132] DAPO-Math-17k-Processed_filtered-request-101-67: ok  self=0.69 agree=0.69 maj=Y (16/16 parsed, 0 truncated, 6614 gen-toks)  | 546s elapsed, ETA 1637s
+[2026-06-08 21:36:21] [34/132] DAPO-Math-17k-Processed_filtered-request-101-72: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5207 gen-toks)  | 564s elapsed, ETA 1627s
+[2026-06-08 21:36:30] [35/132] DAPO-Math-17k-Processed_filtered-request-101-61: ok  self=0.75 agree=0.19 maj=n (16/16 parsed, 0 truncated, 8210 gen-toks)  | 573s elapsed, ETA 1589s
+[2026-06-08 21:36:38] [36/132] DAPO-Math-17k-Processed_filtered-request-101-82: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 3972 gen-toks)  | 581s elapsed, ETA 1550s
+[2026-06-08 21:36:46] [37/132] DAPO-Math-17k-Processed_filtered-request-101-74: ok  self=1.00 agree=1.00 maj=Y (14/16 parsed, 0 truncated, 5011 gen-toks)  | 589s elapsed, ETA 1512s
+[2026-06-08 21:37:02] [38/132] DAPO-Math-17k-Processed_filtered-request-101-85: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 4567 gen-toks)  | 605s elapsed, ETA 1496s
+[2026-06-08 21:37:05] [39/132] DAPO-Math-17k-Processed_filtered-request-101-3: ok  self=0.44 agree=0.25 maj=n (16/16 parsed, 0 truncated, 8994 gen-toks)  | 608s elapsed, ETA 1449s
+[2026-06-08 21:37:28] [40/132] DAPO-Math-17k-Processed_filtered-request-101-78: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 6579 gen-toks)  | 631s elapsed, ETA 1451s
+[2026-06-08 21:37:54] [41/132] DAPO-Math-17k-Processed_filtered-request-102-3: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 3991 gen-toks)  | 657s elapsed, ETA 1459s
+[2026-06-08 21:38:03] [42/132] DAPO-Math-17k-Processed_filtered-request-101-87: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5276 gen-toks)  | 666s elapsed, ETA 1427s
+[2026-06-08 21:38:24] [43/132] DAPO-Math-17k-Processed_filtered-request-102-1: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5492 gen-toks)  | 687s elapsed, ETA 1422s
+[2026-06-08 21:38:26] [44/132] DAPO-Math-17k-Processed_filtered-request-102-61: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 3821 gen-toks)  | 689s elapsed, ETA 1378s
+[2026-06-08 21:38:36] [45/132] DAPO-Math-17k-Processed_filtered-request-102-38: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 3554 gen-toks)  | 699s elapsed, ETA 1351s
+[2026-06-08 21:39:08] [46/132] DAPO-Math-17k-Processed_filtered-request-103-34: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 3458 gen-toks)  | 731s elapsed, ETA 1366s
+[2026-06-08 21:39:15] [47/132] DAPO-Math-17k-Processed_filtered-request-102-28: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5507 gen-toks)  | 738s elapsed, ETA 1334s
+[2026-06-08 21:39:17] [48/132] DAPO-Math-17k-Processed_filtered-request-101-89: ok  self=0.56 agree=0.44 maj=n (16/16 parsed, 0 truncated, 6998 gen-toks)  | 740s elapsed, ETA 1294s
+[2026-06-08 21:39:31] [49/132] DAPO-Math-17k-Processed_filtered-request-101-86: ok  self=0.73 agree=0.27 maj=n (15/16 parsed, 0 truncated, 8233 gen-toks)  | 754s elapsed, ETA 1277s
+[2026-06-08 21:39:55] [50/132] DAPO-Math-17k-Processed_filtered-request-104-48: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5401 gen-toks)  | 778s elapsed, ETA 1277s
+[2026-06-08 21:40:01] [51/132] DAPO-Math-17k-Processed_filtered-request-103-15: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5758 gen-toks)  | 784s elapsed, ETA 1245s
+[2026-06-08 21:40:15] [52/132] DAPO-Math-17k-Processed_filtered-request-102-97: ok  self=0.79 agree=0.79 maj=Y (14/16 parsed, 0 truncated, 6281 gen-toks)  | 798s elapsed, ETA 1227s
+[2026-06-08 21:40:16] [53/132] DAPO-Math-17k-Processed_filtered-request-102-9: ok  self=0.75 agree=0.25 maj=n (16/16 parsed, 0 truncated, 7370 gen-toks)  | 799s elapsed, ETA 1191s
+[2026-06-08 21:40:54] [54/132] DAPO-Math-17k-Processed_filtered-request-104-58: ok  self=1.00 agree=0.00 maj=n (16/16 parsed, 0 truncated, 5636 gen-toks)  | 837s elapsed, ETA 1209s
+[2026-06-08 21:41:33] [55/132] DAPO-Math-17k-Processed_filtered-request-104-21: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 6409 gen-toks)  | 876s elapsed, ETA 1227s
+[2026-06-08 21:41:33] [56/132] DAPO-Math-17k-Processed_filtered-request-104-99: ok  self=1.00 agree=1.00 maj=Y (15/16 parsed, 0 truncated, 5258 gen-toks)  | 876s elapsed, ETA 1190s
+[2026-06-08 21:41:49] [57/132] DAPO-Math-17k-Processed_filtered-request-104-89: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 6245 gen-toks)  | 892s elapsed, ETA 1174s
+[2026-06-08 21:42:06] [58/132] DAPO-Math-17k-Processed_filtered-request-104-26: ok  self=0.56 agree=0.56 maj=Y (16/16 parsed, 0 truncated, 7979 gen-toks)  | 909s elapsed, ETA 1160s
+[2026-06-08 21:42:14] [59/132] DAPO-Math-17k-Processed_filtered-request-107-98: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 3004 gen-toks)  | 917s elapsed, ETA 1135s
+[2026-06-08 21:42:30] [60/132] DAPO-Math-17k-Processed_filtered-request-105-74: ok  self=0.94 agree=0.94 maj=Y (16/16 parsed, 0 truncated, 5654 gen-toks)  | 933s elapsed, ETA 1120s
+[2026-06-08 21:42:36] [61/132] DAPO-Math-17k-Processed_filtered-request-106-62: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5089 gen-toks)  | 939s elapsed, ETA 1093s
+[2026-06-08 21:42:42] [62/132] DAPO-Math-17k-Processed_filtered-request-106-89: ok  self=0.81 agree=0.81 maj=Y (16/16 parsed, 0 truncated, 5537 gen-toks)  | 945s elapsed, ETA 1067s
+[2026-06-08 21:43:10] [63/132] DAPO-Math-17k-Processed_filtered-request-107-81: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5346 gen-toks)  | 973s elapsed, ETA 1066s
+[2026-06-08 21:43:23] [64/132] DAPO-Math-17k-Processed_filtered-request-105-53: ok  self=0.56 agree=0.56 maj=Y (16/16 parsed, 0 truncated, 8419 gen-toks)  | 986s elapsed, ETA 1047s
+[2026-06-08 21:43:54] [65/132] DAPO-Math-17k-Processed_filtered-request-108-47: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5227 gen-toks)  | 1017s elapsed, ETA 1048s
+[2026-06-08 21:43:57] [66/132] DAPO-Math-17k-Processed_filtered-request-107-36: ok  self=0.94 agree=0.94 maj=Y (16/16 parsed, 0 truncated, 6602 gen-toks)  | 1020s elapsed, ETA 1020s
+[2026-06-08 21:44:20] [67/132] DAPO-Math-17k-Processed_filtered-request-106-44: ok  self=0.69 agree=0.69 maj=Y (16/16 parsed, 0 truncated, 8792 gen-toks)  | 1043s elapsed, ETA 1012s
+[2026-06-08 21:44:42] [68/132] DAPO-Math-17k-Processed_filtered-request-106-86: ok  self=0.81 agree=0.12 maj=n (16/16 parsed, 0 truncated, 7198 gen-toks)  | 1065s elapsed, ETA 1003s
+[2026-06-08 21:44:59] [69/132] DAPO-Math-17k-Processed_filtered-request-107-79: ok  self=0.94 agree=0.94 maj=Y (16/16 parsed, 0 truncated, 7341 gen-toks)  | 1082s elapsed, ETA 988s
+[2026-06-08 21:45:13] [70/132] DAPO-Math-17k-Processed_filtered-request-11-100: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 4380 gen-toks)  | 1096s elapsed, ETA 971s
+[2026-06-08 21:45:15] [71/132] DAPO-Math-17k-Processed_filtered-request-108-53: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5915 gen-toks)  | 1098s elapsed, ETA 943s
+[2026-06-08 21:45:20] [72/132] DAPO-Math-17k-Processed_filtered-request-109-10: ok  self=1.00 agree=1.00 maj=Y (8/16 parsed, 0 truncated, 5340 gen-toks)  | 1103s elapsed, ETA 919s
+[2026-06-08 21:45:29] [73/132] DAPO-Math-17k-Processed_filtered-request-11-14: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5414 gen-toks)  | 1112s elapsed, ETA 899s
+[2026-06-08 21:45:38] [74/132] DAPO-Math-17k-Processed_filtered-request-11-4: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 3256 gen-toks)  | 1121s elapsed, ETA 878s
+[2026-06-08 21:45:45] [75/132] DAPO-Math-17k-Processed_filtered-request-105-46: ok  self=0.60 agree=0.40 maj=n (15/16 parsed, 1 truncated, 8746 gen-toks)  | 1128s elapsed, ETA 857s
+[2026-06-08 21:46:07] [76/132] DAPO-Math-17k-Processed_filtered-request-11-78: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 3272 gen-toks)  | 1150s elapsed, ETA 848s
+[2026-06-08 21:46:17] [77/132] DAPO-Math-17k-Processed_filtered-request-11-62: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 4736 gen-toks)  | 1160s elapsed, ETA 828s
+[2026-06-08 21:46:30] [78/132] DAPO-Math-17k-Processed_filtered-request-11-21: ok  self=0.81 agree=0.19 maj=n (16/16 parsed, 0 truncated, 6818 gen-toks)  | 1173s elapsed, ETA 812s
+[2026-06-08 21:46:34] [79/132] DAPO-Math-17k-Processed_filtered-request-108-48: ok  self=0.75 agree=0.25 maj=n (16/16 parsed, 0 truncated, 7230 gen-toks)  | 1177s elapsed, ETA 790s
+[2026-06-08 21:46:40] [80/132] DAPO-Math-17k-Processed_filtered-request-108-59: ok  self=0.81 agree=0.19 maj=n (16/16 parsed, 0 truncated, 6896 gen-toks)  | 1183s elapsed, ETA 769s
+[2026-06-08 21:46:45] [81/132] DAPO-Math-17k-Processed_filtered-request-11-1: ok  self=0.88 agree=0.88 maj=Y (16/16 parsed, 0 truncated, 6606 gen-toks)  | 1188s elapsed, ETA 748s
+[2026-06-08 21:47:53] [82/132] DAPO-Math-17k-Processed_filtered-request-11-81: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5594 gen-toks)  | 1256s elapsed, ETA 766s
+[2026-06-08 21:48:13] [83/132] DAPO-Math-17k-Processed_filtered-request-11-68: ok  self=0.93 agree=0.93 maj=Y (15/16 parsed, 0 truncated, 6313 gen-toks)  | 1276s elapsed, ETA 754s
+[2026-06-08 21:48:33] [84/132] DAPO-Math-17k-Processed_filtered-request-11-92: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 6626 gen-toks)  | 1296s elapsed, ETA 741s
+[2026-06-08 21:48:41] [85/132] DAPO-Math-17k-Processed_filtered-request-112-5: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 4064 gen-toks)  | 1304s elapsed, ETA 721s
+[2026-06-08 21:48:44] [86/132] DAPO-Math-17k-Processed_filtered-request-111-30: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5269 gen-toks)  | 1308s elapsed, ETA 699s
+[2026-06-08 21:49:21] [87/132] DAPO-Math-17k-Processed_filtered-request-110-32: ok  self=0.93 agree=0.93 maj=Y (14/16 parsed, 0 truncated, 6877 gen-toks)  | 1344s elapsed, ETA 695s
+[2026-06-08 21:49:37] [88/132] DAPO-Math-17k-Processed_filtered-request-111-62: ok  self=0.69 agree=0.31 maj=n (16/16 parsed, 0 truncated, 6869 gen-toks)  | 1360s elapsed, ETA 680s
+[2026-06-08 21:50:05] [89/132] DAPO-Math-17k-Processed_filtered-request-112-82: ok  self=0.88 agree=0.88 maj=Y (16/16 parsed, 0 truncated, 6100 gen-toks)  | 1388s elapsed, ETA 670s
+[2026-06-08 21:50:14] [90/132] DAPO-Math-17k-Processed_filtered-request-112-68: ok  self=0.69 agree=0.69 maj=Y (16/16 parsed, 0 truncated, 6396 gen-toks)  | 1397s elapsed, ETA 652s
+[2026-06-08 21:50:17] [91/132] DAPO-Math-17k-Processed_filtered-request-112-73: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 6445 gen-toks)  | 1400s elapsed, ETA 631s
+[2026-06-08 21:50:18] [92/132] DAPO-Math-17k-Processed_filtered-request-110-11: ok  self=0.62 agree=0.38 maj=n (16/16 parsed, 0 truncated, 7799 gen-toks)  | 1401s elapsed, ETA 609s
+[2026-06-08 21:50:33] [93/132] DAPO-Math-17k-Processed_filtered-request-111-37: ok  self=0.75 agree=0.75 maj=Y (16/16 parsed, 0 truncated, 8420 gen-toks)  | 1416s elapsed, ETA 594s
+[2026-06-08 21:50:43] [94/132] DAPO-Math-17k-Processed_filtered-request-112-83: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 4856 gen-toks)  | 1426s elapsed, ETA 576s
+[2026-06-08 21:50:51] [95/132] DAPO-Math-17k-Processed_filtered-request-112-79: ok  self=1.00 agree=0.00 maj=n (16/16 parsed, 0 truncated, 6486 gen-toks)  | 1434s elapsed, ETA 558s
+[2026-06-08 21:51:04] [96/132] DAPO-Math-17k-Processed_filtered-request-112-43: ok  self=0.88 agree=0.00 maj=n (16/16 parsed, 0 truncated, 7679 gen-toks)  | 1447s elapsed, ETA 543s
+[2026-06-08 21:51:17] [97/132] DAPO-Math-17k-Processed_filtered-request-112-38: ok  self=0.50 agree=0.31 maj=n (16/16 parsed, 0 truncated, 7722 gen-toks)  | 1460s elapsed, ETA 527s
+[2026-06-08 21:51:42] [98/132] DAPO-Math-17k-Processed_filtered-request-113-22: ok  self=1.00 agree=1.00 maj=Y (14/16 parsed, 0 truncated, 5633 gen-toks)  | 1485s elapsed, ETA 515s
+[2026-06-08 21:51:46] [99/132] DAPO-Math-17k-Processed_filtered-request-113-47: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 4797 gen-toks)  | 1489s elapsed, ETA 496s
+[2026-06-08 21:52:01] [100/132] DAPO-Math-17k-Processed_filtered-request-113-92: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 4837 gen-toks)  | 1504s elapsed, ETA 481s
+[2026-06-08 21:52:30] [101/132] DAPO-Math-17k-Processed_filtered-request-113-88: ok  self=0.88 agree=0.88 maj=Y (16/16 parsed, 0 truncated, 6107 gen-toks)  | 1533s elapsed, ETA 470s
+[2026-06-08 21:52:39] [102/132] DAPO-Math-17k-Processed_filtered-request-112-18: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 8043 gen-toks)  | 1542s elapsed, ETA 454s
+[2026-06-08 21:53:27] [103/132] DAPO-Math-17k-Processed_filtered-request-114-86: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5724 gen-toks)  | 1590s elapsed, ETA 448s
+[2026-06-08 21:53:39] [104/132] DAPO-Math-17k-Processed_filtered-request-115-22: ok  self=0.94 agree=0.94 maj=Y (16/16 parsed, 0 truncated, 4922 gen-toks)  | 1602s elapsed, ETA 431s
+[2026-06-08 21:53:54] [105/132] DAPO-Math-17k-Processed_filtered-request-113-93: ok  self=0.69 agree=0.69 maj=Y (16/16 parsed, 0 truncated, 7383 gen-toks)  | 1617s elapsed, ETA 416s
+[2026-06-08 21:54:04] [106/132] DAPO-Math-17k-Processed_filtered-request-114-90: ok  self=0.87 agree=0.87 maj=Y (15/16 parsed, 0 truncated, 6248 gen-toks)  | 1627s elapsed, ETA 399s
+[2026-06-08 21:54:05] [107/132] DAPO-Math-17k-Processed_filtered-request-113-10: ok  self=0.75 agree=0.75 maj=Y (16/16 parsed, 0 truncated, 9833 gen-toks)  | 1628s elapsed, ETA 380s
+[2026-06-08 21:54:09] [108/132] DAPO-Math-17k-Processed_filtered-request-115-45: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5641 gen-toks)  | 1632s elapsed, ETA 363s
+[2026-06-08 21:54:26] [109/132] DAPO-Math-17k-Processed_filtered-request-115-52: ok  self=1.00 agree=1.00 maj=Y (12/16 parsed, 0 truncated, 6007 gen-toks)  | 1649s elapsed, ETA 348s
+[2026-06-08 21:54:35] [110/132] DAPO-Math-17k-Processed_filtered-request-114-38: ok  self=0.94 agree=0.94 maj=Y (16/16 parsed, 0 truncated, 6288 gen-toks)  | 1658s elapsed, ETA 332s
+[2026-06-08 21:54:49] [111/132] DAPO-Math-17k-Processed_filtered-request-116-1: ok  self=0.94 agree=0.94 maj=Y (16/16 parsed, 0 truncated, 5028 gen-toks)  | 1672s elapsed, ETA 316s
+[2026-06-08 21:54:57] [112/132] DAPO-Math-17k-Processed_filtered-request-114-42: ok  self=0.94 agree=0.94 maj=Y (16/16 parsed, 0 truncated, 8454 gen-toks)  | 1680s elapsed, ETA 300s
+[2026-06-08 21:54:58] [113/132] DAPO-Math-17k-Processed_filtered-request-115-94: ok  self=0.94 agree=0.94 maj=Y (16/16 parsed, 0 truncated, 5230 gen-toks)  | 1681s elapsed, ETA 283s
+[2026-06-08 21:55:00] [114/132] DAPO-Math-17k-Processed_filtered-request-116-26: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 4850 gen-toks)  | 1683s elapsed, ETA 266s
+[2026-06-08 21:55:03] [115/132] DAPO-Math-17k-Processed_filtered-request-115-33: ok  self=0.94 agree=0.94 maj=Y (16/16 parsed, 0 truncated, 7316 gen-toks)  | 1686s elapsed, ETA 249s
+[2026-06-08 21:55:41] [116/132] DAPO-Math-17k-Processed_filtered-request-116-14: ok  self=0.88 agree=0.88 maj=Y (16/16 parsed, 0 truncated, 6563 gen-toks)  | 1724s elapsed, ETA 238s
+[2026-06-08 21:55:58] [117/132] DAPO-Math-17k-Processed_filtered-request-117-25: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5266 gen-toks)  | 1741s elapsed, ETA 223s
+[2026-06-08 21:56:46] [118/132] DAPO-Math-17k-Processed_filtered-request-117-55: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5082 gen-toks)  | 1789s elapsed, ETA 212s
+[2026-06-08 21:56:54] [119/132] DAPO-Math-17k-Processed_filtered-request-116-81: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 6124 gen-toks)  | 1797s elapsed, ETA 196s
+[2026-06-08 21:56:58] [120/132] DAPO-Math-17k-Processed_filtered-request-117-39: ok  self=0.56 agree=0.44 maj=n (16/16 parsed, 0 truncated, 6241 gen-toks)  | 1801s elapsed, ETA 180s
+[2026-06-08 21:57:01] [121/132] DAPO-Math-17k-Processed_filtered-request-117-53: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 5902 gen-toks)  | 1804s elapsed, ETA 164s
+[2026-06-08 21:57:08] [122/132] DAPO-Math-17k-Processed_filtered-request-12-36: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 3602 gen-toks)  | 1811s elapsed, ETA 148s
+[2026-06-08 21:57:11] [123/132] DAPO-Math-17k-Processed_filtered-request-12-19: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 3420 gen-toks)  | 1814s elapsed, ETA 133s
+[2026-06-08 21:57:35] [124/132] DAPO-Math-17k-Processed_filtered-request-119-85: ok  self=0.56 agree=0.56 maj=Y (16/16 parsed, 0 truncated, 5143 gen-toks)  | 1838s elapsed, ETA 119s
+[2026-06-08 21:57:37] [125/132] DAPO-Math-17k-Processed_filtered-request-12-16: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 4404 gen-toks)  | 1840s elapsed, ETA 103s
+[2026-06-08 21:57:37] [126/132] DAPO-Math-17k-Processed_filtered-request-119-12: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 4427 gen-toks)  | 1840s elapsed, ETA 88s
+[2026-06-08 21:57:42] [127/132] DAPO-Math-17k-Processed_filtered-request-118-26: ok  self=1.00 agree=1.00 maj=Y (15/16 parsed, 0 truncated, 7102 gen-toks)  | 1845s elapsed, ETA 73s
+[2026-06-08 21:57:50] [128/132] DAPO-Math-17k-Processed_filtered-request-12-39: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 4970 gen-toks)  | 1853s elapsed, ETA 58s
+[2026-06-08 21:57:53] [129/132] DAPO-Math-17k-Processed_filtered-request-117-67: ok  self=0.94 agree=0.94 maj=Y (16/16 parsed, 0 truncated, 6668 gen-toks)  | 1856s elapsed, ETA 43s
+[2026-06-08 21:58:09] [130/132] DAPO-Math-17k-Processed_filtered-request-118-56: ok  self=1.00 agree=1.00 maj=Y (16/16 parsed, 0 truncated, 6633 gen-toks)  | 1872s elapsed, ETA 29s
+[2026-06-08 21:58:13] [131/132] DAPO-Math-17k-Processed_filtered-request-12-43: ok  self=0.94 agree=0.06 maj=n (16/16 parsed, 0 truncated, 5321 gen-toks)  | 1876s elapsed, ETA 14s
+[2026-06-08 21:59:09] [132/132] DAPO-Math-17k-Processed_filtered-request-119-48: ok  self=0.94 agree=0.94 maj=Y (16/16 parsed, 0 truncated, 6270 gen-toks)  | 1932s elapsed, ETA 0s
+[2026-06-08 21:59:09] ============================================================
+[2026-06-08 21:59:09] SUMMARY  model=Qwen3.5-27B  problems=132  n=16
+[2026-06-08 21:59:09]   mean self-consistency      : 0.901
+[2026-06-08 21:59:09]   mean agreement w/ codex    : 0.796
+[2026-06-08 21:59:09]   majority == codex rate     : 0.803
+[2026-06-08 21:59:09]   mean parse rate            : 0.982
+[2026-06-08 21:59:09]   mean truncation rate       : 0.000
+[2026-06-08 21:59:09]   mean completion tokens     : 5867
+[2026-06-08 21:59:09]   -- inference timing (server saturated) --
+[2026-06-08 21:59:09]   wall time                  : 1932s
+[2026-06-08 21:59:09]   total completion tokens    : 12390275
+[2026-06-08 21:59:09]   throughput                 : 6413 tok/s  (1.09 calls/s)
+[2026-06-08 21:59:09]   mean/median call latency   : 162.22s / 159.17s
+[2026-06-08 21:59:09]   summary -> /xutao/project/hint_rl/selector/selector_Qwen3.5-27B/run_20260608_211809/_summary.json
+[2026-06-08 21:59:09] ============================================================
+[2026-06-08 21:59:09] DONE: 132/132 problems in 1932s

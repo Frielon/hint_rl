@@ -2,43 +2,32 @@
 set -xeuo pipefail
 
 # ---------------------------------------------------------------------------
-# Dr. GRPO ("Understanding R1-Zero-Like Training", Liu et al. 2024) variant of
-# the DAPO run. It is plain GRPO with the two unbiased-estimator fixes from the
-# paper, and deliberately drops DAPO's extra machinery:
+# Hint Penalized RL (HPRL) -- multi-turn GRPO with the hint tool.
 #
-#   Dr. GRPO changes vs. run_dapo_qwen2.5_7b_npu.sh
-#     * algorithm.norm_adv_by_std_in_grpo=False  -> advantage is (r - mean),
-#       WITHOUT dividing by the group std (removes the question-difficulty bias).
-#     * actor.loss_agg_mode=seq-mean-token-sum-norm -> loss is summed over tokens
-#       and normalized by a constant (max length) instead of per-response length
-#       (removes the response-length bias).
-#   Dropped DAPO tricks (not part of Dr. GRPO):
-#     * dynamic sampling / filter_groups (+ the 3x gen oversample batch)
-#     * clip-higher: asymmetric clip + dual-clip -> standard symmetric clip 0.2
-#     * overlong reward shaping -> plain "naive" reward manager
-#   Entry point is verl.trainer.main_ppo (the standard GRPO trainer), not the
-#   recipe.dapo.main_dapo recipe.
+# This is the multi-turn tool-use sibling of run_grpo_qwen2.5_7b_npu.sh. The
+# algorithm is unchanged (GRPO: group-std-normalized advantage, clip-higher, no
+# KL). What is added is the agent loop + the stateful `request_hint` tool:
 #
-# Everything else (model, data, lr schedule, batch sizes, n, lengths, sp_size,
-# offload, gpu-mem, dynamic bsz, gradient checkpointing, logging, ckpt) is kept
-# identical so DAPO vs Dr. GRPO is an apples-to-apples comparison.
+#   * rollout.mode=async + multi_turn.enable=True  -> the agent loop.
+#   * multi_turn.tool_config_path=hint_tool_config.yaml  -> declares the
+#     `request_hint` tool (hint_tool.HintTool), which routes each hint call to
+#     a frozen selector model and records the applied hints as per-rollout state.
+#   * per-row agent_name="tool_agent" (added by prepare_hint_data.py) routes
+#     training prompts through the tool-calling loop. The val set (aime2024) has
+#     NO agent_name, so validation stays single-turn / unaided.
+#   * reward: hint_reward.compute_score (outcome reward * blank hint penalty),
+#     with HintRewardManager merging the applied-hints state into extra_info.
 #
-# All paths are derived from this script's own location so the tree can be
-# mounted anywhere. Expected layout (relative positions must be preserved):
+# Prereqs:
+#   1. Build the multi-turn parquet:   python prepare_hint_data.py
+#   2. Serve the frozen selector model on an OpenAI-compatible endpoint and set
+#      SELECTOR_BASE_URL / SELECTOR_MODEL below (default sglang @ :30000).
 #
-#   <base>/
-#     miniconda3/                 -> CONDA_HOME
-#     model/Qwen2.5-7B-Instruct/  -> MODEL_PATH
-#     project/
-#       verl/                     -> VERL_HOME
-#       hint_rl/                  -> HINT_RL_HOME
-#         script/<this script>
-#         dataset/ reward/ ckpt/
-#
-# Any path can still be overridden from the environment (VAR=... ./script.sh).
+# All paths derive from this script's location; override any VAR via the env.
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HINT_RL_HOME=${HINT_RL_HOME:-"$(cd "${SCRIPT_DIR}/.." && pwd)"}
+# this script lives at <HINT_RL_HOME>/script/hint_rl/<this>
+HINT_RL_HOME=${HINT_RL_HOME:-"$(cd "${SCRIPT_DIR}/../.." && pwd)"}
 PROJECT_HOME=${PROJECT_HOME:-"$(cd "${HINT_RL_HOME}/.." && pwd)"}
 BASE_HOME=${BASE_HOME:-"$(cd "${PROJECT_HOME}/.." && pwd)"}
 
@@ -46,11 +35,8 @@ BASE_HOME=${BASE_HOME:-"$(cd "${PROJECT_HOME}/.." && pwd)"}
 CONDA_HOME=${CONDA_HOME:-"${BASE_HOME}/miniconda3"}
 CONDA_ENV=${CONDA_ENV:-"verl"}
 
-# miniconda was installed with the prefix below baked into conda.sh and every
-# script shebang (conda, torchrun, ray, pip, vllm ...). Conda is not
-# relocatable, so when this tree is mounted somewhere else (e.g. ${BASE_HOME})
-# those absolute paths must still resolve. Symlink the original prefix to the
-# current mount point so the baked-in paths keep working.
+# miniconda is not relocatable; symlink the original prefix to the current mount
+# so baked-in absolute paths keep resolving when the tree is mounted elsewhere.
 CONDA_INSTALL_PREFIX=${CONDA_INSTALL_PREFIX:-/share5/users/xutao.ma}
 if [ ! -e "${CONDA_INSTALL_PREFIX}" ]; then
     sudo mkdir -p "$(dirname "${CONDA_INSTALL_PREFIX}")"
@@ -60,42 +46,50 @@ fi
 source "${CONDA_HOME}/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV}"
 
-# Load secrets (wandb key, ...) from .envrc, which exports `wandb_key`.
-# wandb expects WANDB_API_KEY, so map it across.
+# Load secrets (wandb key, ...) from .envrc.
 if [ -f "${HINT_RL_HOME}/.envrc" ]; then
     source "${HINT_RL_HOME}/.envrc"
 fi
 export WANDB_API_KEY="${WANDB_API_KEY:-${wandb_key:-}}"
 
-project_name='Dr-GRPO-Qwen2.5-7B-Instruct'
-exp_name="Dr-GRPO-Qwen2.5-7B-Instruct-MATH-5582-$(date +%Y%m%d-%H%M%S)"
+project_name='HPRL-Qwen2.5-7B-Instruct'
+exp_name="HPRL-Qwen2.5-7B-Instruct-dapo-4k-$(date +%Y%m%d-%H%M%S)"
 wandb_project=${wandb_project:-"hint_rl"}
 
+# ---- GRPO algorithm (identical to the plain GRPO run) ---------------------
 adv_estimator=grpo
-# Dr. GRPO: do NOT divide the advantage by the group std.
-norm_adv_by_std_in_grpo=False
-
+norm_adv_by_std_in_grpo=True
 use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.0
-# DAPO-style asymmetric clip (clip-higher): lower clip 0.2, upper clip 0.3.
 clip_ratio_low=0.2
 clip_ratio_high=0.28
-max_prompt_length=2048
-max_response_length=8192
-# Dr. GRPO: sum the per-token loss and normalize by a constant (max length)
-# instead of the per-response length -> removes the length bias.
-loss_agg_mode="seq-mean-token-sum-norm"
+loss_agg_mode="token-mean"
 
-# Cluster: 2 nodes x 8 H100 = 16 GPUs. This requires a Ray cluster spanning
-# both nodes (see the `ray job submit` at the bottom); the job is dispatched
-# across whatever GPUs the cluster actually has.
+# ---- lengths: multi-turn trajectories accumulate tokens across turns ------
+max_prompt_length=2048
+# bumped from 8192: prompt + N*(assistant turn + hint tool result).
+max_response_length=16384
+
+# ---- multi-turn / hint-tool knobs -----------------------------------------
+# Cap on assistant turns; must be >= the largest per-problem hint budget B_q.
+max_turns=${max_turns:-8}
+TOOL_CONFIG_PATH=${TOOL_CONFIG_PATH:-"${SCRIPT_DIR}/hint_tool_config.yaml"}
+# Hints can be a full sentence or two; allow more than the 256-token default.
+max_tool_response_length=${max_tool_response_length:-2048}
+
+# ---- frozen selector model (OpenAI-compatible endpoint) -------------------
+# Read by hint_tool_config.yaml via ${oc.env:...}; forwarded into the Ray job
+# below so the rollout workers can reach the selector.
+export SELECTOR_BASE_URL=${SELECTOR_BASE_URL:-"http://localhost:30000/v1"}
+export SELECTOR_MODEL=${SELECTOR_MODEL:-"Qwen3.5-27B"}
+export SELECTOR_API_KEY=${SELECTOR_API_KEY:-"EMPTY"}
+
+# Cluster
 NNODES=${NNODES:-4}
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 
-# No dynamic-sampling oversample here, so the generation batch equals the
-# training batch (the trainer generates train_prompt_bsz prompts per step).
 train_prompt_bsz=256
 n_resp_per_prompt=16
 train_prompt_mini_bsz=32
@@ -104,23 +98,25 @@ train_prompt_mini_bsz=32
 VERL_HOME=${VERL_HOME:-"${PROJECT_HOME}/verl"}
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 WORKING_DIR=${WORKING_DIR:-"${VERL_HOME}"}
-# The Ray runtime env is generated per-run just before submit (see below), so we
-# can inject secrets/log paths via env_vars; ${VERL_HOME}/recipe/dapo/runtime_env.yaml
-# is the upstream template it mirrors.
 
 # Paths
 MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Qwen2.5-7B-Instruct"}
 CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dapo_17k.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dapo-3740-hint-verl-simplified-mt.parquet"}
 TEST_FILE=${TEST_FILE:-"${HINT_RL_HOME}/dataset/aime2024.parquet"}
 
-# Custom reward function (loaded by verl via custom_reward_function.path/.name)
-REWARD_FN_PATH=${REWARD_FN_PATH:-"${HINT_RL_HOME}/reward/custom_reward.py"}
+# HPRL reward function (outcome reward * blank hint penalty).
+REWARD_FN_PATH=${REWARD_FN_PATH:-"${SCRIPT_DIR}/hint_reward.py"}
 REWARD_FN_NAME=${REWARD_FN_NAME:-"compute_score"}
+# HPRL reward manager: merges per-rollout applied-hints state into extra_info.
+REWARD_MGR_PATH=${REWARD_MGR_PATH:-"${SCRIPT_DIR}/hint_reward_manager.py"}
+REWARD_MGR_CLASS=${REWARD_MGR_CLASS:-"HintRewardManager"}
+
+# The directory holding hint_tool.py must be importable by the rollout workers
+# (the tool config's class_name "hint_tool.HintTool" is resolved with importlib).
+TOOL_PYTHONPATH="${SCRIPT_DIR}"
 
 # Local logs
-#   - LOG_FILE   : verl 'file' logger, one JSON object of metrics per step
-#   - CONSOLE_LOG: full stdout/stderr of the training driver (text)
 RUN_ID=${RUN_ID:-"$(date +%Y%m%d-%H%M%S)"}
 LOG_DIR=${LOG_DIR:-"${HINT_RL_HOME}/logs"}
 EXP_LOG_DIR=${EXP_LOG_DIR:-"${LOG_DIR}/${exp_name}"}
@@ -128,17 +124,15 @@ LOG_FILE=${LOG_FILE:-"${EXP_LOG_DIR}/${exp_name}.jsonl"}
 CONSOLE_LOG=${CONSOLE_LOG:-"${EXP_LOG_DIR}/${exp_name}.${RUN_ID}.console.log"}
 mkdir -p "${EXP_LOG_DIR}"
 
-# Archive a verbatim copy of this training script into the per-run log dir so the
-# exact hyperparameters that produced the run are always recoverable alongside its
-# logs/checkpoints. RUN_ID in the name keeps re-launches of the same exp distinct.
+# Archive a verbatim copy of this script alongside the run's logs.
 cp "${BASH_SOURCE[0]}" "${EXP_LOG_DIR}/$(basename "${BASH_SOURCE[0]}").${RUN_ID}"
 
-# Algorithm
+# Algorithm sampling
 temperature=1.0
 top_p=1.0
-top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
+top_k=-1
 
-# Performance Related Parameter
+# Performance
 sp_size=4
 use_dynamic_bsz=True
 actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) / sp_size))
@@ -146,11 +140,9 @@ infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) / sp_size))
 offload=True
 gen_tp=1
 
-# Build a per-run Ray runtime env. Env vars from this shell do NOT propagate to
-# a submitted job (the driver/workers run elsewhere, often inside a container),
-# so the wandb key and file-logger path must be injected via runtime_env.env_vars
-# -- this is the mechanism Ray actually guarantees to forward. Written with
-# private perms (umask 077) so the wandb key never appears in the set -x trace.
+# Per-run Ray runtime env. Env vars from this shell do NOT propagate to a
+# submitted job, so wandb key, file-logger path, the selector endpoint, and the
+# PYTHONPATH for the hint tool must all be injected here.
 RUNTIME_ENV_RUN=${RUNTIME_ENV_RUN:-"${LOG_DIR}/.runtime_env.${RUN_ID}.yaml"}
 ( umask 077
   cat > "${RUNTIME_ENV_RUN}" <<EOF
@@ -161,20 +153,21 @@ env_vars:
   VLLM_USE_V1: "1"
   VERL_FILE_LOGGER_PATH: "${LOG_FILE}"
   WANDB_API_KEY: "${WANDB_API_KEY}"
-# The job runs in the cluster's container (e.g. /opt/venv), not the conda env we
-# activated for submitting. custom_reward.py imports mathruler, so ensure it is
-# present in the job env. Remove this if mathruler is already baked into the image.
+  HINT_RL_HOME: "${HINT_RL_HOME}"
+  SELECTOR_BASE_URL: "${SELECTOR_BASE_URL}"
+  SELECTOR_MODEL: "${SELECTOR_MODEL}"
+  SELECTOR_API_KEY: "${SELECTOR_API_KEY}"
+  # make hint_tool.py / hint_reward_manager.py importable in the job env.
+  PYTHONPATH: "${TOOL_PYTHONPATH}"
+# custom_reward.py + the selector client import mathruler / openai; ensure both
+# exist in the job env (remove if already baked into the image).
 pip:
   - mathruler
+  - openai
 EOF
 )
 
-# Submit to the Ray cluster's job server (dashboard at ${RAY_ADDRESS}). This
-# spans all nodes of the cluster, which is required for the multi-node
-# (NNODES>1) run. The cluster must already be up: a head with
-# `ray start --head --dashboard-port 8265` and the worker(s) joined via
-# `ray start --address <head>:6379`. Run attached so the driver's console
-# output streams back here; tee it to a local console log.
+# Submit to the Ray cluster's job server. The cluster must already be up.
 ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     --working-dir "${WORKING_DIR}" \
     --address "${RAY_ADDRESS}" \
@@ -183,6 +176,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     data.val_files="${TEST_FILE}" \
     data.prompt_key=prompt \
     data.truncation='left' \
+    data.return_raw_chat=True \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
@@ -205,6 +199,14 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.mode=async \
+    actor_rollout_ref.rollout.multi_turn.enable=True \
+    actor_rollout_ref.rollout.multi_turn.max_assistant_turns=${max_turns} \
+    actor_rollout_ref.rollout.multi_turn.max_user_turns=${max_turns} \
+    actor_rollout_ref.rollout.multi_turn.format=hermes \
+    actor_rollout_ref.rollout.multi_turn.tool_config_path="${TOOL_CONFIG_PATH}" \
+    actor_rollout_ref.rollout.multi_turn.max_tool_response_length=${max_tool_response_length} \
+    actor_rollout_ref.rollout.multi_turn.tokenization_sanity_check_mode=ignore_strippable \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     +actor_rollout_ref.model.override_config.attention_dropout=0. \
@@ -236,7 +238,10 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=-1 \
-    reward_model.reward_manager=naive \
+    reward_model.reward_manager="${REWARD_MGR_CLASS}" \
+    reward_model.reward_loop_source=importlib \
+    reward_model.reward_loop_module_path="${REWARD_MGR_PATH}" \
+    reward_model.reward_loop_class_name="${REWARD_MGR_CLASS}" \
     custom_reward_function.path="${REWARD_FN_PATH}" \
     custom_reward_function.name="${REWARD_FN_NAME}" \
     +custom_reward_function.reward_kwargs.correct_reward=1.0 \

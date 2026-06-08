@@ -1,0 +1,101 @@
+Looking in indexes: https://download.pytorch.org/whl/cu128
+Collecting torch==2.11.0+cu128
+  Using cached https://download-r2.pytorch.org/whl/cu128/torch-2.11.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl.metadata (29 kB)
+Collecting torchvision==0.26.0+cu128
+  Using cached https://download-r2.pytorch.org/whl/cu128/torchvision-0.26.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl.metadata (5.5 kB)
+Collecting torchaudio==2.11.0+cu128
+  Using cached https://download-r2.pytorch.org/whl/cu128/torchaudio-2.11.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl.metadata (6.9 kB)
+Requirement already satisfied: filelock in /share5/users/xutao.ma/miniconda3/envs/inference/lib/python3.11/site-packages (from torch==2.11.0+cu128) (3.29.0)
+Requirement already satisfied: typing-extensions>=4.10.0 in /share5/users/xutao.ma/miniconda3/envs/inference/lib/python3.11/site-packages (from torch==2.11.0+cu128) (4.15.0)
+Requirement already satisfied: setuptools<82 in /share5/users/xutao.ma/miniconda3/envs/inference/lib/python3.11/site-packages (from torch==2.11.0+cu128) (81.0.0)
+Requirement already satisfied: sympy>=1.13.3 in /share5/users/xutao.ma/miniconda3/envs/inference/lib/python3.11/site-packages (from torch==2.11.0+cu128) (1.14.0)
+Requirement already satisfied: networkx>=2.5.1 in /share5/users/xutao.ma/miniconda3/envs/inference/lib/python3.11/site-packages (from torch==2.11.0+cu128) (3.6.1)
+Requirement already satisfied: jinja2 in /share5/users/xutao.ma/miniconda3/envs/inference/lib/python3.11/site-packages (from torch==2.11.0+cu128) (3.1.6)
+Requirement already satisfied: fsspec>=0.8.5 in /share5/users/xutao.ma/miniconda3/envs/inference/lib/python3.11/site-packages (from torch==2.11.0+cu128) (2026.2.0)
+Collecting cuda-toolkit==12.8.1 (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.8.1; platform_system == "Linux"->torch==2.11.0+cu128)
+  Downloading https://pypi.nvidia.com/cuda-toolkit/cuda_toolkit-12.8.1-py2.py3-none-any.whl (2.3 kB)
+Collecting cuda-bindings<13,>=12.9.4 (from torch==2.11.0+cu128)
+  Using cached https://download.pytorch.org/whl/cu128/cuda_bindings-12.9.4-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl.metadata (2.6 kB)
+Collecting nvidia-cudnn-cu12==9.19.0.56 (from torch==2.11.0+cu128)
+  Downloading https://pypi.nvidia.com/nvidia-cudnn-cu12/nvidia_cudnn_cu12-9.19.0.56-py3-none-manylinux_2_27_x86_64.whl (657.9 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 657.9/657.9 MB 140.2 MB/s  0:00:05
+Collecting nvidia-cusparselt-cu12==0.7.1 (from torch==2.11.0+cu128)
+  Downloading https://pypi.nvidia.com/nvidia-cusparselt-cu12/nvidia_cusparselt_cu12-0.7.1-py3-none-manylinux2014_x86_64.whl (287.2 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 287.2/287.2 MB 138.3 MB/s  0:00:02
+Collecting nvidia-nccl-cu12==2.28.9 (from torch==2.11.0+cu128)
+  Downloading https://pypi.nvidia.com/nvidia-nccl-cu12/nvidia_nccl_cu12-2.28.9-py3-none-manylinux_2_18_x86_64.whl (296.8 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 296.8/296.8 MB 110.4 MB/s  0:00:02
+Collecting nvidia-nvshmem-cu12==3.4.5 (from torch==2.11.0+cu128)
+  Downloading https://pypi.nvidia.com/nvidia-nvshmem-cu12/nvidia_nvshmem_cu12-3.4.5-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (139.1 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 139.1/139.1 MB 128.0 MB/s  0:00:01
+Requirement already satisfied: triton==3.6.0 in /share5/users/xutao.ma/miniconda3/envs/inference/lib/python3.11/site-packages (from torch==2.11.0+cu128) (3.6.0)
+Requirement already satisfied: numpy in /share5/users/xutao.ma/miniconda3/envs/inference/lib/python3.11/site-packages (from torchvision==0.26.0+cu128) (2.3.5)
+Requirement already satisfied: pillow!=8.3.*,>=5.3.0 in /share5/users/xutao.ma/miniconda3/envs/inference/lib/python3.11/site-packages (from torchvision==0.26.0+cu128) (12.2.0)
+Collecting nvidia-cublas-cu12==12.8.4.1.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.8.1; platform_system == "Linux"->torch==2.11.0+cu128)
+  Downloading https://pypi.nvidia.com/nvidia-cublas-cu12/nvidia_cublas_cu12-12.8.4.1-py3-none-manylinux_2_27_x86_64.whl (594.3 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 594.3/594.3 MB 127.0 MB/s  0:00:04
+Collecting nvidia-cuda-runtime-cu12==12.8.90.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.8.1; platform_system == "Linux"->torch==2.11.0+cu128)
+  Downloading https://pypi.nvidia.com/nvidia-cuda-runtime-cu12/nvidia_cuda_runtime_cu12-12.8.90-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (954 kB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 954.8/954.8 kB 154.3 MB/s  0:00:00
+Collecting nvidia-cufft-cu12==11.3.3.83.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.8.1; platform_system == "Linux"->torch==2.11.0+cu128)
+  Downloading https://pypi.nvidia.com/nvidia-cufft-cu12/nvidia_cufft_cu12-11.3.3.83-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (193.1 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 193.1/193.1 MB 126.4 MB/s  0:00:01
+Collecting nvidia-cufile-cu12==1.13.1.3.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.8.1; platform_system == "Linux"->torch==2.11.0+cu128)
+  Downloading https://pypi.nvidia.com/nvidia-cufile-cu12/nvidia_cufile_cu12-1.13.1.3-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (1.2 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.2/1.2 MB 151.8 MB/s  0:00:00
+Collecting nvidia-cuda-cupti-cu12==12.8.90.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.8.1; platform_system == "Linux"->torch==2.11.0+cu128)
+  Downloading https://pypi.nvidia.com/nvidia-cuda-cupti-cu12/nvidia_cuda_cupti_cu12-12.8.90-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (10.2 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 10.2/10.2 MB 146.5 MB/s  0:00:00
+Collecting nvidia-curand-cu12==10.3.9.90.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.8.1; platform_system == "Linux"->torch==2.11.0+cu128)
+  Downloading https://pypi.nvidia.com/nvidia-curand-cu12/nvidia_curand_cu12-10.3.9.90-py3-none-manylinux_2_27_x86_64.whl (63.6 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 63.6/63.6 MB 145.5 MB/s  0:00:00
+Collecting nvidia-cusolver-cu12==11.7.3.90.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.8.1; platform_system == "Linux"->torch==2.11.0+cu128)
+  Downloading https://pypi.nvidia.com/nvidia-cusolver-cu12/nvidia_cusolver_cu12-11.7.3.90-py3-none-manylinux_2_27_x86_64.whl (267.5 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 267.5/267.5 MB 111.7 MB/s  0:00:02
+Collecting nvidia-cusparse-cu12==12.5.8.93.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.8.1; platform_system == "Linux"->torch==2.11.0+cu128)
+  Downloading https://pypi.nvidia.com/nvidia-cusparse-cu12/nvidia_cusparse_cu12-12.5.8.93-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (288.2 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 288.2/288.2 MB 124.4 MB/s  0:00:02
+Collecting nvidia-nvjitlink-cu12==12.8.93.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.8.1; platform_system == "Linux"->torch==2.11.0+cu128)
+  Downloading https://pypi.nvidia.com/nvidia-nvjitlink-cu12/nvidia_nvjitlink_cu12-12.8.93-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl (39.3 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 39.3/39.3 MB 146.5 MB/s  0:00:00
+Collecting nvidia-cuda-nvrtc-cu12==12.8.93.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.8.1; platform_system == "Linux"->torch==2.11.0+cu128)
+  Downloading https://pypi.nvidia.com/nvidia-cuda-nvrtc-cu12/nvidia_cuda_nvrtc_cu12-12.8.93-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl (88.0 MB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 88.0/88.0 MB 107.2 MB/s  0:00:00
+Collecting nvidia-nvtx-cu12==12.8.90.* (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==12.8.1; platform_system == "Linux"->torch==2.11.0+cu128)
+  Downloading https://pypi.nvidia.com/nvidia-nvtx-cu12/nvidia_nvtx_cu12-12.8.90-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (89 kB)
+Requirement already satisfied: cuda-pathfinder~=1.1 in /share5/users/xutao.ma/miniconda3/envs/inference/lib/python3.11/site-packages (from cuda-bindings<13,>=12.9.4->torch==2.11.0+cu128) (1.5.5)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in /share5/users/xutao.ma/miniconda3/envs/inference/lib/python3.11/site-packages (from sympy>=1.13.3->torch==2.11.0+cu128) (1.3.0)
+Requirement already satisfied: MarkupSafe>=2.0 in /share5/users/xutao.ma/miniconda3/envs/inference/lib/python3.11/site-packages (from jinja2->torch==2.11.0+cu128) (3.0.3)
+Downloading https://download-r2.pytorch.org/whl/cu128/torch-2.11.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl (820.2 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 820.2/820.2 MB 148.8 MB/s  0:00:03
+Downloading https://download-r2.pytorch.org/whl/cu128/torchvision-0.26.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl (8.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 8.1/8.1 MB 148.6 MB/s  0:00:00
+Downloading https://download-r2.pytorch.org/whl/cu128/torchaudio-2.11.0%2Bcu128-cp311-cp311-manylinux_2_28_x86_64.whl (1.7 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.7/1.7 MB 46.7 MB/s  0:00:00
+Downloading https://download.pytorch.org/whl/cu128/cuda_bindings-12.9.4-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl (12.2 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 12.2/12.2 MB 16.4 MB/s  0:00:00
+Installing collected packages: torchaudio, nvidia-cusparselt-cu12, cuda-toolkit, nvidia-nvtx-cu12, nvidia-nvshmem-cu12, nvidia-nvjitlink-cu12, nvidia-nccl-cu12, nvidia-curand-cu12, nvidia-cufile-cu12, nvidia-cuda-runtime-cu12, nvidia-cuda-nvrtc-cu12, nvidia-cuda-cupti-cu12, nvidia-cublas-cu12, cuda-bindings, nvidia-cusparse-cu12, nvidia-cufft-cu12, nvidia-cudnn-cu12, nvidia-cusolver-cu12, torch, torchvision
+  Attempting uninstall: torchaudio
+    Found existing installation: torchaudio 2.11.0
+    Uninstalling torchaudio-2.11.0:
+      Successfully uninstalled torchaudio-2.11.0
+  Attempting uninstall: cuda-toolkit
+    Found existing installation: cuda-toolkit 13.0.2
+    Uninstalling cuda-toolkit-13.0.2:
+      Successfully uninstalled cuda-toolkit-13.0.2
+  Attempting uninstall: cuda-bindings
+    Found existing installation: cuda-bindings 13.3.0
+    Uninstalling cuda-bindings-13.3.0:
+      Successfully uninstalled cuda-bindings-13.3.0
+  Attempting uninstall: torch
+    Found existing installation: torch 2.11.0
+    Uninstalling torch-2.11.0:
+      Successfully uninstalled torch-2.11.0
+  Attempting uninstall: torchvision
+    Found existing installation: torchvision 0.26.0
+    Uninstalling torchvision-0.26.0:
+      Successfully uninstalled torchvision-0.26.0
+
+ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. This behaviour is the source of the following dependency conflicts.
+cuda-python 13.3.0 requires cuda-bindings~=13.3.0, but you have cuda-bindings 12.9.4 which is incompatible.
+Successfully installed cuda-bindings-12.9.4 cuda-toolkit-12.8.1 nvidia-cublas-cu12-12.8.4.1 nvidia-cuda-cupti-cu12-12.8.90 nvidia-cuda-nvrtc-cu12-12.8.93 nvidia-cuda-runtime-cu12-12.8.90 nvidia-cudnn-cu12-9.19.0.56 nvidia-cufft-cu12-11.3.3.83 nvidia-cufile-cu12-1.13.1.3 nvidia-curand-cu12-10.3.9.90 nvidia-cusolver-cu12-11.7.3.90 nvidia-cusparse-cu12-12.5.8.93 nvidia-cusparselt-cu12-0.7.1 nvidia-nccl-cu12-2.28.9 nvidia-nvjitlink-cu12-12.8.93 nvidia-nvshmem-cu12-3.4.5 nvidia-nvtx-cu12-12.8.90 torch-2.11.0+cu128 torchaudio-2.11.0+cu128 torchvision-0.26.0+cu128

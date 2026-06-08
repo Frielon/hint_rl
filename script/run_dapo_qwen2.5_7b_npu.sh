@@ -108,6 +108,11 @@ LOG_FILE=${LOG_FILE:-"${EXP_LOG_DIR}/${exp_name}.jsonl"}
 CONSOLE_LOG=${CONSOLE_LOG:-"${EXP_LOG_DIR}/${exp_name}.${RUN_ID}.console.log"}
 mkdir -p "${EXP_LOG_DIR}"
 
+# Archive a verbatim copy of this training script into the per-run log dir so the
+# exact hyperparameters that produced the run are always recoverable alongside its
+# logs/checkpoints. RUN_ID in the name keeps re-launches of the same exp distinct.
+cp "${BASH_SOURCE[0]}" "${EXP_LOG_DIR}/$(basename "${BASH_SOURCE[0]}").${RUN_ID}"
+
 # Algorithm
 temperature=1.0
 top_p=1.0

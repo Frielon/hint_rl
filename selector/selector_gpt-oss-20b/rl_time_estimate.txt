@@ -1,0 +1,18 @@
+=== selector inference timing (measured) ===
+topology                : dp=8 tp=1  (replicas=8)
+eval wall time          : 138s
+throughput (saturated)  : 12849 tok/s
+mean tokens / call      : 831
+
+=== projected RL selector cost ===
+config                  : 4096 rollouts x 5 calls/rollout x 500 steps
+calls / step            : 20480
+tokens / step           : 17,018,880
+selector time / step    : 1325s  (22m4s)
+total selector calls    : 10,240,000
+total selector tokens   : 8,509,440,000
+TOTAL selector time     : 662275s  (183h57m)
+
+note: assumes the selector saturates this topology during RL (true if
+rollouts batch concurrently). If the selector shares GPUs with policy/train
+it is additive serially; on dedicated GPUs it overlaps up to max(step,sel).

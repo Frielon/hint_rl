@@ -2,26 +2,26 @@
 set -xeuo pipefail
 
 # ---------------------------------------------------------------------------
-# Dr. GRPO ("Understanding R1-Zero-Like Training", Liu et al. 2024) variant of
-# the DAPO run. It is plain GRPO with the two unbiased-estimator fixes from the
-# paper, and deliberately drops DAPO's extra machinery:
+# Plain GRPO variant, kept as an apples-to-apples sibling of
+# run_drgrpo_qwen2.5_7b_npu.sh. It is standard GRPO with the clip-higher
+# (asymmetric clip) trick and NO KL penalty, but WITHOUT the two Dr. GRPO
+# unbiased-estimator fixes:
 #
-#   Dr. GRPO changes vs. run_dapo_qwen2.5_7b_npu.sh
-#     * algorithm.norm_adv_by_std_in_grpo=False  -> advantage is (r - mean),
-#       WITHOUT dividing by the group std (removes the question-difficulty bias).
-#     * actor.loss_agg_mode=seq-mean-token-sum-norm -> loss is summed over tokens
-#       and normalized by a constant (max length) instead of per-response length
-#       (removes the response-length bias).
-#   Dropped DAPO tricks (not part of Dr. GRPO):
-#     * dynamic sampling / filter_groups (+ the 3x gen oversample batch)
-#     * clip-higher: asymmetric clip + dual-clip -> standard symmetric clip 0.2
-#     * overlong reward shaping -> plain "naive" reward manager
-#   Entry point is verl.trainer.main_ppo (the standard GRPO trainer), not the
-#   recipe.dapo.main_dapo recipe.
+#   GRPO changes vs. run_drgrpo_qwen2.5_7b_npu.sh
+#     * algorithm.norm_adv_by_std_in_grpo=True  -> advantage is (r - mean)/std,
+#       the standard GRPO group-normalized advantage (keeps the std divide that
+#       Dr. GRPO drops to remove question-difficulty bias).
+#     * actor.loss_agg_mode=token-mean -> loss is averaged per token over the
+#       whole batch (standard GRPO), instead of Dr. GRPO's
+#       seq-mean-token-sum-norm constant-length normalization.
+#   Kept the same as the Dr. GRPO run (per the request):
+#     * No KL: use_kl_in_reward=False, use_kl_loss=False, coefs 0.
+#     * clip-higher: asymmetric clip with clip_ratio_low / clip_ratio_high.
+#   Entry point is verl.trainer.main_ppo (the standard GRPO trainer).
 #
 # Everything else (model, data, lr schedule, batch sizes, n, lengths, sp_size,
 # offload, gpu-mem, dynamic bsz, gradient checkpointing, logging, ckpt) is kept
-# identical so DAPO vs Dr. GRPO is an apples-to-apples comparison.
+# identical so GRPO vs Dr. GRPO is an apples-to-apples comparison.
 #
 # All paths are derived from this script's own location so the tree can be
 # mounted anywhere. Expected layout (relative positions must be preserved):
@@ -67,26 +67,25 @@ if [ -f "${HINT_RL_HOME}/.envrc" ]; then
 fi
 export WANDB_API_KEY="${WANDB_API_KEY:-${wandb_key:-}}"
 
-project_name='Dr-GRPO-Qwen2.5-7B-Instruct'
-exp_name="Dr-GRPO-Qwen2.5-7B-Instruct-MATH-5582-$(date +%Y%m%d-%H%M%S)"
+project_name='GRPO-Qwen2.5-7B-Instruct'
+exp_name="GRPO-Qwen2.5-7B-Instruct-dapo-4k-$(date +%Y%m%d-%H%M%S)"
 wandb_project=${wandb_project:-"hint_rl"}
 
 adv_estimator=grpo
-# Dr. GRPO: do NOT divide the advantage by the group std.
-norm_adv_by_std_in_grpo=False
+# GRPO: divide the advantage by the group std (standard group normalization).
+norm_adv_by_std_in_grpo=True
 
 use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.0
-# DAPO-style asymmetric clip (clip-higher): lower clip 0.2, upper clip 0.3.
+# DAPO-style asymmetric clip (clip-higher): lower clip 0.2, upper clip 0.28.
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 max_prompt_length=2048
 max_response_length=8192
-# Dr. GRPO: sum the per-token loss and normalize by a constant (max length)
-# instead of the per-response length -> removes the length bias.
-loss_agg_mode="seq-mean-token-sum-norm"
+# GRPO: standard per-token mean over the batch.
+loss_agg_mode="token-mean"
 
 # Cluster: 2 nodes x 8 H100 = 16 GPUs. This requires a Ray cluster spanning
 # both nodes (see the `ray job submit` at the bottom); the job is dispatched
@@ -107,11 +106,10 @@ WORKING_DIR=${WORKING_DIR:-"${VERL_HOME}"}
 # The Ray runtime env is generated per-run just before submit (see below), so we
 # can inject secrets/log paths via env_vars; ${VERL_HOME}/recipe/dapo/runtime_env.yaml
 # is the upstream template it mirrors.
-
 # Paths
 MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Qwen2.5-7B-Instruct"}
 CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dapo_17k.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dapo-3740-hint-verl.parquet"}
 TEST_FILE=${TEST_FILE:-"${HINT_RL_HOME}/dataset/aime2024.parquet"}
 
 # Custom reward function (loaded by verl via custom_reward_function.path/.name)

@@ -1,0 +1,4 @@
+T=  0.7  parse_rate=0.960  self_consistency=0.899  agree_codex=0.646  majority_agree=0.644  mean_tokens=978
+T=  0.4  parse_rate=0.976  self_consistency=0.893  agree_codex=0.626  majority_agree=0.606  mean_tokens=941
+T=  0.2  parse_rate=0.986  self_consistency=0.905  agree_codex=0.626  majority_agree=0.629  mean_tokens=964
+T=  0.0  parse_rate=0.978  self_consistency=0.922  agree_codex=0.612  majority_agree=0.598  mean_tokens=1014

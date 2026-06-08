@@ -1,0 +1,47 @@
+# Tool config for Hint Penalized RL (HPRL).
+#
+# Declares the single stateful `request_hint` tool, implemented by
+# hint_tool.HintTool. verl loads this via
+#   actor_rollout_ref.rollout.multi_turn.tool_config_path=<this file>
+#
+# `class_name` is imported with importlib, so the directory holding hint_tool.py
+# (i.e. ${HINT_RL_HOME}/script/hint_rl) must be on PYTHONPATH -- the launch
+# script (run_hprl_qwen2.5_7b.sh) injects it via the Ray runtime env.
+#
+# The `config:` block is passed verbatim to HintTool.__init__; override the
+# selector endpoint / model from the launch script's environment if needed.
+tools:
+  - class_name: "hint_tool.HintTool"
+    config:
+      type: native
+      # --- frozen selector model (OpenAI-compatible endpoint) ---
+      selector_base_url: "${oc.env:SELECTOR_BASE_URL,http://localhost:30000/v1}"
+      selector_model: "${oc.env:SELECTOR_MODEL,Qwen3.5-27B}"
+      selector_api_key: "${oc.env:SELECTOR_API_KEY,EMPTY}"
+      temperature: 0.7
+      top_p: 0.95
+      max_tokens: 16000
+      request_timeout_s: 600.0
+      max_retries: 3
+      # fallback budget when a sample carries none (samples normally inject
+      # their own per-problem budget via extra_info.tools_kwargs.create_kwargs).
+      default_budget: 8
+    tool_schema:
+      type: "function"
+      function:
+        name: "request_hint"
+        description: >
+          Request a single step-level hint for the current math problem. A tutor
+          looks at your reasoning so far and returns the most useful next hint.
+          You may call this only a limited number of times (your hint budget);
+          each call you use lowers your reward, so call it only when genuinely
+          stuck. Solve as much as you can on your own.
+        parameters:
+          type: "object"
+          properties:
+            stuck_description:
+              type: "string"
+              description: >
+                A short description of where you are stuck or what you are unsure
+                about. Optional; the tutor mainly reads your reasoning so far.
+          required: []

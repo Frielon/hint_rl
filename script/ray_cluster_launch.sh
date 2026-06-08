@@ -65,7 +65,7 @@ RAY_BIN=${RAY_BIN:-"${CONDA_HOME}/envs/${CONDA_ENV}/bin/ray"}
 # invokes this script as `ray_cluster_launch.sh /xutao/ undefined`, so $1/$2 are
 # platform junk, not ours. A bare filename (no slash) is resolved against this
 # script's dir.
-TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_drgrpo_qwen2.5_7b_npu.sh"}
+TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_grpo_qwen2.5_7b_npu.sh"}
 # TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_drgrpo_qwen2.5_7b_npu.sh"}
 if [[ "${TRAIN_SCRIPT}" != */* ]]; then
     TRAIN_SCRIPT="${SCRIPT_DIR}/${TRAIN_SCRIPT}"
