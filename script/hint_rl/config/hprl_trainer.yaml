@@ -1,0 +1,51 @@
+# HPRL trainer config = stock ppo_trainer + the HPRL dynamic-budget knobs.
+#
+# Mirrors recipe/dapo/config/dapo_trainer.yaml: pull verl's base config in via
+# the searchpath (resolved relative to the launch cwd = the verl repo root, which
+# run_hprl_qwen2.5_7b.sh sets as the Ray working-dir), then layer our additions.
+#
+# The HPRL flag + knobs live under `data.hprl` because verl passes the data
+# config to the dataset (HintBudgetDataset, the injection side) while the trainer
+# reads the same node as `config.data.hprl` (the ratchet side) -- one source of
+# truth for both. With `data.hprl.enable=false` every HPRL override no-ops and
+# this is an ordinary multi-turn GRPO run.
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  # route every training row through the dynamic-budget dataset (injection side).
+  custom_cls:
+    path: ${oc.env:HINT_RL_HOME}/script/hint_rl/hint_dataset.py
+    name: HintBudgetDataset
+
+  # the HPRL dynamic-budget ratchet.
+  hprl:
+    # master switch. false -> HintBudgetDataset + HPRLRayPPOTrainer are no-ops.
+    enable: true
+    # shared budget-state JSON: written by the trainer ratchet, read by the
+    # dataset. Override per-experiment from the launch script.
+    budget_state_path: ${oc.env:HINT_RL_HOME}/logs/hprl_budget_state.json
+    # downward-rule knobs (see budget_manager.compute_downward_budget).
+    min_budget: 0
+    decrement: 1
+    # fallback B_q when a row carries no baked budget.
+    default_budget: 8
+    # tool name whose create_kwargs.budget is injected/enforced.
+    tool_name: request_hint
+    # when the policy emits <hint_call/> after the budget is spent:
+    #   true  -> terminate the rollout; false -> inject a "finish up" user message.
+    terminate_on_budget_exceeded: true
+    # hint-selection + penalty strategy. Read by the agent loop (HintAgentLoop);
+    # MUST be matched by the reward's custom_reward_function.reward_kwargs.hint_strategy.
+    #   "hint"       -> selector reveals ONE hint within the identified major step;
+    #                   that hint is excluded next call; per-hint penalty.
+    #   "major_step" -> reveal ALL hints of the identified major step at once;
+    #                   record + exclude the WHOLE step next call; charge the step
+    #                   penalty directly (hint_penalty.applied_step_penalty).
+    strategy: hint

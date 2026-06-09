@@ -85,6 +85,52 @@ def first_last(prob):
             np.array(fs), np.array(ls))
 
 
+def nonzero_among_init_zero(prob):
+    """Among problems whose FIRST-epoch accuracy is 0.0, count per epoch how many
+    have non-zero accuracy. Epoch = occurrence rank of the problem across steps
+    (1st occurrence = epoch 1, ...), since each problem reappears once per epoch.
+    Returns (epochs, nonzero_counts, present_counts, total_init_zero)."""
+    series = []
+    for h, d in prob.items():
+        ss = sorted(d)
+        accs = [d[s] for s in ss]
+        if accs and accs[0] == 0.0:
+            series.append(accs)
+    total = len(series)
+    max_ep = max((len(a) for a in series), default=0)
+    nonzero, present = [], []
+    for e in range(max_ep):
+        nonzero.append(sum(1 for a in series if len(a) > e and a[e] > 0.0))
+        present.append(sum(1 for a in series if len(a) > e))
+    return (np.arange(1, max_ep + 1), np.array(nonzero),
+            np.array(present), total)
+
+
+def plot_nonzero_among_init_zero(epochs, nonzero, present, total, out_png, title_extra=""):
+    if len(epochs) == 0:
+        print("[plot] no init-zero problems; skipping non-zero evolution plot")
+        return
+    fig, ax = plt.subplots(figsize=(11, 6))
+    ax.bar(epochs, nonzero, color="#55A868", edgecolor="white", linewidth=0.4,
+           label="# non-zero acc")
+    ax.plot(epochs, present, color="#8172B3", lw=1.5, marker="o", ms=3,
+            label="# init-zero problems present")
+    for x, y, p in zip(epochs, nonzero, present):
+        if p:
+            ax.text(x, y, f"{y/p*100:.0f}%", ha="center", va="bottom", fontsize=7)
+    ax.set_xlabel("epoch (occurrence rank)")
+    ax.set_ylabel("# problems")
+    ax.set_title(
+        f"Non-zero accuracy problems among the {total} initially zero-accuracy problems"
+        + (f"\n{title_extra}" if title_extra else ""),
+        fontsize=12)
+    ax.legend(loc="upper left", fontsize=9)
+    ax.grid(axis="y", ls=":", alpha=0.5)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=130)
+    print(f"[plot] saved -> {out_png}")
+
+
 def plot(first, last, out_png, title_extra=""):
     delta = last - first
     N = len(first)
@@ -131,6 +177,8 @@ def main():
     run_dir = os.path.dirname(rollouts)              # parent of the rollouts dir
     run_tag = os.path.basename(run_dir) or "run"
     out_png = args.out or os.path.join(run_dir, "accuracy_evolution_by_initial.png")
+    nz_out_png = os.path.join(os.path.dirname(out_png),
+                              "nonzero_among_init_zero_by_epoch.png")
     if args.no_cache:
         cache = None
     else:
@@ -152,6 +200,15 @@ def main():
         print(f"  {name:<24}{n:>7}{n/N*100:>6.1f}%{d.mean():>+9.3f}{(d>1e-9).mean()*100:>11.1f}%")
 
     plot(first, last, out_png, title_extra=run_tag)
+
+    epochs, nonzero, present, total_iz = nonzero_among_init_zero(prob)
+    if len(epochs):
+        print("\nnon-zero acc among init-zero problems (by epoch):")
+        print(f"  init-zero problems: {total_iz}")
+        for e, nz, pr in zip(epochs, nonzero, present):
+            print(f"  epoch {int(e):>3}: {nz:>6} / {pr:<6} non-zero ({nz/pr*100:>5.1f}%)" if pr else "")
+    plot_nonzero_among_init_zero(epochs, nonzero, present, total_iz, nz_out_png,
+                                 title_extra=run_tag)
 
     if args.csv:
         csv_path = args.csv if args.csv != "__auto__" else os.path.join(run_dir, "per_problem_acc_first_vs_last.csv")

@@ -1,0 +1,8 @@
+# HPRL custom agent-loop registry (verl rollout.agent.agent_loop_config_path).
+#
+# Registers the <hint_call/> rollout under agent_name "hint_agent" -> the dataset
+# rows tagged agent_name="hint_agent" (set by prepare_hint_data.py) route here.
+# The _target_ is imported from PYTHONPATH (= the script/hint_rl dir, exported by
+# the run script), so no verl core edit is needed.
+- name: hint_agent
+  _target_: hint_agent_loop.HintAgentLoop

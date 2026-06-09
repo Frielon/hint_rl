@@ -68,7 +68,7 @@ fi
 export WANDB_API_KEY="${WANDB_API_KEY:-${wandb_key:-}}"
 
 project_name='GRPO-Qwen2.5-7B-Instruct'
-exp_name="GRPO-Qwen2.5-7B-Instruct-dapo-4k-$(date +%Y%m%d-%H%M%S)"
+exp_name="GRPO-Qwen2.5-7B-Instruct-dapo-4k-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
 wandb_project=${wandb_project:-"hint_rl"}
 
 adv_estimator=grpo
@@ -119,7 +119,7 @@ REWARD_FN_NAME=${REWARD_FN_NAME:-"compute_score"}
 # Local logs
 #   - LOG_FILE   : verl 'file' logger, one JSON object of metrics per step
 #   - CONSOLE_LOG: full stdout/stderr of the training driver (text)
-RUN_ID=${RUN_ID:-"$(date +%Y%m%d-%H%M%S)"}
+RUN_ID=${RUN_ID:-"$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
 LOG_DIR=${LOG_DIR:-"${HINT_RL_HOME}/logs"}
 EXP_LOG_DIR=${EXP_LOG_DIR:-"${LOG_DIR}/${exp_name}"}
 LOG_FILE=${LOG_FILE:-"${EXP_LOG_DIR}/${exp_name}.jsonl"}
@@ -249,7 +249,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     trainer.test_freq=5 \
     trainer.save_freq=200 \
     trainer.max_actor_ckpt_to_keep=1 \
-    trainer.total_epochs=10 \
+    trainer.total_epochs=100 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.rollout_data_dir="${LOG_DIR}/${exp_name}/rollouts" \
     trainer.validation_data_dir="${LOG_DIR}/${exp_name}/val_rollouts" \

@@ -33,10 +33,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
-import sys
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -48,30 +46,16 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-# --------------------------------------------------------------------------- #
-# Reuse the offline selector prompt + parser verbatim.
-#
-# These live under ``${HINT_RL_HOME}/selector``. We add that directory to
-# sys.path (derived from HINT_RL_HOME, with a fallback relative to this file)
-# so the rollout uses the *same* prompt template and the *same* tolerant
-# <output> JSON parser the offline selector eval validated against.
-# --------------------------------------------------------------------------- #
-def _add_selector_to_path() -> None:
-    candidates = []
-    hint_rl_home = os.environ.get("HINT_RL_HOME")
-    if hint_rl_home:
-        candidates.append(os.path.join(hint_rl_home, "selector"))
-    # fallback: this file is at <HINT_RL_HOME>/script/hint_rl/hint_tool.py
-    here = os.path.dirname(os.path.abspath(__file__))
-    candidates.append(os.path.abspath(os.path.join(here, "..", "..", "selector")))
-    for c in candidates:
-        if os.path.isdir(c) and c not in sys.path:
-            sys.path.insert(0, c)
+# Offline selector prompt + tolerant <output> parser, vendored locally in
+# utils.py so the rollout uses the *same* prompt template and parser the offline
+# selector eval validated against, with no cross-folder import dependency.
+from utils import selector_prompt, hint_id_of, parse_output
 
+# Shared hint-pool filter (also used by hint_agent_loop.HintAgentLoop).
+from hint_selector import exclude_applied_hints
 
-_add_selector_to_path()
-from seletor_prompt import selector_prompt  # noqa: E402
-from run_hint_selection_model import hint_id_of, parse_output  # noqa: E402
+# Shared "N hint calls remaining" wording (identical to the <hint_call/> path).
+from hint_prompt import render_remaining_calls
 
 
 class HintTool(BaseTool):
@@ -153,7 +137,9 @@ class HintTool(BaseTool):
         # ---- build inputs for the selector model -------------------------
         problem = create_kwargs.get("problem", "")
         hints_obj = create_kwargs.get("hints", "")
-        hints_str = hints_obj if isinstance(hints_obj, str) else json.dumps(hints_obj, ensure_ascii=False)
+        # Exclude hints already surfaced this rollout so the selector cannot
+        # re-offer them; it must pick from the remaining candidates.
+        hints_str = exclude_applied_hints(hints_obj, applied)
         trace = self._build_trace(agent_data, applied)
 
         prompt = selector_prompt(problem, trace, hints_str)
@@ -186,14 +172,17 @@ class HintTool(BaseTool):
         )
 
         response_text = f"Hint: {hint_text}" if hint_text else "Hint: (the selector returned an empty hint)"
+        # Tell the policy how many hint calls remain (this one is already counted
+        # in `applied`), so it can ration the rest of its budget.
+        response_text = f"{response_text}\n\n{render_remaining_calls(budget - len(applied))}"
         metrics = {
             "hint_call": 1,
             "hint_id": hint_id,
             "hints_used": len(applied),
             "budget": budget,
         }
-        # tool step-reward is 0.0; the hint penalty is multiplicative on the
-        # final accuracy reward and is applied in the reward function instead.
+        # tool step-reward is 0.0; the hint penalty is subtracted from the final
+        # correct reward and is applied in the reward function instead.
         return ToolResponse(text=response_text), 0.0, metrics
 
     # ------------------------------------------------------------------ #

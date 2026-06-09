@@ -68,7 +68,7 @@ fi
 export WANDB_API_KEY="${WANDB_API_KEY:-${wandb_key:-}}"
 
 project_name='Dr-GRPO-Qwen2.5-7B-Instruct'
-exp_name="Dr-GRPO-Qwen2.5-7B-Instruct-MATH-5582-$(date +%Y%m%d-%H%M%S)"
+exp_name="Dr-GRPO-Qwen2.5-7B-Instruct-MATH-5582-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
 wandb_project=${wandb_project:-"hint_rl"}
 
 adv_estimator=grpo
@@ -121,7 +121,7 @@ REWARD_FN_NAME=${REWARD_FN_NAME:-"compute_score"}
 # Local logs
 #   - LOG_FILE   : verl 'file' logger, one JSON object of metrics per step
 #   - CONSOLE_LOG: full stdout/stderr of the training driver (text)
-RUN_ID=${RUN_ID:-"$(date +%Y%m%d-%H%M%S)"}
+RUN_ID=${RUN_ID:-"$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
 LOG_DIR=${LOG_DIR:-"${HINT_RL_HOME}/logs"}
 EXP_LOG_DIR=${EXP_LOG_DIR:-"${LOG_DIR}/${exp_name}"}
 LOG_FILE=${LOG_FILE:-"${EXP_LOG_DIR}/${exp_name}.jsonl"}
