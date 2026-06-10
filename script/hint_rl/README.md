@@ -89,8 +89,12 @@ stock `input`/`output`/`score`/`gts` + reward keys (`acc`, `num_hints`, ...):
    ./run_hprl_qwen2.5_7b.sh
    ```
 
-Validation (`aime2024.parquet`) has no `agent_name`, so it runs **single-turn /
-unaided** — it measures the policy's hint-free capability.
+Validation runs on two held-out sets (`VAL_FILES`), neither carrying an
+`agent_name`, so both run **single-turn / unaided** — measuring the policy's
+hint-free capability:
+- `aime2024.parquet` (30 problems) → `val-core/aime2024/*`;
+- `dapo_sample_hard_100.parquet` (100 hard DAPO problems, zero `problem_id`
+  overlap with the training set) → `val-core/math_dapo/*`.
 
 ### Cluster launch (5 nodes: 1 selector + 4 training)
 

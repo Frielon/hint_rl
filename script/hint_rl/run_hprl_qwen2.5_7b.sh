@@ -119,6 +119,15 @@ MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Qwen2.5-7B-Instruct"}
 CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dapo-3740-hint-verl-simplified-mt.parquet"}
 TEST_FILE=${TEST_FILE:-"${HINT_RL_HOME}/dataset/aime2024.parquet"}
+# Second held-out eval: 100 hard DAPO problems. Like aime2024 it carries NO
+# agent_name (-> unaided single-turn, the HintBudgetDataset passthrough), and its
+# problem_ids have ZERO overlap with the 3740 training rows. Its data_source is
+# "math_dapo", so verl reports it separately as val-core/math_dapo/* (aime2024
+# stays val-core/aime2024/*). verl evaluates each val file independently.
+HARD_TEST_FILE=${HARD_TEST_FILE:-"${HINT_RL_HOME}/dataset/dapo_sample_hard_100.parquet"}
+# All validation files as a hydra list (RLHFDataset concatenates them, each row
+# keeping its own data_source for per-set metrics). Override VAL_FILES to change.
+VAL_FILES=${VAL_FILES:-"['${TEST_FILE}','${HARD_TEST_FILE}']"}
 
 # HPRL reward function (outcome reward minus the summed hint penalty).
 REWARD_FN_PATH=${REWARD_FN_PATH:-"${SCRIPT_DIR}/hint_reward.py"}
@@ -241,7 +250,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     --address "${RAY_ADDRESS}" \
     -- python3 "${SCRIPT_DIR}/main_hprl.py" \
     data.train_files="${TRAIN_FILE}" \
-    data.val_files="${TEST_FILE}" \
+    data.val_files="${VAL_FILES}" \
     data.prompt_key=prompt \
     data.truncation='left' \
     data.return_raw_chat=True \
