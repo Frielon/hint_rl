@@ -1,8 +1,8 @@
 # Downward Budget Ratchet — HPRL §7 (IMPLEMENTED)
 
 Per-problem hint budget `B_q` that **ratchets downward** as the policy proves it
-can solve a problem with fewer hints. This is the downward half of paper
-Section 7 (the upward-on-plateau half is deferred).
+can solve a problem with fewer hints. The ratchet is **strictly downward — there
+is no upward / budget-raising mechanism.**
 
 **Status: implemented**, gated behind the `data.hprl.enable` flag. Everything is
 an *override* — a custom dataset class, a `RayPPOTrainer` subclass, and a recipe
@@ -16,27 +16,28 @@ the code path is byte-for-byte stock verl. The pure rule + state store live in
 
 For one problem `q`, evaluated once per epoch over its group of rollouts:
 
-- Let `N` = total rollouts for the problem this step (`rollout.n`, here 16).
-- Let `C` = number of those rollouts that reached the correct answer.
+- Let `C` = number of rollouts that reached the correct answer.
 - Let `h_1 … h_C` = the hint-call counts of the **correct** rollouts.
 
 ```
-if 2·C < N:                      # fewer than half correct
-    B_q  unchanged               # not yet reliable at this budget
-else:                            # at least half correct
-    asc   = sort(h_1 … h_C)      # ascending
-    v     = asc[N//2 - 1]        # the (N/2)-th SMALLEST correct hint count
-    B_q   = clamp(v - 1, min_budget, current_B_q)
+if C == 0:                       # no correct rollout
+    B_q  unchanged               # couldn't solve it at this budget
+else:
+    m = min(h_1 … h_C)           # fewest hints any correct rollout used
+    if m < current_B_q:          # some success beats the budget
+        B_q = m                  # cap everyone at the best rollout's usage
+    else:                        # m == current_B_q (most frugal still used all)
+        B_q = current_B_q - 1    # squeeze by one
+    B_q = clamp(B_q, min_budget, current_B_q)
 ```
 
-`clamp(…, min_budget, current_B_q)` makes the ratchet **monotone down** (never
+`clamp(…, min_budget, current_B_q)` makes the ratchet **strictly downward** (never
 raises `B_q`) and floors it at `min_budget` (default `0` → a problem may ratchet
 all the way to fully unaided, its terminal state).
 
-**Worked example.** `N=8`, 6 correct with hint counts `[1,2,2,3,4,5]`:
-`N/2 = 4` → 4th smallest = `3` → new `B_q = 3 - 1 = 2`. Intuition: at least half
-the rollouts already succeed using `≤ 3` hints, so squeeze the budget just under
-that to push the policy to solve one more step unaided next epoch.
+**Worked example.** budget `5`, correct hint counts `[2,3,4]`: `m = 2 < 5` → new
+`B_q = 2`. The luckiest success solved with 2 hints, so cap the whole problem at
+2 next epoch. If instead every success used all 5 (`m == 5`), squeeze to `4`.
 
 ---
 
@@ -189,5 +190,5 @@ fields.
   rises; terminal state is `B_q=0` (unaided GRPO problem).
 - **`max_assistant_turns` (8)** stays `≥` any budget since budgets only fall —
   no change needed.
-- This only handles the **downward** half of §7. The upward-on-plateau ratchet
-  is a separate function in the same module later.
+- The ratchet is **strictly downward — there is no upward / budget-raising
+  mechanism.**

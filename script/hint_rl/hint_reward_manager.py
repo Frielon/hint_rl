@@ -76,6 +76,10 @@ class HintRewardManager(RewardManagerBase):
         if "applied_hints" not in extra_info and "applied_hints" in ntb:
             extra_info["applied_hints"] = _to_py(ntb.get("applied_hints"))
 
+        # Same for the per-turn reasoning lengths feeding the effort-shaping term.
+        if "turn_lens" not in extra_info and "turn_lens" in ntb:
+            extra_info["turn_lens"] = _to_py(ntb.get("turn_lens"))
+
         extra_info["num_turns"] = ntb.get("__num_turns__", None)
         extra_info["rollout_reward_scores"] = ntb.get("reward_scores", {})
 

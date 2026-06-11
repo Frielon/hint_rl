@@ -30,7 +30,10 @@
 # Required env (injected by the PyTorchJob): MASTER_ADDR, MASTER_PORT,
 #   WORLD_SIZE, and a per-node RANK (RANK / NODE_RANK / GROUP_RANK / *_COMM_WORLD_RANK).
 # Key overrides:
-#   SELECTOR_NNODES   # of pods serving the selector (default: 2).
+#   TRAIN_NNODES      # of training pods (default: WORLD_SIZE - SELECTOR_NNODES).
+#   SELECTOR_NNODES   # of pods serving the selector (default: 2). Set BOTH to
+#                     pick any split (e.g. TRAIN_NNODES=2 SELECTOR_NNODES=1);
+#                     WORLD_SIZE must equal the sum (validated at launch).
 #   SELECTOR_HOST     comma-separated selector host/IPs (skips rendezvous).
 #   SELECTOR_*        serving + call params (see below).
 # =============================================================================
@@ -56,7 +59,26 @@ source "${CONDA_HOME}/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV}"
 
 # --- cluster topology ------------------------------------------------------
-WORLD_SIZE=${WORLD_SIZE:-6}            # default: 4 training + 2 selector pods
+# Specify the split EXPLICITLY: TRAIN_NNODES training pods + SELECTOR_NNODES
+# selector pods (any combination, e.g. 4+2, 2+1, 1+1). WORLD_SIZE (injected by
+# the PyTorchJob) must equal their sum -- mismatches abort so a job-spec replica
+# count that disagrees with the requested split fails at launch, not mid-run.
+# If TRAIN_NNODES is unset it is derived as WORLD_SIZE - SELECTOR_NNODES (the
+# original behavior); if WORLD_SIZE is unset it is derived as the sum.
+SELECTOR_NNODES=${SELECTOR_NNODES:-2}
+if [ -z "${TRAIN_NNODES:-}" ]; then
+    TRAIN_NNODES=$(( ${WORLD_SIZE:-6} - SELECTOR_NNODES ))
+fi
+WORLD_SIZE=${WORLD_SIZE:-$((TRAIN_NNODES + SELECTOR_NNODES))}
+if [ "$((TRAIN_NNODES + SELECTOR_NNODES))" -ne "${WORLD_SIZE}" ]; then
+    echo "[launch] FATAL: TRAIN_NNODES(${TRAIN_NNODES}) + SELECTOR_NNODES(${SELECTOR_NNODES}) != WORLD_SIZE(${WORLD_SIZE})." >&2
+    echo "         Set the job's replica count to the sum, or fix the split." >&2
+    exit 1
+fi
+if [ "${TRAIN_NNODES}" -lt 1 ] || [ "${SELECTOR_NNODES}" -lt 1 ]; then
+    echo "[launch] FATAL: need >= 1 training pod and >= 1 selector pod (got train=${TRAIN_NNODES} selector=${SELECTOR_NNODES})." >&2
+    exit 1
+fi
 # node rank, from whichever the launcher set.
 RANK=${RANK:-${NODE_RANK:-${GROUP_RANK:-${PMI_RANK:-${OMPI_COMM_WORLD_RANK:-}}}}}
 if [ -z "${RANK}" ]; then
@@ -66,9 +88,7 @@ if [ -z "${RANK}" ]; then
 fi
 # The selector occupies the LAST SELECTOR_NNODES ranks (all symmetric, independent
 # servers); the first selector rank must be != 0 (rank 0 = MASTER_ADDR = Ray head).
-SELECTOR_NNODES=${SELECTOR_NNODES:-2}
 SELECTOR_FIRST_RANK=${SELECTOR_FIRST_RANK:-$((WORLD_SIZE - SELECTOR_NNODES))}
-TRAIN_NNODES=$((WORLD_SIZE - SELECTOR_NNODES))
 IS_SELECTOR_NODE=0; [ "${RANK}" -ge "${SELECTOR_FIRST_RANK}" ] && IS_SELECTOR_NODE=1
 
 # --- selector SERVING config (one INDEPENDENT single-node server per pod) ---

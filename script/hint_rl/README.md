@@ -130,8 +130,10 @@ static-budget multi-turn GRPO run. With it **on**:
    budget are set to its *current* `B_q`, read from the budget-state JSON.
 2. **Ratchet** (`hprl_ray_trainer.py` → `hint_budget_callback.py`): after each
    step, rollouts are grouped by `problem_id` and `B_q` is lowered per the rule
-   in `budget_manager.compute_downward_budget` (if ≥ half the rollouts are
-   correct, drop to one below the N/2-th-smallest correct hint count).
+   in `budget_manager.compute_downward_budget` (if any rollout is correct, drop
+   to the fewest hints a correct rollout used — or one less when even the most
+   frugal success used the whole budget; if none correct, hold). Strictly
+   downward — there is no budget-raising mechanism.
 3. **Persist**: the new table is atomically written back to the JSON the dataset
    reads. It survives restarts (`resume_mode=auto`).
 
@@ -184,9 +186,15 @@ three knobs are `reward_kwargs` (run-script env `HINT_PENALTY_TOTAL`,
 `HINT_PENALTY_HARD_FACTOR`, `HINT_GUIDANCE_DIFFICULTY`) — **retunable without
 regenerating the dataset**. The total is invariant to `hard_factor` (it only
 redistributes). Reward: a wrong answer gets `incorrect_reward`; a correct answer
-gets `correct_reward − Σ wₖ` (the penalty applies only when correct).
+gets `correct_reward − Σ wₖ − shape` (penalties apply only when correct), where
+`shape` is the effort-shaping penalty (`HINT_SHAPE_COEFF`, default 0.3): per
+applied hint, `coeff · relu(mean_turn_len − pre_call_reasoning_len)/mean_turn_len`
+summed over calls — it discourages calling a hint after too-little reasoning
+(the front-loading pathology). The correct score is **floored at `incorrect_reward`
+(−1)** so a hinted success never scores below a failure.
 
-## Not yet implemented (hooks left open)
+## Design notes
 
-- **Upward-on-plateau** half of the budget ratchet (§7) — only the downward
-  ratchet is wired so far.
+- The budget ratchet is **strictly downward by design — there is no upward /
+  budget-raising mechanism.** A problem's `B_q` only ever falls (or holds), never
+  rises; its terminal state is `B_q=0` (fully unaided).

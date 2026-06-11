@@ -92,6 +92,74 @@ def hint_penalty(
     )
 
 
+def effort_shortfall_sum(turn_lens) -> float:
+    """Coefficient-FREE, ORDER-AWARE effort-shaping signal.
+
+    Motivation: the base hint penalty is *timing-blind* -- a hint costs the same
+    whether the policy called it after a genuine struggle or after one shallow
+    sentence. Empirically that makes the policy front-load hint calls (reason for
+    a few tokens, call a hint, repeat) and only reason hard once the budget is
+    spent. We want EARLIER turns to reason as hard as LATER turns, so the signal
+    must encode turn ORDER -- a turn is bad only if a *later* turn out-reasoned it.
+
+    For the rollout's ordered assistant-turn token lengths ``L_1..L_T``
+    (``turn_lens``), the reference for turn ``i`` is the SUFFIX MAXIMUM
+    ``M_i = max(L_i, L_{i+1}, ..., L_T)`` -- the hardest reasoning at or after
+    turn i. The per-turn shortfall is::
+
+        shortfall_i = relu(M_i - L_i) / M_i = (M_i - L_i) / M_i     in [0, 1)
+
+    and the signal is the SUM over turns::
+
+        shortfall_sum = sum_i shortfall_i
+
+    Equivalent to the recursive rule "from the front, find the longest turn k,
+    score turns 1..k against L_k, then recurse on k+1..T": when k = argmax(L_i..L_T),
+    every j in [i..k] has max(L_j..L_T) = L_k, so this is exactly the suffix max.
+    Computed in one right-to-left pass.
+
+    Order semantics (the point of this design):
+      * reasoning NON-INCREASING over turns (hard early, ease off) -> every M_i is
+        the turn's own length -> shortfall_sum = 0 ("reason hard first" is free);
+      * reasoning RISING (shallow early, long late = front-loading) -> penalized;
+      * the longest turn(s) and the final turn contribute 0 (M_i == L_i there), so
+        a hint-free single-turn rollout is 0 and the final solve turn is never
+        penalized -- it only raises the bar for the turns before it.
+
+    This is the raw quantity logged to wandb (``hint_shape_sum``); the reward
+    subtracts ``coeff * shortfall_sum`` (see ``effort_shortfall_penalty``).
+    Returns 0.0 for missing/empty/single-turn ``turn_lens`` (incl. legacy rollouts
+    without the field).
+    """
+    if turn_lens is None:
+        return 0.0
+    if hasattr(turn_lens, "tolist"):
+        turn_lens = turn_lens.tolist()
+    lens = [float(x) for x in turn_lens if x is not None]
+    if len(lens) < 2:
+        return 0.0  # 0 or 1 turn: nothing later to fall short of.
+    total = 0.0
+    suffix_max = 0.0
+    # right -> left: after updating, suffix_max == max(L_i .. L_T).
+    for length in reversed(lens):
+        if length > suffix_max:
+            suffix_max = length
+        if suffix_max > 0:
+            total += (suffix_max - length) / suffix_max
+    return total
+
+
+def effort_shortfall_penalty(turn_lens, coeff: float) -> float:
+    """Coeff-scaled effort-shaping penalty: ``coeff * effort_shortfall_sum(...)``.
+
+    Returns 0.0 when disabled (``coeff <= 0``). The caller subtracts this from the
+    CORRECT reward only.
+    """
+    if coeff <= 0:
+        return 0.0
+    return float(coeff) * effort_shortfall_sum(turn_lens)
+
+
 def compute_score(
     data_source: str,
     solution_str: str,
@@ -105,6 +173,7 @@ def compute_score(
     hint_penalty_hard_factor: float = DEFAULT_HARD_FACTOR,
     hint_guidance_difficulty: str = DEFAULT_GUIDANCE_DIFFICULTY,
     hint_strategy: str = STRATEGY_HINT,
+    hint_shape_coeff: float = 0.0,
     **kwargs,
 ) -> dict:
     """HPRL reward: outcome correctness minus the summed hint penalty.
@@ -115,6 +184,10 @@ def compute_score(
     regenerating the dataset. ``hint_strategy`` must match the strategy the agent
     loop ran (``data.hprl.strategy``): ``"hint"`` charges per-hint penalties,
     ``"major_step"`` charges per-step penalties directly.
+
+    ``hint_shape_coeff`` (>0) additionally subtracts the effort-shaping penalty
+    (``effort_shortfall_penalty``) from the CORRECT reward, discouraging hints
+    called after too-little reasoning. 0 disables it.
 
     Returns a dict whose ``score`` is the optimized reward and whose extra keys
     are logged as ``reward_extra_info`` by the reward manager (``acc`` is also
@@ -148,11 +221,26 @@ def compute_score(
         strategy=hint_strategy,
     )
 
+    # --- effort-shaping penalty (order-aware: earlier turns must reason as hard
+    # as later ones) -----------------------------------------------------
+    # The raw, coefficient-FREE shortfall sum (sum_i relu(suffixmax_i - L_i)/
+    # suffixmax_i over the ordered turn lengths) is computed ALWAYS -- even when
+    # shaping is disabled (coeff <= 0) -- so the front-loading signal is logged to
+    # wandb (hint_shape_sum) in the control arm too. The applied penalty is
+    # coeff * that sum, subtracted ONLY from the correct reward (a wrong answer
+    # stays at exactly the base incorrect_reward, -1).
+    shape_sum = effort_shortfall_sum(extra_info.get("turn_lens"))
+    shape_penalty = float(hint_shape_coeff) * shape_sum if hint_shape_coeff > 0 else 0.0
+
     # Wrong answer -> base (incorrect) reward, ignoring hints. Correct answer ->
     # base (correct) reward minus the summed hint penalty (each hint used lowers
-    # the reward).
+    # the reward) and the effort-shaping penalty (shallow calls lower it further).
+    # The correct score is FLOORED at incorrect_reward (-1): even a fully hinted /
+    # front-loaded correct rollout never scores below a wrong answer, so the hint
+    # + shaping penalties can't make "solve with hints" worse than "fail" (which
+    # would push GRPO to suppress hint use entirely).
     if correct:
-        score = base - penalty
+        score = max(base - penalty - shape_penalty, incorrect_reward)
     else:
         score = base
 
@@ -171,5 +259,7 @@ def compute_score(
         "has_format": 1.0 if has_format else 0.0,
         "num_hints": float(len(applied_hints)),
         "hint_penalty": float(penalty),
+        "hint_shape_sum": float(shape_sum),
+        "hint_shape_penalty": float(shape_penalty),
         "hint_call_failed": float(hint_call_failed or 0),
     }

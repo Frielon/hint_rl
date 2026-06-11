@@ -9,9 +9,12 @@
 #   * generates each assistant turn that STILL ENDS ON EOS -- we do NOT add the
 #     sentinel (or any tool stop token) as a stop string; generation terminates
 #     naturally and we inspect the finished turn afterward;
-#   * DETECTS ``<hint_call/>`` in the decoded turn (this is the hint-call
-#     detection). If present and budget remains, it asks the frozen selector for
-#     a hint and injects it as the next USER message, then continues;
+#   * DETECTS a hint call ONLY when the finished turn ENDS with ``<hint_call/>``
+#     alone on its own line (the taught "emit it on its own line and stop"
+#     format). Inline / mid-reasoning sentinels are NOT requests -- a bare
+#     substring match let the policy learn to spam the sentinel. If a real hint
+#     call is seen and budget remains, it asks the frozen selector for a hint and
+#     injects it as the next USER message, then continues;
 #   * enforces the per-problem budget B_q (from tools_kwargs, kept current by the
 #     dynamic-budget dataset) and records each applied hint into
 #     ``extra_fields["applied_hints"]`` -- the SAME state key HintTool used, so
@@ -102,8 +105,9 @@ class HintAgentLoop(ToolAgentLoop):
         This mirrors ToolAgentLoop._handle_generating_state EXCEPT:
           (1) it does NOT inject the tool-parser stop tokens -- the turn ends on
               EOS only (per the design: the generation/step token is unchanged);
-          (2) the continuation decision is driven by detecting ``<hint_call/>`` in
-              the finished turn instead of parsing hermes tool calls.
+          (2) the continuation decision is driven by detecting a hint call --
+              ``<hint_call/>`` alone on the finished turn's LAST line (see
+              ``_is_hint_call``) -- instead of parsing hermes tool calls.
         """
         # (1) EOS only: intentionally NOT adding self.tool_parser.stop_token_ids.
         with simple_timer("generate_sequences", agent_data.metrics):
@@ -146,9 +150,21 @@ class HintAgentLoop(ToolAgentLoop):
         # the reward fn and aggregated by hint_budget_callback so a selector outage
         # is VISIBLE in hprl/* metrics instead of silently degrading every call.
         agent_data.extra_fields.setdefault("hint_call_failed", 0)
+        # Per-turn reasoning-token lengths for the reward's ORDER-AWARE effort-
+        # shaping term (hint_reward.effort_shortfall_sum). Each turn is scored
+        # against the SUFFIX MAXIMUM of this (ordered) list -- a turn is penalized
+        # only to the extent that a LATER turn out-reasoned it, so rising/front-
+        # loaded reasoning is penalized while reasoning hard early is free. ORDER
+        # MATTERS: appended in chronological turn order, for EVERY assistant turn
+        # (final solve turn + hint-free rollouts included). Initialized here for
+        # the same DataProto.concat reason as applied_hints.
+        agent_data.extra_fields.setdefault("turn_lens", [])
 
         agent_data.assistant_turns += 1
         agent_data.response_ids = output.token_ids
+        # length of THIS assistant turn (== reasoning since the previous hint /
+        # start, since each turn restarts after an injected hint user-message).
+        agent_data.extra_fields["turn_lens"].append(len(output.token_ids))
         agent_data.prompt_ids += agent_data.response_ids
         agent_data.response_mask += [1] * len(agent_data.response_ids)
         if output.log_probs:
@@ -165,10 +181,30 @@ class HintAgentLoop(ToolAgentLoop):
             return AgentState.TERMINATED
 
         # (2) hint-call DETECTION on the finished (EOS-terminated) turn.
+        # A hint call is recognized ONLY when the turn ENDS with the sentinel on
+        # its own line -- i.e. the policy emitted ``<hint_call/>`` alone on the
+        # final line and then stopped (EOS). A plain substring match treated any
+        # inline ``<hint_call/>`` buried mid-reasoning as a request, which the
+        # policy learns to spam (occurrences/turn blow up late in training); the
+        # taught format is "emit it alone on its own line and stop", so we key off
+        # exactly that and let everything else terminate as a normal answer turn.
         text = self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
-        if self.hint_sentinel in text:
+        if self._is_hint_call(text):
             return AgentState.PROCESSING_TOOLS  # reuse this state slot for hint injection
         return AgentState.TERMINATED
+
+    def _is_hint_call(self, text: str) -> bool:
+        """True iff the finished turn ends with the sentinel alone on its own line.
+
+        Requires both signals the format teaches: the sentinel is on its OWN line
+        (nothing but whitespace around it) and it is the LAST thing the policy
+        emitted before stopping (EOS). Trailing whitespace/newlines are ignored;
+        an inline or non-terminal ``<hint_call/>`` is NOT a hint call.
+        """
+        stripped = text.rstrip()
+        last_nl = stripped.rfind("\n")
+        last_line = stripped[last_nl + 1 :] if last_nl != -1 else stripped
+        return last_line.strip() == self.hint_sentinel
 
     # ------------------------------------------------------------------ #
     # hint selection + inject as a USER message
@@ -226,8 +262,14 @@ class HintAgentLoop(ToolAgentLoop):
             # hint_select/{min,max,mean} (+ slowest/hint_select) in wandb.
             with simple_timer("hint_select", agent_data.metrics):
                 selection, _raw, err = await self._selector.select(problem, trace, hints_str)
-            if selection is None:
-                logger.warning("hint selection failed (request=%s): %s", agent_data.request_id, err)
+            # Guard on dict, not just None: no selector output shape may crash the
+            # rollout (a stray JSON array once killed a whole run via .get on a list).
+            if not isinstance(selection, dict):
+                logger.warning(
+                    "hint selection failed (request=%s): %s",
+                    agent_data.request_id,
+                    err if selection is None else f"non-dict selection: {type(selection).__name__}",
+                )
                 agent_data.extra_fields["hint_call_failed"] = (
                     agent_data.extra_fields.get("hint_call_failed", 0) + 1
                 )
@@ -271,6 +313,10 @@ class HintAgentLoop(ToolAgentLoop):
                 "major_step_id": selection.get("major_step_id"),
                 "hint": hint_text,
                 "confidence_of_hint": selection.get("confidence_of_hint"),
+                # token length of the turn that emitted this <hint_call/> (==
+                # reasoning since the previous hint). The reward's effort-shaping
+                # term scores this against the rollout's mean turn length.
+                "reasoning_len": len(agent_data.response_ids),
             }
         )
         agent_data.metrics["hint_call"] = agent_data.metrics.get("hint_call", 0) + 1
@@ -305,6 +351,10 @@ class HintAgentLoop(ToolAgentLoop):
                 "hint_ids": [h.get("hint_id") for h in step_hints if isinstance(h, dict)],
                 "hint": body,
                 "confidence_of_major_step": selection.get("confidence_of_major_step"),
+                # token length of the turn that emitted this <hint_call/> (==
+                # reasoning since the previous hint). The reward's effort-shaping
+                # term scores this against the rollout's mean turn length.
+                "reasoning_len": len(agent_data.response_ids),
             }
         )
         agent_data.metrics["hint_call"] = agent_data.metrics.get("hint_call", 0) + 1

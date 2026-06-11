@@ -131,6 +131,42 @@ def hprl_update_budgets(
     deltas = [(u.old_budget - u.new_budget) for u in updates]
     n_problems = len(updates)
 
+    # "Active learning" problems: prompt-groups with BOTH a correct AND an
+    # incorrect rollout (0 < C < N). Only these carry a correct-vs-wrong contrast
+    # -- the groups the policy actually learns a correctness signal from; an
+    # all-correct or all-wrong group has no such spread. (Under HPRL the reward is
+    # continuous, so an all-correct group can still have non-zero GRPO variance via
+    # differing hint/shape penalties; this is specifically the correct/incorrect-
+    # mixed fraction.)
+    n_active = sum(
+        1
+        for results in groups.values()
+        if any(ok for ok, _ in results) and any(not ok for ok, _ in results)
+    )
+
+    # -------- effort-shaping signal (TRAINING scalar) -----------------------
+    # hint_reward.compute_score returns hint_shape_sum (coeff-free shortfall sum)
+    # and hint_shape_penalty (coeff-scaled, what's actually subtracted) per
+    # rollout, but verl only auto-aggregates reward_extra_info to wandb on the
+    # VALIDATION path -- where it's always 0 (val is single-turn / no hints). We
+    # surface it as a TRAINING scalar here (best-effort; absent in legacy runs).
+    # `*_hinted` averages only over rollouts that actually applied a hint -- the
+    # meaningful "how shallow were the pre-hint turns" signal; the plain mean is
+    # diluted by hint-free rollouts (which contribute 0).
+    shape_sum_arr = ntb.get("hint_shape_sum")
+    shape_pen_arr = ntb.get("hint_shape_penalty")
+    shape_metrics = {}
+    if shape_sum_arr is not None:
+        sums = [float(_to_py(shape_sum_arr[i]) or 0.0) for i in range(n)]
+        hinted = [s for i, s in enumerate(sums) if int(round(float(_to_py(num_hints[i])))) > 0]
+        shape_metrics["hprl/hint_shape_sum_mean"] = float(sum(sums) / n) if n else 0.0
+        shape_metrics["hprl/hint_shape_sum_mean_hinted"] = (
+            float(sum(hinted) / len(hinted)) if hinted else 0.0
+        )
+    if shape_pen_arr is not None:
+        pens = [float(_to_py(shape_pen_arr[i]) or 0.0) for i in range(n)]
+        shape_metrics["hprl/hint_shape_penalty_mean"] = float(sum(pens) / n) if n else 0.0
+
     metrics = {
         "hprl/n_problems": float(n_problems),
         "hprl/budget_mean": float(sum(new_budgets) / n_problems),
@@ -140,6 +176,10 @@ def hprl_update_budgets(
         "hprl/num_ratcheted": float(n_changed),
         "hprl/frac_ratcheted": float(n_changed / n_problems),
         "hprl/correct_frac_mean": float(sum(correct_fracs) / len(correct_fracs)) if correct_fracs else 0.0,
+        # fraction of problems with mixed correct/incorrect rollouts this step.
+        "hprl/active_learning_frac": float(n_active / n_problems),
+        "hprl/num_active_learning": float(n_active),
+        **shape_metrics,
     }
 
     # -------- selector health: applied vs failed hint calls -----------------

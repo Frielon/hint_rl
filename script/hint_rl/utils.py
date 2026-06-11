@@ -5,9 +5,13 @@ and ``run_hint_selection_model.py``) via a sys.path hack. They are vendored here
 that everything the HPRL rollout needs lives inside ``script/hint_rl`` and the package
 has no cross-folder import dependency.
 
-Kept verbatim so the rollout uses the *same* prompt template and the *same* tolerant
-<output> JSON parser the offline selector eval validated against. If the offline
-selector changes, sync the relevant pieces here.
+The <output> parser is kept verbatim. The prompt template is the ``v2_final_gate``
+variant (selector/prompt_variants.py): the original offline template plus the
+"Ground rules for crediting progress" and "Guard the final step" sections, which cut
+unearned final-step (answer-bearing) reveals 32.1% -> 9.4% @T=0.7 / 7.0% @T=0.1 on
+replayed failure cases -- see selector/prompt_improvement_progress.md. NOTE: those
+gains assume the selector sees the student's reasoning; they require the
+blind-trace fix in hint_agent_loop (assistant turns appended to agent_data.messages).
 """
 from __future__ import annotations
 
@@ -46,7 +50,28 @@ Go through the major steps in order and, for each one, **verify whether the stud
 - A step counts as completed **only if** the student has correctly carried out its substance. A step is **not** completed if the student's work for it is wrong, rests on a false premise, sets the problem up incorrectly, or has merely been *named or recognized* without being executed. A confident but incorrect conclusion means the step is **not** complete.
 - Conversely, do not rewind to an earlier step over a trivial, purely mechanical omission (e.g., an unstated arithmetic sum) when the student has clearly done that step's substantive reasoning.
 
+### Ground rules for crediting progress
+- Hints previously given by the tutor appear in the trace. **Hint text is not
+  student work.** A step counts as completed only if the *student's own
+  writing* carries out its substance after (or independently of) any hint.
+  Content that merely echoes a given hint, or a step whose hint was shown but
+  that the student never executed, is NOT completed.
+- Progress requires new written reasoning. If the student has written little
+  or nothing of substance since the last hint was given, then no additional
+  step can have been completed since then.
+- The candidate list contains only steps whose hints have **not** been given
+  yet. Do not skip over an earlier candidate step because you, the tutor, can
+  see how it would go -- the student still has to do it.
+
 The current step is the **earliest step the student has not yet completed correctly**. Note that this may be *earlier* than where the student feels stuck: if the student's work first went wrong at an earlier step, anchor on that step, not on the point they report being stuck. Justify your choice with specific evidence from the trace, including any error you found in the student's earlier work.
+
+### Guard the final step
+The last major step typically states the final answer. Selecting it gives the
+answer away, so it is justified **only** when the student's own written work
+has correctly completed every earlier candidate step. If you are at all unsure
+whether an earlier candidate step is genuinely done, select that earlier step
+instead. An unearned answer reveal is a much worse error than a hint that is
+one step too early.
 
 ## 2. Select a hint within that major step
 - If the student has not yet recognized *what* this step requires, select the `step_guidence_hint` (the `X.0` hint).
@@ -185,25 +210,44 @@ def _hard_parse(text: str):
     return None
 
 
+def _as_selection_dict(obj):
+    """Coerce a parsed selection to a dict, or None.
+
+    The selector occasionally emits a JSON array of candidate selections instead
+    of the single object the prompt asks for; take the first dict element (its
+    top candidate) rather than failing the call. Anything else (string, number,
+    list without dicts) is rejected so parse_output falls through to its other
+    extraction strategies.
+    """
+    if isinstance(obj, dict):
+        return obj
+    if isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, dict):
+                return item
+    return None
+
+
 def parse_output(raw: str):
     """Pull the JSON object out of <output>...</output>, then fall back to a
     brace-matched object and a fenced ```json block. Tolerates invalid LaTeX
-    backslash escapes. Returns (obj, error)."""
+    backslash escapes. Always returns a dict or None -- a JSON array from the
+    selector is coerced to its first object. Returns (obj, error)."""
     m = OUTPUT_RE.search(raw)
     if m:
         block = m.group(1).strip()
         # strip a ```json fence if the model added one inside the tags
         block = re.sub(r"^```(?:json)?\s*|\s*```$", "", block.strip())
-        obj = _loads_lenient(block)
+        obj = _as_selection_dict(_loads_lenient(block))
         if obj is not None:
             return obj, None
-        obj = _extract_last_json_object(block)
+        obj = _as_selection_dict(_extract_last_json_object(block))
         if obj is not None:
             return obj, None
         err = "json decode failed (after escape repair)"
     else:
         err = "no <output> block"
-    obj = _extract_last_json_object(raw)
+    obj = _as_selection_dict(_extract_last_json_object(raw))
     if obj is not None:
         return obj, None
     # hard fallback: field-by-field regex extraction that tolerates JSON the

@@ -33,25 +33,28 @@ DEFAULT_BASE_SYSTEM = "You are a math assistant."
 # Mechanism note: the hint is requested by emitting the sentinel ``<hint_call/>``
 # on its own line (NOT a hermes ``request_hint`` tool call); the rollout side must
 # detect that sentinel and inject the curated hint back as the next USER message.
+#
+# DELIBERATELY NO few-shot example (Round 14, 2026-06-10): any worked demo is
+# parroted — the Round-13 "Step 1: ... Step 2: ..." demo had the live policy
+# copying the skeleton in 78-86% of first turns with ever-shorter step
+# statements. Demo-free, the style bias disappears (~5% step-form, all genuine),
+# pre-1st-call CoT doubles (median 341 -> 607 tok), and the two protocol worries
+# do NOT regress: sentinel format had 0 malformed attempts in 720 rollouts (the
+# instruction sentence anchors it) and self-fabricated "User (hint)" turns
+# stayed ~0 (the IMPORTANT-STOP sentence does that work). Cost: offline emission
+# halves to ~20%, right at the floor — watch live emit before tightening
+# further. The closer keeps "reason step by step": demo-free it is BETTER on
+# both axes than "reason briefly" (emit 19.6% vs 16.7%, median 607 vs 374;
+# hint_call_test/test_no_demo_round14.py, progress.md Round 14).
 TOOL_INSTRUCTION = r"""
 
 A hint tool is available. Emitting the exact sentence <hint_call/> on its own line causes the system to inject one curated hint as the next user message. You may use the hint tool at most {budget} time(s) for this problem, so call it only when you are genuinely stuck.
 
 Before each hint call, briefly describe your progress so far: what you have established and where you are stuck. This summary is what the hint is based on, so make it accurate. Then emit <hint_call/> on its own line.
 
-Example:
-User: How many positive integers less than 1000 are divisible by neither 5 nor 7?
-Assistant: I want to count the integers from 1 to 999 that avoid both 5 and 7. It is easier to count those that ARE divisible by 5 or 7 and subtract, but I'm not sure how to combine the two divisibility counts without double-counting.
-<hint_call/>
-User (hint): Use inclusion-exclusion: |A or B| = |A| + |B| - |A and B|, where A is the multiples of 5 and B is the multiples of 7.
-Assistant: So I need three counts up to 999. Multiples of 5: floor(999/5) = 199. Multiples of 7: floor(999/7) = 142. I have those, but I still need the overlap (multiples of both 5 and 7) and I'm not certain of the right modulus for it. That is a separate sticking point, so I'll ask for another hint rather than guess.
-<hint_call/>
-User (hint): Numbers divisible by both 5 and 7 are exactly the multiples of 35, so count floor(999/35) = 28.
-Assistant: Then |A or B| = 199 + 142 - 28 = 313, so the count divisible by neither is 999 - 313 = 686. \boxed{{686}}
+Now solve the user's problem: reason step by step, summarize your progress, and emit <hint_call/> whenever you get stuck and need a hint. End your final answer in \boxed{{...}}.
 
-Now solve the user's problem in this style: reason briefly, summarize your progress, and emit <hint_call/> whenever you get stuck and need a hint. End your final answer in \boxed{{...}}.
-
-IMPORTANT: After you emit <hint_call/>, STOP immediately and output nothing more. Do NOT write the hint yourself and do NOT keep solving. The system will send the hint as the next user message; only after it arrives do you continue (as shown in the example above)."""
+IMPORTANT: After you emit <hint_call/>, STOP immediately and output nothing more. Do NOT write the hint yourself and do NOT keep solving. The system will send the hint as the next user message; only after it arrives do you continue."""
 
 
 def render_system(base_system: str | None, budget: int) -> str:

@@ -11,9 +11,11 @@ MODEL_PATH="${MODEL_PATH:-/share5/users/xutao.ma/model/gpt-oss-20b}"
 SERVED_NAME="${SERVED_NAME:-gpt-oss-20b}"
 SERVE_HOST="${SERVE_HOST:-0.0.0.0}"
 PORT="${PORT:-30000}"
-# ~13.8 GB MXFP4 weights + small active MoE -> fits on one 40GB card. TP=1.
-GPU="${GPU:-1}"
+# ~13.8 GB MXFP4 weights + small active MoE -> fits on one 40GB card, so
+# TP=1 and one DP replica per GPU for throughput.
+GPU="${GPU:-0,1}"
 TP="${TP:-1}"
+DP="${DP:-2}"
 MEM_FRAC="${MEM_FRAC:-0.9}"
 MAX_LEN="${MAX_LEN:-40960}"
 # gpt-oss separates chain-of-thought (analysis channel) from the final answer;
@@ -48,7 +50,7 @@ echo "Launching sglang server"
 echo "  model:       $MODEL_PATH"
 echo "  served name: $SERVED_NAME"
 echo "  host:port:   $SERVE_HOST:$PORT"
-echo "  GPU:         $GPU  (tp=$TP)"
+echo "  GPU:         $GPU  (tp=$TP dp=$DP)"
 echo "  context:     $MAX_LEN"
 echo "  reasoning:   $REASONING_PARSER"
 echo "  log:         $LOG_FILE"
@@ -59,6 +61,7 @@ exec python -m sglang.launch_server \
     --host "$SERVE_HOST" \
     --port "$PORT" \
     --tp "$TP" \
+    --dp-size "$DP" \
     --mem-fraction-static "$MEM_FRAC" \
     --context-length "$MAX_LEN" \
     --reasoning-parser "$REASONING_PARSER" \

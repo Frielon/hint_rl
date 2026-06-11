@@ -58,8 +58,10 @@ from hint_prompt import (
 # and suppresses <hint_call/> emission (offline bisect 2026-06-09: closer
 # "step by step" ~8% emit vs "briefly" ~28%). The DAPO base ("You are a helpful
 # assistant. Solve the math problem given by the user, reasoning step by step,
-# and put your final answer within \boxed{}.") carries it, which silently
-# undercuts render_system()'s "reason briefly" framing. Strip it before render.
+# and put your final answer within \boxed{}.") carries it. Still strip it: the
+# ONE deliberate "step by step" lives in render_system()'s closer (Round 13
+# trades emission for longer pre-call CoT); an extra unconditional copy in the
+# base system stacks on top and pushes emission below the 20% floor.
 _COMMA_COT_RE = re.compile(
     r",\s*(?:reasoning|reason|thinking|think)\s+step[\s-]by[\s-]step\s*,",
     re.IGNORECASE,

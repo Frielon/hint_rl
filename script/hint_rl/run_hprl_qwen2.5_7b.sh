@@ -105,9 +105,9 @@ export SELECTOR_MAX_RETRIES=${SELECTOR_MAX_RETRIES:-3}
 NNODES=${NNODES:-4}
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 
-train_prompt_bsz=128
+train_prompt_bsz=256
 n_resp_per_prompt=16
-train_prompt_mini_bsz=16
+train_prompt_mini_bsz=32
 
 # Ray
 VERL_HOME=${VERL_HOME:-"${PROJECT_HOME}/verl"}
@@ -142,6 +142,17 @@ REWARD_MGR_CLASS=${REWARD_MGR_CLASS:-"HintRewardManager"}
 HINT_PENALTY_TOTAL=${HINT_PENALTY_TOTAL:-1.8}
 HINT_PENALTY_HARD_FACTOR=${HINT_PENALTY_HARD_FACTOR:-1.5}
 HINT_GUIDANCE_DIFFICULTY=${HINT_GUIDANCE_DIFFICULTY:-moderate}
+
+# ---- effort-shaping penalty (premature/shallow hint calls) ----------------
+# Fixes the front-loading pathology: with a timing-blind hint penalty the policy
+# reasons for a few tokens, calls a hint, repeats -- and only reasons hard once
+# the budget is spent. This term (hint_reward.effort_shortfall_penalty) charges,
+# per APPLIED hint, coeff * relu(mean_turn_len - pre_call_reasoning_len)/mean_turn_len,
+# summed over calls -- i.e. a hint emitted after a near-empty turn (vs the rollout's
+# own mean turn length) is penalized; one emitted after a real struggle is ~free.
+# Subtracted from the CORRECT reward only (incorrect stays at -1). 0 disables it.
+# Start small (~0.3) and watch rollouts for filler-padding before raising.
+HINT_SHAPE_COEFF=${HINT_SHAPE_COEFF:-0.3}
 
 # ---- hint-selection + penalty strategy ------------------------------------
 # Selects HOW a hint call is answered and penalized. The same value is given to
@@ -335,6 +346,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     +custom_reward_function.reward_kwargs.hint_penalty_hard_factor=${HINT_PENALTY_HARD_FACTOR} \
     +custom_reward_function.reward_kwargs.hint_guidance_difficulty=${HINT_GUIDANCE_DIFFICULTY} \
     +custom_reward_function.reward_kwargs.hint_strategy=${HINT_STRATEGY} \
+    +custom_reward_function.reward_kwargs.hint_shape_coeff=${HINT_SHAPE_COEFF} \
     trainer.logger="['console','file','wandb']" \
     trainer.project_name="${wandb_project}" \
     trainer.experiment_name="${exp_name}" \
