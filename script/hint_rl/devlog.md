@@ -5,6 +5,126 @@ per working session.
 
 ---
 
+## 2026-06-12 — hint-call reward (anti-suppression bonus) + raised correct floor
+
+A reward-side lever against the **GRPO hint-suppression** pathology (the 2026-06-10
+(d) entry + the suppression memo: unhinted-correct advantage ~1.10 out-ranks
+hinted-correct ~0.70, so hint emission collapses over training even when hints
+work). User framing: *if the model is stuck we want it to call a hint, not plow
+straight to a wrong answer.*
+
+**New term (`hint_reward.compute_score`).** A wrong answer now scores
+`incorrect_reward + b`; a correct answer is unchanged. `b = hint_call_reward`
+(default **0.1**) iff the rollout RECEIVED ≥1 applied hint, else 0.
+- **Binary, not per-call** — one applied hint earns the full bonus; extra hints add
+  nothing, so there is NO incentive to spam `<hint_call/>` (verified: 1 vs 3
+  applied hints both → −0.9). The point is purely to keep a positive gradient on
+  hint use among the rollouts that **fail anyway**, where it can't trade off against
+  solving (the bonus never applies when correct).
+
+**Gate on APPLIED, not on the `<hint_call/>` emission (user-flagged mid-session).**
+First cut also counted `hint_call_failed` (a sentinel the selector failed to serve)
+as "called a hint"; reverted. A failed call hands the policy the *"no hint
+available, continue on your own"* no-op — zero information to course-correct with,
+so it behaves like a never-called rollout. Worse, `hint_call_failed` spikes during a
+selector **OUTAGE** (the NIC-routing class, 0 hints ever applied), so rewarding the
+bare emission would pay out a no-op bonus *exactly when the mechanism is down*,
+training the sentinel as a reward-grab decoupled from hint use. So we gate on
+`len(applied_hints) >= 1` and keep `hint_call_failed` as the **metric we watch to
+detect outages**, not a rewarded signal. Also made `hint_call_failed` path-
+independent in `hint_reward_manager` (colocate merge, mirroring `applied_hints`/
+`turn_lens`) so that outage metric is reliable on both reward paths.
+
+**Raised the correct-side floor.** The bonus reopened the floor caveat: correct was
+floored at `incorrect_reward` (the WORST wrong score), so a heavily-penalized
+correct rollout pinned to −1 could sit just *under* a hinted failure (−1 + b). Fix:
+`correct_floor = incorrect_reward + format_reward + hint_call_reward` — the **BEST
+achievable wrong score** (well-formed AND hinted). A correct rollout can now never
+rank below ANY wrong rollout in the GRPO group, even after the full hint + shaping
+penalties, so "solve with hints" can't drop under "fail with a hint." Only the
+CORRECT branch is floored; the wrong branch (`base + bonus`) is unclamped.
+
+**Knob + logging.** `reward_kwargs.hint_call_reward` (default 0.1, **0 disables**),
+env `HINT_CALL_REWARD` in `run_hprl_qwen2.5_7b.sh`. New `reward_extra_info`:
+`called_hint` (applied-hint rate over the batch — **the suppression curve to
+watch**, should rise/stabilize, not collapse) and `hint_call_bonus` (mean bonus
+actually paid).
+
+**Verified** (stubbed grader on `compute_score`, all defaults `incorrect=-1`,
+`format=0.1`, `hint_call=0.1` → floor **−0.8**): wrong+applied → −0.9;
+wrong+failed-only → **−1.0 (no bonus)** while `hint_call_failed` still logged;
+wrong+no-call → −1.0; correct+no-hints → 1.0; correct+hint(default penalty) → 0.28
+(no bonus, not floored); **floor exercised** — correct+heavy penalty pins at −0.8 =
+best-wrong (invariant `correct ≥ best-wrong` holds with equality at the extreme);
+disable (=0) → −1.0.
+
+**Files:** `hint_reward.py` (kwarg, `called_hint`/`hint_call_bonus`, raised
+`correct_floor`, header + docstring), `hint_reward_manager.py` (`hint_call_failed`
+colocate merge), `run_hprl_qwen2.5_7b.sh` (`HINT_CALL_REWARD` knob + reward_kwarg).
+**Status:** unit-tested; not yet run live.
+
+---
+
+## 2026-06-11 (d) — blind-trace bug LIVE-confirmed, instrumented, and FIXED
+
+Closes item #1 of (d) 2026-06-10's "Still to apply". That bug (entry below, cause
+#2) was diagnosed offline via replay; this session caught it on a **live** run,
+added runtime instrumentation, proved it 285/285, and **applied the loop fix**.
+
+**Triggering case** (user: "is this successful 2-hint rollout the selector's
+fault?"). Run `…-v3-20260611-103735`, step 33, problem
+`DAPO-Math-17k-04b3e7c6-5c2b-4fe9-8d4c-6a35fd3e53a8` (gt **150**, 5-step pool,
+step 5 states the answer). Group of 16; **idx 3630**: acc 1.0, pred 150,
+**num_hints 2, score +0.225 — the single highest in the group** (the two honest
+5-hint solves scored −1.0). `applied_hints`: call 0 → major step **1**, call 1 →
+major step **5** — the selector **jumped 1→5, skipping 2/3/4**, and step 5's hint
+is literally `…cos = −√3/2, hence angle B3MA3 = 150 degrees`. The policy had done
+only step 1 (coords + circumcircle) then bogus hand-waving (wrong 75° via a fake
+"reflection of orthocenter over circumcenter" / arc-subtension argument) — never
+located A1/A2/B1/B2 or computed the MA3/MB3 vectors — then transcribed step 5's
+formulas verbatim and copied 150. Textbook unearned reveal, and GRPO upweights it.
+
+**Runtime dump (new tooling).** `hint_agent_loop._dump_selector_call`, env-gated on
+`HPRL_SELECTOR_DUMP_DIR`, wired through `run_hprl` (`HPRL_DUMP_SELECTOR`, **default
+ON while debugging**) into the Ray `runtime_env` — a local-shell export can't reach
+workers across the `launch_hprl_cluster`→ray job-spec boundary, hence default-ON.
+Per-worker append to `<run dir>/selector_calls/selector_calls.<host>.<pid>.jsonl`;
+each record carries `msg_roles`, `n_assistant_in_messages`, `trace`,
+`candidate_hints_str`, `selection`, `selector_raw`. `HPRL_DUMP_SELECTOR=0` disables
+(writes a lot over a full run — turn off once a step or two is captured).
+
+**Live proof.** Run `…-v3-20260611-143549`: **285/285** dumped calls had
+`n_assistant_in_messages == 0` — call_index 0 → `"(The student has not written any
+reasoning yet.)"` ×269 (despite a full first turn already written), call_index 1 →
+hints-only ×16. One `selector_raw` self-incriminated: *"the student's trace shows
+only the two initial hints… there is no evidence of any work."* build_trace is
+structurally blind — confirmed at runtime, not just offline replay.
+
+**THE FIX (applied).** `_handle_generating_state`: after the decode, before the
+`_is_hint_call` check, append `{"role":"assistant","content":text}` to
+`agent_data.messages`. Every assistant turn (incl. the one ending in `<hint_call/>`,
+whose progress summary IS the signal) now reaches `build_trace`.
+- **Safe** — verified by reading the base loop: `agent_data.messages` feeds ONLY
+  `build_trace` after startup. The trained sequence is built from
+  `prompt_ids`/`response_mask` (run() finalize, tool_agent_loop.py:177–204), and the
+  initial prompt is templated from messages once in `_handle_pending_state` (PENDING,
+  before any turn is appended). No token double-count.
+- **Effective** — replayed `build_trace` on rollout 3630's real turns: OLD =
+  `[hint given] …` (hints-only); NEW leads with the student's turn-1 reasoning
+  ("To solve the problem… reflection… symmetry…"), so the prompt's "Guard the final
+  step" rule can finally see steps 2–4 are undone.
+
+**Status / next.** Needs a relaunch (143549 predates the fix); after relaunch the
+dump should flip to `n_assistant_in_messages > 0`, then disable the dump. Item #1 of
+(d)'s list is DONE; still pending there: `SELECTOR_TEMPERATURE`→0.1, the
+deterministic last-step guard in `_record_major_step`, and `v4_cite` (the Round 3
+entry above) into `utils.selector_prompt`.
+
+**Files:** `hint_agent_loop.py` (trace fix + `_dump_selector_call` + call-site dump),
+`run_hprl_qwen2.5_7b.sh` (`HPRL_DUMP_SELECTOR` toggle + `runtime_env` passthrough).
+
+---
+
 ## 2026-06-11 (c) — budget ratchet: revised min-correct rule parked; reverted to N/2-th-smallest
 
 **What changed:** the working tree had an unfinished revision of the downward

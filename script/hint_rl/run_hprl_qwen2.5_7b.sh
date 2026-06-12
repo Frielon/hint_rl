@@ -58,7 +58,7 @@ wandb_project=${wandb_project:-"hint_rl"}
 
 # ---- GRPO algorithm (identical to the plain GRPO run) ---------------------
 adv_estimator=grpo
-norm_adv_by_std_in_grpo=True
+norm_adv_by_std_in_grpo=False
 use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
@@ -154,6 +154,18 @@ HINT_GUIDANCE_DIFFICULTY=${HINT_GUIDANCE_DIFFICULTY:-moderate}
 # Start small (~0.3) and watch rollouts for filler-padding before raising.
 HINT_SHAPE_COEFF=${HINT_SHAPE_COEFF:-0.3}
 
+# ---- hint-call reward (anti-suppression bonus) ----------------------------
+# One-off bonus ADDED to the INCORRECT reward when a failing rollout RECEIVED a
+# hint at least once (correct rollouts are untouched -- it does not stack on a
+# solve). BINARY: one applied hint earns it; extra hints add nothing, so it can't
+# be spammed. Gates on an APPLIED hint, not a bare <hint_call/> emission -- a call
+# the selector failed to serve conveyed nothing to the policy and would pay out
+# during a selector outage. Counters the GRPO hint-suppression pathology (unhinted-
+# correct out-ranks hinted-correct -> the policy stops calling hints) by keeping a
+# positive gradient on hint use among the rollouts that fail anyway. 0 disables it.
+# (hint_reward.compute_score reward_kwargs.hint_call_reward.)
+HINT_CALL_REWARD=${HINT_CALL_REWARD:-0.1}
+
 # ---- hint-selection + penalty strategy ------------------------------------
 # Selects HOW a hint call is answered and penalized. The same value is given to
 # BOTH the agent loop (data.hprl.strategy -> HintAgentLoop) and the reward
@@ -221,6 +233,19 @@ gen_tp=1
 # Per-run Ray runtime env. Env vars from this shell do NOT propagate to a
 # submitted job, so wandb key, file-logger path, the selector endpoint, and the
 # PYTHONPATH for the hint tool must all be injected here.
+# DEBUG: dump EVERY hint-selection call (the exact `trace` build_trace produced
+# -- the selector's whole view of student progress -- plus the candidate steps
+# and the selector's parsed + raw output). Use it to verify on a LIVE run whether
+# build_trace carries the student's reasoning or only the injected hints. Files
+# land in <run dir>/selector_calls/. ON by default while we debug the blind-trace
+# bug; set HPRL_DUMP_SELECTOR=0 to disable (it writes a lot of data over a full
+# run, so turn it off once a step or two has been captured).
+HPRL_DUMP_SELECTOR=${HPRL_DUMP_SELECTOR:-1}
+HPRL_SELECTOR_DUMP_DIR=${HPRL_SELECTOR_DUMP_DIR:-""}
+if [ "${HPRL_DUMP_SELECTOR}" != "0" ] && [ -z "${HPRL_SELECTOR_DUMP_DIR}" ]; then
+  HPRL_SELECTOR_DUMP_DIR="${EXP_LOG_DIR}/selector_calls"
+fi
+
 RUNTIME_ENV_RUN=${RUNTIME_ENV_RUN:-"${LOG_DIR}/.runtime_env.${RUN_ID}.yaml"}
 ( umask 077
   cat > "${RUNTIME_ENV_RUN}" <<EOF
@@ -241,13 +266,15 @@ env_vars:
   SELECTOR_MAX_TOKENS: "${SELECTOR_MAX_TOKENS}"
   SELECTOR_REQUEST_TIMEOUT_S: "${SELECTOR_REQUEST_TIMEOUT_S}"
   SELECTOR_MAX_RETRIES: "${SELECTOR_MAX_RETRIES}"
+  HPRL_SELECTOR_DUMP_DIR: "${HPRL_SELECTOR_DUMP_DIR}"
   # make hint_tool.py / hint_reward_manager.py importable in the job env.
   PYTHONPATH: "${TOOL_PYTHONPATH}"
-# custom_reward.py + the selector client import mathruler / openai; ensure both
-# exist in the job env (remove if already baked into the image).
-pip:
-  - mathruler
-  - openai
+# NOTE: do NOT add a runtime_env pip block on this air-gapped fabric. mathruler
+# and openai (imported by custom_reward.py / the selector client) are already baked
+# into the verl conda env, so a pip install here is redundant AND fatal: with no
+# PyPI egress Ray hangs forever in "Runtime env is setting up" and never reaches
+# main_hprl. Symptom: run v3-20260611-195503 stuck ~22 min at that line. If you
+# ever need a new dep, install it into the env/image, not via runtime_env pip.
 EOF
 )
 
@@ -342,6 +369,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     +custom_reward_function.reward_kwargs.correct_reward=1.0 \
     +custom_reward_function.reward_kwargs.incorrect_reward=-1.0 \
     +custom_reward_function.reward_kwargs.format_reward=0.1 \
+    +custom_reward_function.reward_kwargs.hint_call_reward=${HINT_CALL_REWARD} \
     +custom_reward_function.reward_kwargs.hint_penalty_total=${HINT_PENALTY_TOTAL} \
     +custom_reward_function.reward_kwargs.hint_penalty_hard_factor=${HINT_PENALTY_HARD_FACTOR} \
     +custom_reward_function.reward_kwargs.hint_guidance_difficulty=${HINT_GUIDANCE_DIFFICULTY} \
@@ -353,7 +381,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=True \
-    trainer.test_freq=5 \
+    trainer.test_freq=10 \
     trainer.save_freq=50 \
     trainer.max_actor_ckpt_to_keep=1 \
     trainer.total_epochs=100 \

@@ -25,8 +25,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import socket
 from typing import Any
 
 from verl.experimental.agent_loop.agent_loop import register
@@ -58,6 +60,36 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 HINT_SENTINEL = "<hint_call/>"
 # tools_kwargs key carrying this problem's create_kwargs (problem/hints/budget).
 HINT_KWARGS_KEY = "request_hint"
+
+# --- DEBUG: per-selector-call dump ------------------------------------------ #
+# Set HPRL_SELECTOR_DUMP_DIR to a writable dir to record EVERY hint-selection
+# call -- the exact `trace` build_trace produced (the selector's whole view of
+# student progress), the candidate steps, and the selector's parsed + raw output.
+# This is how we VERIFY on a live run whether build_trace actually carries the
+# student's reasoning or only the injected hints (the blind-trace path). Off
+# (no-op) unless the env var is set, so production runs are unaffected. Each
+# worker PROCESS writes its own file (host+pid) to avoid cross-process append
+# races; concatenate them for analysis.
+_SELECTOR_DUMP_DIR = os.environ.get("HPRL_SELECTOR_DUMP_DIR", "").strip()
+
+
+def _dump_selector_call(record: dict) -> None:
+    """Append one selector-call record as a JSON line to this process's dump file.
+
+    No-op unless ``HPRL_SELECTOR_DUMP_DIR`` is set. Best-effort and fully guarded:
+    a debug dump must NEVER break a rollout, so every error is swallowed.
+    """
+    if not _SELECTOR_DUMP_DIR:
+        return
+    try:
+        os.makedirs(_SELECTOR_DUMP_DIR, exist_ok=True)
+        path = os.path.join(
+            _SELECTOR_DUMP_DIR, f"selector_calls.{socket.gethostname()}.{os.getpid()}.jsonl"
+        )
+        with open(path, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 -- never let debug dumping break training
+        logger.warning("selector-call dump failed", exc_info=True)
 
 
 @register("hint_agent")
@@ -189,6 +221,20 @@ class HintAgentLoop(ToolAgentLoop):
         # taught format is "emit it alone on its own line and stop", so we key off
         # exactly that and let everything else terminate as a normal answer turn.
         text = self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
+
+        # BLIND-TRACE FIX: record this assistant turn in agent_data.messages so the
+        # selector's build_trace(agent_data.messages) actually sees the student's
+        # reasoning. The base loop tracks turns ONLY as tokens (prompt_ids); without
+        # this, messages stays [system, problem] + injected hints, so build_trace
+        # returns a hints-only trace and the selector picks steps blind to all
+        # student work (verified: n_assistant_in_messages==0 on 285/285 live calls).
+        # Safe: agent_data.messages feeds ONLY build_trace after startup -- the
+        # trained sequence is built from prompt_ids/response_mask, and the initial
+        # prompt is templated once in _handle_pending_state before any turn lands
+        # here. Appended for EVERY assistant turn (incl. the one ending in
+        # <hint_call/>, whose progress summary is exactly what the selector needs).
+        agent_data.messages.append({"role": "assistant", "content": text})
+
         if self._is_hint_call(text):
             return AgentState.PROCESSING_TOOLS  # reuse this state slot for hint injection
         return AgentState.TERMINATED
@@ -254,6 +300,7 @@ class HintAgentLoop(ToolAgentLoop):
             else:
                 hints_str = exclude_applied_hints(hints_obj, applied)
             trace = build_trace(agent_data.messages)
+            call_index = len(applied)  # index of THIS hint call (before recording)
 
             # Time the (blocking, on-critical-path) call to the frozen gpt-oss
             # selector. simple_timer accumulates (+=) across every hint call in
@@ -284,6 +331,41 @@ class HintAgentLoop(ToolAgentLoop):
                 else:
                     content = self._record_single_hint(selection, applied, budget, agent_data)
                 hint_message = {"role": "user", "content": content}
+
+            # DEBUG: record this selector call (trace IN / selection OUT) so the
+            # build_trace path can be verified on a live run. agent_data.messages
+            # is captured BEFORE the hint turn below is appended -- i.e. exactly
+            # what the selector saw. No-op unless HPRL_SELECTOR_DUMP_DIR is set;
+            # covers both successful and failed (non-dict) selections.
+            _dump_selector_call(
+                {
+                    "request_id": getattr(agent_data, "request_id", None),
+                    "call_index": call_index,
+                    "strategy": self.hint_strategy,
+                    "budget": budget,
+                    "applied_step_ids_before": [h.get("major_step_id") for h in applied[:call_index]],
+                    "n_assistant_in_messages": sum(
+                        1 for m in agent_data.messages if m.get("role") == "assistant"
+                    ),
+                    "msg_roles": [m.get("role") for m in agent_data.messages],
+                    "messages": [
+                        {
+                            "role": m.get("role"),
+                            "content": (
+                                f"<system prompt: {len(m.get('content') or '')} chars omitted>"
+                                if m.get("role") == "system"
+                                else m.get("content")
+                            ),
+                        }
+                        for m in agent_data.messages
+                    ],
+                    "trace": trace,
+                    "candidate_hints_str": hints_str,
+                    "selection": selection if isinstance(selection, dict) else None,
+                    "selector_raw": _raw,
+                    "selector_err": err,
+                }
+            )
 
         # inject the hint as a user turn, mirroring the base tool-response path.
         agent_data.messages.append(hint_message)

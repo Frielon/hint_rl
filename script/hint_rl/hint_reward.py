@@ -10,13 +10,17 @@
 #
 # HPRL reward:
 #
-#     R = incorrect_reward                    if the answer is wrong
+#     R = incorrect_reward + b                if the answer is wrong
 #     R = correct_reward - sum_k w_{j_k}      if the answer is correct
 #
-# i.e. a wrong answer gets the base (incorrect) reward; a correct answer gets the
-# base (correct) reward minus the summed importance weights {w_{j_k}} of the hints
-# applied during the rollout. Correctness is verified exactly as in the plain GRPO
-# run (mathruler boxed-answer grading).
+# i.e. a wrong answer gets the base (incorrect) reward plus a one-off hint-call
+# bonus b (= hint_call_reward if the rollout RECEIVED >=1 applied hint, else 0);
+# a correct answer gets the base (correct) reward minus the summed importance
+# weights {w_{j_k}} of the hints applied during the rollout (the bonus does NOT
+# apply when correct), FLOORED at the best achievable wrong score
+# (incorrect_reward + format_reward + hint_call_reward) so solving always ranks at
+# least as high as any failure. Correctness is verified exactly as in the plain
+# GRPO run (mathruler boxed-answer grading).
 #
 # The list of hints applied in the rollout is maintained as per-rollout state by
 # the rollout (on agent_data.extra_fields["applied_hints"]) and is merged into
@@ -169,6 +173,7 @@ def compute_score(
     correct_reward: float = 1.0,
     incorrect_reward: float = -1.0,
     format_reward: float = 0.0,
+    hint_call_reward: float = 0.1,
     hint_penalty_total: float = DEFAULT_TOTAL_PENALTY,
     hint_penalty_hard_factor: float = DEFAULT_HARD_FACTOR,
     hint_guidance_difficulty: str = DEFAULT_GUIDANCE_DIFFICULTY,
@@ -188,6 +193,17 @@ def compute_score(
     ``hint_shape_coeff`` (>0) additionally subtracts the effort-shaping penalty
     (``effort_shortfall_penalty``) from the CORRECT reward, discouraging hints
     called after too-little reasoning. 0 disables it.
+
+    ``hint_call_reward`` (default 0.1) is a one-off bonus added to the INCORRECT
+    reward when the rollout RECEIVED at least one hint (correct rollouts are
+    unaffected). It is binary -- one applied hint is enough; extra hints add
+    nothing, so there is no incentive to spam. The intent is to keep a positive
+    gradient on hint use among the failing rollouts (GRPO otherwise ranks
+    unhinted-correct above hinted-correct and the policy learns to suppress hint
+    use). It gates on an APPLIED hint (``len(applied_hints) >= 1``), NOT a bare
+    ``<hint_call/>`` emission: a call the selector failed to serve conveyed nothing
+    to the policy, and rewarding the emission alone would pay out during a selector
+    outage (when ``hint_call_failed`` spikes). 0 disables.
 
     Returns a dict whose ``score`` is the optimized reward and whose extra keys
     are logged as ``reward_extra_info`` by the reward manager (``acc`` is also
@@ -232,22 +248,47 @@ def compute_score(
     shape_sum = effort_shortfall_sum(extra_info.get("turn_lens"))
     shape_penalty = float(hint_shape_coeff) * shape_sum if hint_shape_coeff > 0 else 0.0
 
-    # Wrong answer -> base (incorrect) reward, ignoring hints. Correct answer ->
-    # base (correct) reward minus the summed hint penalty (each hint used lowers
-    # the reward) and the effort-shaping penalty (shallow calls lower it further).
-    # The correct score is FLOORED at incorrect_reward (-1): even a fully hinted /
-    # front-loaded correct rollout never scores below a wrong answer, so the hint
-    # + shaping penalties can't make "solve with hints" worse than "fail" (which
-    # would push GRPO to suppress hint use entirely).
-    if correct:
-        score = max(base - penalty - shape_penalty, incorrect_reward)
-    else:
-        score = base
+    # --- hint-call bonus (added to the INCORRECT reward only) ------------
+    # Reward a FAILING rollout for getting unstuck via a hint: a wrong answer that
+    # received a hint scores above one that plowed straight ahead to a wrong answer.
+    # We gate on a hint the selector actually SERVED (len(applied_hints) >= 1), NOT
+    # on a bare <hint_call/> emission. A call the selector FAILED to serve gave the
+    # policy no information to course-correct with (it got the "no hint available,
+    # continue on your own" no-op), so it behaves like a rollout that never called;
+    # worse, hint_call_failed spikes during a selector OUTAGE (selectors have gone
+    # down silently here), and rewarding the bare emission would pay out a bonus for
+    # a no-op sentinel exactly then -- training the policy to emit it as a reward-
+    # grab decoupled from hint use. BINARY -- one applied hint is enough, extra hints
+    # add nothing -- so there is NO incentive to spam hint calls.
+    called_hint = len(applied_hints) >= 1
+    hint_call_bonus = float(hint_call_reward) if (not correct and called_hint) else 0.0
 
-    # Count of hint calls this rollout made whose selector lookup failed (the
+    # Floor for a CORRECT rollout's score: the BEST achievable WRONG score -- a wrong
+    # answer that is well-formed (format_reward) AND called a hint (hint_call_reward).
+    # Flooring here guarantees a correct rollout is never worth less than ANY wrong
+    # rollout in the GRPO group, even after the full hint + shaping penalties, so
+    # "solve (with hints)" can never rank below "fail (with a hint)" -- which would
+    # otherwise push GRPO to suppress solving-with-hints. (Previously floored at
+    # incorrect_reward alone, which left a heavily-penalized correct rollout able to
+    # dip just under a hinted failure.)
+    correct_floor = incorrect_reward + format_reward + hint_call_reward
+
+    # Wrong answer -> base (incorrect) reward + the one-off hint-call bonus (keeps a
+    # positive gradient on hint use that GRPO otherwise suppresses). Correct answer
+    # -> base (correct) reward minus the summed hint penalty (each hint used lowers
+    # the reward) and the effort-shaping penalty (shallow calls lower it further),
+    # FLOORED at correct_floor; the bonus does NOT apply when correct.
+    if correct:
+        score = max(base - penalty - shape_penalty, correct_floor)
+    else:
+        score = base + hint_call_bonus
+
+    # Count of hint calls this rollout made whose selector lookup FAILED (the
     # policy got the no-op fallback instead of a hint). Recorded by the agent loop
     # on extra_fields; surfaced here so it lands in non_tensor_batch for
     # hint_budget_callback to aggregate -> a selector outage shows up in hprl/*.
+    # NOT rewarded (see the hint-call bonus above) -- only logged, as the signal we
+    # watch to DETECT such an outage instead of paying it out.
     hint_call_failed = extra_info.get("hint_call_failed", 0)
     if hasattr(hint_call_failed, "item"):
         hint_call_failed = hint_call_failed.item()
@@ -258,6 +299,8 @@ def compute_score(
         "pred": pred,
         "has_format": 1.0 if has_format else 0.0,
         "num_hints": float(len(applied_hints)),
+        "called_hint": 1.0 if called_hint else 0.0,
+        "hint_call_bonus": float(hint_call_bonus),
         "hint_penalty": float(penalty),
         "hint_shape_sum": float(shape_sum),
         "hint_shape_penalty": float(shape_penalty),

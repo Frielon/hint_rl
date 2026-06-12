@@ -80,6 +80,11 @@ class HintRewardManager(RewardManagerBase):
         if "turn_lens" not in extra_info and "turn_lens" in ntb:
             extra_info["turn_lens"] = _to_py(ntb.get("turn_lens"))
 
+        # Same for the failed-hint-call count (feeds the hint-call bonus, which
+        # treats a selector-failed call as a genuine emission, and the hprl/* logs).
+        if "hint_call_failed" not in extra_info and "hint_call_failed" in ntb:
+            extra_info["hint_call_failed"] = _to_py(ntb.get("hint_call_failed"))
+
         extra_info["num_turns"] = ntb.get("__num_turns__", None)
         extra_info["rollout_reward_scores"] = ntb.get("reward_scores", {})
 

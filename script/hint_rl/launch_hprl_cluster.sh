@@ -114,6 +114,13 @@ export SELECTOR_MAX_TOKENS=${SELECTOR_MAX_TOKENS:-16000}
 export SELECTOR_REQUEST_TIMEOUT_S=${SELECTOR_REQUEST_TIMEOUT_S:-600}
 export SELECTOR_MAX_RETRIES=${SELECTOR_MAX_RETRIES:-3}
 
+# --- pre-launch cleanup toggle -------------------------------------------------
+# hprl_reap_stale_vllm() (below) pkills orphaned vLLM workers left by a SIGKILLed
+# prior run before this pod binds its ports, preventing the EADDRINUSE bring-up
+# failure (run v3-20260611-150247 -> 173707). Set to 1 to skip the reap entirely
+# (e.g. when you KNOW the nodes are clean, or to avoid touching co-located procs).
+HPRL_SKIP_PRELAUNCH_CLEAN=${HPRL_SKIP_PRELAUNCH_CLEAN:-1}
+
 # NOTE: the per-launch selector-endpoint rendezvous DIR (RDV_DIR) is defined
 # below, AFTER JOB_STAMP -- it is keyed on the shared per-launch stamp so a
 # relaunch never reads the previous launch's stale endpoint files.
@@ -188,6 +195,27 @@ slog() {
 
 slog "[launch] rank=${RANK}/${WORLD_SIZE}  selector=[${SELECTOR_FIRST_RANK}..$((WORLD_SIZE-1))]  train_nnodes=${TRAIN_NNODES}  check_log=${SELECTOR_CHECK_LOG}"
 
+# Reap orphaned vLLM workers from a SIGKILLed prior run before THIS pod binds any
+# port. A run killed by eviction/preemption/OOM does not reap its distributed vLLM
+# children, so they keep their TCP ports bound; on hostNetwork pods the next
+# process to bind the same port dies with EADDRINUSE (seen: run v3-20260611-150247
+# -> 173707, vLLM EngineCore "address already in use"). At pod startup nothing of
+# THIS run has bound yet, so any match is a stale orphan -> safe to -9. Pure local
+# pkill: no Ray dependency, runs before `ray start`/vLLM, and each branch passes
+# only the patterns for the role it is about to start (so a training pod never
+# kills a co-located selector's api_server, and vice versa). Disable with
+# HPRL_SKIP_PRELAUNCH_CLEAN=1.
+hprl_reap_stale_vllm() {
+    [ "${HPRL_SKIP_PRELAUNCH_CLEAN:-0}" = "1" ] && return 0
+    local p
+    for p in "$@"; do
+        if pkill -9 -f "${p}" 2>/dev/null; then
+            slog "[launch]   reaped stale procs matching: ${p}"
+        fi
+    done
+    sleep 2   # let the kernel release the freed ports before we bind
+}
+
 if [ "${IS_SELECTOR_NODE}" = "1" ]; then
     # =================== SELECTOR NODE (independent gpt-oss-20b server) =======
     # Advertise the IP on the SAME fabric the training pods (the Ray cluster) use,
@@ -224,6 +252,9 @@ if [ "${IS_SELECTOR_NODE}" = "1" ]; then
     REASONING_ARGS=()
     [ -n "${SELECTOR_REASONING_PARSER}" ] && REASONING_ARGS=(--reasoning-parser "${SELECTOR_REASONING_PARSER}")
 
+    # Free the selector port from a stale api_server before we re-bind it.
+    hprl_reap_stale_vllm "vllm.entrypoints.openai.api_server"
+
     exec python -m vllm.entrypoints.openai.api_server \
         --model "${SELECTOR_MODEL_PATH}" \
         --served-model-name "${SELECTOR_SERVED_NAME}" \
@@ -245,8 +276,28 @@ else
         echo "[launch] training node: collecting ${SELECTOR_NNODES} selector endpoint(s) from ${RDV_DIR} ..."
         for R in $(seq "${SELECTOR_FIRST_RANK}" $((WORLD_SIZE - 1))); do
             f="${RDV_DIR}/${R}"
-            for _ in $(seq 1 240); do        # up to ~20 min per endpoint
+            for _i in $(seq 1 240); do        # up to ~20 min per endpoint
                 if [ -s "${f}" ]; then break; fi
+                # Late-pod fallback: a pod that starts >SELECTOR_STAMP_TTL after
+                # the launch wave rotates to a FRESH stamp, so its RDV_DIR can
+                # never receive the wave's endpoint files (the selectors published
+                # to the wave's dir) -> 20min FATAL -> restart -> fresh stamp
+                # again: a permanent crashloop that holds the cluster at N-1/N
+                # nodes (seen: v6 rank1, stamp 204114 vs wave 203828, 20260611).
+                # After 5 min of an empty own dir (selectors publish within ~1 min
+                # of pod start, long before model load), adopt this rank's file
+                # from the NEWEST sibling rdv dir of the same job key; the
+                # reachability probe below rejects dead/stale adoptions.
+                if [ "${_i}" -ge 60 ]; then
+                    for _d in $(ls -dt "${HINT_RL_HOME}/logs/.selector_endpoints.${_job_key}."* 2>/dev/null); do
+                        [ "${_d}" = "${RDV_DIR}" ] && continue
+                        if [ -s "${_d}/${R}" ]; then
+                            { cp "${_d}/${R}" "${f}" 2>/dev/null && \
+                                slog "[launch]   adopted rank-${R} selector endpoint from sibling launch dir ${_d##*/}"; } || true
+                            break
+                        fi
+                    done
+                fi
                 sleep 5
             done
             [ -s "${f}" ] || { echo "[launch] FATAL: selector endpoint for rank ${R} never published (${f})" >&2; exit 1; }
@@ -294,6 +345,12 @@ else
             slog "[launch] selector check passed: ${n_ok}/${#urls[@]} endpoint(s) reachable."
         fi
     fi
+
+    # Free rollout-vLLM ports from a SIGKILLed prior run before `ray start` brings
+    # this node up. Rollout-worker patterns only -- never api_server, so a selector
+    # co-located via hostNetwork is left untouched.
+    hprl_reap_stale_vllm EngineCore WorkerProc multiproc_executor vLLMHttpServer \
+        "vllm.v1.engine" "vllm.v1.executor"
 
     # Only the TRAIN_NNODES nodes join the Ray cluster (the selector pods are out).
     export NNODES=${TRAIN_NNODES}
