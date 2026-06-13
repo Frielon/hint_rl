@@ -38,8 +38,10 @@ data:
     default_budget: 8
     # tool name whose create_kwargs.budget is injected/enforced.
     tool_name: request_hint
-    # when the policy emits <hint_call/> after the budget is spent:
-    #   true  -> terminate the rollout; false -> inject a "finish up" user message.
+    # RETIRED (no longer changes behavior): an over-budget <hint_call/> is now
+    # ALWAYS a terminating protocol violation -- the rollout is flagged
+    # (extra_info["hint_budget_exceeded"]) and floored to budget_exceeded_reward
+    # (acc=0, answer ungraded) by hint_reward.compute_score. Kept for back-compat.
     terminate_on_budget_exceeded: true
     # hint-selection + penalty strategy. Read by the agent loop (HintAgentLoop);
     # MUST be matched by the reward's custom_reward_function.reward_kwargs.hint_strategy.

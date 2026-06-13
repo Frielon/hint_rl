@@ -65,15 +65,19 @@ def render_system(base_system: str | None, budget: int) -> str:
     when ``base_system`` is empty/None.
 
     ``budget <= 0`` means NO hints for this problem (the hard-problem-curriculum
-    "easy" bucket, or a problem ratcheted to 0): the tool instruction is dropped
-    entirely so the prompt never advertises a tool the rollout won't honor. This
-    keeps prep (prepare_hint_data) and the dynamic re-render (HintBudgetDataset)
-    consistent at budget 0.
+    "easy" bucket, or a problem ratcheted to 0). The tool instruction is STILL
+    rendered (with the budget shown as 0, i.e. "at most 0 time(s)"); the user
+    message's reminder reads "no hint calls remaining, finish on your own". This
+    keeps the budget-0 prompt byte-identical to a budget>0 prompt except for the
+    budget digit, so the policy sees the SAME framing/closer ("reason step by
+    step ... \boxed{...}") whether or not it has hints. Earlier we dropped the
+    instruction at budget 0; that gave those rollouts a bare base prompt with no
+    closer and a visibly different response-length distribution (longer, no
+    \boxed nudge). prep (prepare_hint_data) and the dynamic re-render
+    (HintBudgetDataset) both go through here, so they stay consistent at budget 0.
     """
     base = base_system if base_system else DEFAULT_BASE_SYSTEM
-    if int(budget) <= 0:
-        return base
-    return base + TOOL_INSTRUCTION.format(budget=int(budget))
+    return base + TOOL_INSTRUCTION.format(budget=max(int(budget), 0))
 
 
 # --- user-message budget reminder ------------------------------------------
@@ -102,14 +106,13 @@ def render_user(user_base: str, budget: int) -> str:
     """Append the budget reminder as the last sentence of the user message.
 
     ``user_base`` should already be CoT-tail-stripped (see strip_user_cot_tail).
-    No reminder is added when ``budget <= 0``: that sample has the hint tool
-    disabled (render_system also drops the tool instruction), so a "no calls
-    remaining" line would be misleading.
+    At ``budget <= 0`` the reminder is still appended and reads "no hint calls
+    remaining, finish on your own" (render_remaining_calls(0)) -- the budget-0
+    user message thus matches the budget>0 layout exactly, mirroring render_system
+    which also keeps the tool instruction at budget 0.
     """
     base = user_base.rstrip()
-    if int(budget) <= 0:
-        return base
-    return base + "\n\n" + render_remaining_calls(int(budget))
+    return base + "\n\n" + render_remaining_calls(max(int(budget), 0))
 
 
 def render_remaining_calls(remaining: int) -> str:

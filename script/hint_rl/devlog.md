@@ -1,7 +1,392 @@
 # HPRL dev log
 
-Running engineering log — newest entry on top. Append a new `## YYYY-MM-DD` section
-per working session.
+Running engineering log. Two parts: **TODO / Planned** (ideas not yet built) directly
+below, then the **Done log** (shipped work, newest entry on top — append a new
+`## YYYY-MM-DD` section per working session). Move an item from TODO to a dated Done
+entry once it lands.
+
+---
+
+# TODO / Planned (not yet done)
+
+## Counterfactual-probe budget ratchet ("double-rollout") — set the budget at the true frontier
+
+**Logged:** 2026-06-13 (idea from user, 2026-06-13). **Status:** design only — not implemented.
+
+**Motivation — the ratchet reads a corrupted need-signal, so budgets don't descend.**
+Analysis of the hard set (`data_pipeline/dapo_17k_zero_first_epoch_acc_no_improvement.parquet`)
+across the two v3 hint runs (`…-003103`, `…-171235`) vs the no-hint GRPO baseline
+(`…-20260608-223250`) surfaced three linked facts (numbers + plots in
+`logs/experiment_stats.md`, tools in `logs/plot_tool/`):
+
+1. **The policy calls a hint whenever it has budget.** Voluntary abstention rate (of
+   `hint_budget>0` rollouts, the fraction with `called_hint==0`) starts ~92–94% and
+   **collapses to ~0% by step ~18–20** (`hint_abstention_rate.py`). Calling a hint is
+   not itself bad behavior — but it means the model *fills whatever budget it is granted*.
+2. **So the frugal-success signal is self-corrupted.** Because the model spends up to the
+   budget, "fewest hints any correct rollout used" `m ≈ B_q`: in run 003103 **72.6%** of
+   correct `budget>0` rollouts used the FULL budget, 171235 **50.2%**. When `m == B_q` the
+   PRIMARY frugal rule (`budget_manager.compute_downward_budget`) is **dormant**, and
+   downsizing falls entirely to the FALLBACK, which is **gated at ≥50% correct** — a bar
+   hard problems rarely clear. Net: the budget can't tell *true need* from *granted budget*,
+   and freezes at its initial `K_q`.
+3. **The ratchet is purely downward — a frozen budget stays frozen forever** (no
+   upward-on-plateau half is implemented; see budget_manager.py:44). The unaided-solve
+   coverage curve (`unaided_solved_over_steps.py`) **plateaus at ~step 18–20** — exactly
+   when abstention hits 0 — while the GRPO baseline keeps climbing (227–238 vs 666). Once
+   the policy always calls a hint, it stops practicing/expanding unaided solving.
+
+**The idea (user, 2026-06-13).** Stop *inferring* whether one fewer hint would work — *measure*
+it. Each step, for a problem currently at budget `B`, sample **two packs**:
+- a normal pack at budget `B`, and
+- a **probe pack at budget `B−1`** (the same problem, prompt re-rendered at `B−1`).
+
+If the `B−1` pack produces a correct rollout (or a success using even fewer hints), **downsize**
+the budget — to `B−1`, or straight to the min hint count of any correct probe rollout. The probe
+is a genuine counterfactual: the pack was *forced* to ≤`B−1`, so a solve there is real evidence the
+problem is doable with fewer, not an artifact of a greedy policy.
+
+**Why this is the right fix.**
+- **Clean equilibrium = "the correct level."** The budget settles at the smallest `B` such that the
+  probe at `B−1` *fails* but `B` succeeds — i.e. the frontier where removing one hint breaks the
+  problem. The minimal sufficient budget per problem, with no 50% gate and no corrupted frugal read.
+- **The probe pack is not wasted compute — it IS the frugality curriculum.** Rollouts forced to `B−1`
+  are exactly the slightly-more-frugal trajectories we want the policy to learn from, so we train on
+  them too (not probe-only).
+
+**Design choices to settle before building.**
+- **Gate the probe to control cost.** Doubling rollouts everywhere is expensive and pointless on
+  problems that are all-wrong at `B` (they'll be all-wrong at `B−1` too). Only fire the `B−1` probe
+  for problems that cleared some success bar at `B` (this step / last step) → extra cost is sublinear
+  and focused where the budget can actually move.
+- **GRPO grouping — keep the two packs as SEPARATE groups.** `B` and `B−1` are different conditions
+  (different difficulty); each should be advantage-normalized within itself. verl groups by prompt/uid,
+  so two rendered variants form two groups naturally — just make the ratchet read both.
+- **Robustness of the downsize trigger.** "Any correct at `B−1`" mirrors today's aggressive
+  single-success philosophy but is vulnerable to the answer-leak artifact (see the 2026-06-10 (d)
+  entry / `hprl-answer-leak-major-step`: ~5% of late solves are leak-only). Cheap guards: require ≥2
+  probe successes, exclude leak-only solves, or require probe success-rate ≥ the `B`-pack's. Tunable.
+- **Keep an in-probe frugal rule for multi-level descent.** Probing only `B−1` is a one-step-per-update
+  search. To recover fast multi-level jumps, also snap to "min hints used by a correct rollout *in the
+  `B−1` pack*" — since that pack was forced to ≤`B−1`, a solve using `k<B−1` is genuine, uncorrupted
+  evidence.
+- **Periodic re-probe of stuck problems (non-stationarity).** The policy improves, so a problem that
+  fails the `B−1` probe at step 20 may pass it at step 60; since the ratchet is downward-only, re-probe
+  held-budget problems every `K` steps so late capability keeps pulling budgets down.
+- **(Optional, separate) symmetric upward probe at `B+1`** for problems that go all-wrong at `B`
+  (zero GRPO variance, wasted) — pull them back into the learnable zone. Not bundled with this change.
+
+**Implementation touchpoints (when built).**
+- `hint_dataset.HintBudgetDataset` — emit the `B−1` (probe) prompt variant for gated problems.
+- `hint_budget_callback.py` — collect both groups per problem, pass probe results to the ratchet.
+- `budget_manager.compute_downward_budget` — consume probe success (+ in-probe frugal) instead of the
+  corrupted full-budget frugal signal; retire / demote the 50% gate.
+
+**Status:** design only — not implemented. Analysis scripts that motivate it are in `logs/plot_tool/`
+(`unaided_solved_analysis.py`, `unaided_solved_over_steps.py`, `hint_abstention_rate.py`); stats in
+`logs/experiment_stats.md`.
+
+---
+
+# Done log
+
+## 2026-06-12 (g) — box-then-call rate as a live training metric
+
+**Why.** The box-then-call pathology (the policy boxes an answer and then emits `<hint_call/>`
+in the same turn) was only visible OFFLINE via `logs/plot_tool/hint_call_with_box_analysis.py`
+parsing rollout dumps. On run `…v3-20260612-171235` it climbed to ~67% of all hint calls / ~73%
+of hint-using rollouts by step ~30 -- worth watching live, not just post-hoc.
+
+**Fix.** Count it at the source. In `hint_agent_loop._handle_generating_state`, at the
+`_is_hint_call(text)` branch (where `text` is exactly the emitting turn), bump
+`extra_fields["hint_calls_total"]` and, when `\boxed{` is in that turn,
+`extra_fields["hint_calls_with_box"]`. Counts every detected call -- served, selector-failed, and
+the over-budget terminal one (all pass through this branch before the budget check). Plumbed
+through the reward (both return dicts) + colocate pull-through, then aggregated in
+`hint_budget_callback`:
+  * `hprl/hint_call_with_box_frac` -- per CALL (with_box / total calls)
+  * `hprl/hint_call_with_box_rollout_frac` -- per rollout (over ALL rollouts)
+  * `hprl/hint_call_with_box_frac_of_hinting` -- per rollout (over hint-USING rollouts)
+
+Matches the offline tool's definitions (`\boxed{` presence in the calling turn, not "is the final
+answer"). Verified the keys flow on both reward branches + legacy default via the stubbed
+`compute_score` test. Populates from the next run.
+
+**Files touched**
+- `hint_agent_loop.py` — count calls + box-in-emitting-turn at `_is_hint_call`; `setdefault` init
+- `hint_reward.py`, `hint_reward_manager.py` — pass the two counters through
+- `hint_budget_callback.py` — `hprl/hint_call_with_box_{frac,rollout_frac,frac_of_hinting}`
+
+---
+
+## 2026-06-12 (f) — reliable selector-latency logging (verl hint_select timer was dropping to 0.0)
+
+**Finding.** A per-step timing breakdown of run `…v3-20260612-171235` (parsed from the console
+`timing_s/*`) showed rollout generation (`gen`) at **64.6%** of each step and the gradient
+(`update_actor`) at **24.1%** — and `gen` **tripled** over the run (102s avg over the first 5
+steps → 346s over the last 5) as hint usage ramped (137 → ~1315 hinted rollouts/step). But the
+hint-selector cost was **invisible**: `timing_s/agent_loop/hint_select/{mean,max,slowest}` logged
+a flat **0.0** across all 28 steps despite 27,587 selector calls.
+
+**Root cause (verl core, not ours).** `simple_timer("hint_select", agent_data.metrics)` accumulates
+correctly, but `AgentLoopOutput.metrics` is a typed pydantic `AgentLoopMetrics`
+(`verl/experimental/agent_loop/agent_loop.py:79`) with only `generate_sequences` / `tool_calls` /
+`compute_score` / `num_preempted`. The agent loop passes the raw `agent_data.metrics` dict into
+that field (`tool_agent_loop.py:197`); pydantic **drops the undeclared `hint_select` key**, so the
+per-sample `model_dump()` (`agent_loop.py:989`) never carries it and `_performance_metrics`'
+`metric.get("hint_select", 0.0)` (`:1137`) reads 0.0. The READ side was added to verl core but the
+model field never was — an incomplete integration. One-line verl fix would be
+`hint_select: float = 0.0` on `AgentLoopMetrics`, but per our no-core-edits rule we instrument on
+the override side instead.
+
+**Fix — time the selector on the reliable extra_fields path (no verl edit).**
+- `hint_agent_loop.py` — wrap the selector await in `time.perf_counter()` and accumulate
+  `extra_fields["hint_select_time"]` (seconds, `+=` across calls) and `["hint_select_calls"]`
+  (count). extra_fields DOES survive to `non_tensor_batch` (same path as `hint_call_failed`), unlike
+  `agent_data.metrics`. Kept the `simple_timer` too — it starts working for free if verl ever adds
+  the field. Also recorded **per-call** `select_latency_s` into each `selector_calls/*.jsonl` dump
+  record (off unless `HPRL_SELECTOR_DUMP_DIR` is set).
+- `hint_reward.py` / `hint_reward_manager.py` — pass `hint_select_time` / `hint_select_calls`
+  through to the result dict (both branches) and the colocate pull-through.
+- `hint_budget_callback.py` — new metrics `hprl/hint_select_time_{sum,mean,max,per_call}`
+  (`per_call` = total seconds / total calls = the undiluted round-trip cost).
+
+**Analysis artifacts** (in the run dir): `step_timing.{csv,png}` (per-step phase breakdown +
+share pie) via the new `step_timing_analysis.py`. Selector time for THIS run stays unrecoverable
+(folded into `gen`); the new metrics only populate from the next run.
+
+**Files touched**
+- `hint_agent_loop.py` — perf_counter selector timing → extra_fields + per-call dump field
+- `hint_reward.py`, `hint_reward_manager.py` — pass the two fields through
+- `hint_budget_callback.py` — `hprl/hint_select_time_*` metrics
+- new: `step_timing_analysis.py` (per-step timing breakdown tool)
+
+---
+
+## 2026-06-12 (e) — over-budget hint call → floor score, answer ungraded (protocol violation)
+
+**Decision.** An over-budget `<hint_call/>` — the policy emits the sentinel after its
+per-problem budget `B_q` is spent — is now treated as a hard **protocol violation**, not a
+benign no-op. Previously the rollout just terminated (under `terminate_on_budget_exceeded=true`)
+and the reward still graded whatever boxed answer was in `solution_str`, so a model that boxed a
+correct answer and then tacked on an illegal hint call still scored a clean solve. The framing
+question — grade for *correctness* (the box is right → credit it) vs. *instruction-following*
+(an over-budget call is illegal → no credit) — was settled in favor of instruction-following:
+asking for help it cannot have ends the rollout at the floor, **answer not graded**.
+
+**Mechanism (flag in the loop → short-circuit in the reward).**
+- `hint_agent_loop.py` — the budget-exhausted branch in `_handle_processing_tools_state` now
+  *unconditionally* sets `extra_fields["hint_budget_exceeded"]=1` and terminates (the old
+  terminate-vs-"nudge to finish" fork is retired — no free chance to finish after an illegal
+  call). Initialized via `setdefault(..., 0)` on every rollout for `DataProto.concat` safety.
+- `hint_reward.py` — `compute_score` short-circuits on `extra_info["hint_budget_exceeded"]`:
+  returns `score = budget_exceeded_reward` (new kwarg, default `None` → `incorrect_reward`),
+  `acc=0`, and **skips grading entirely** (no `grade_answer`, no penalty/shaping/call-bonus).
+  `applied_hints` / `hint_call_failed` reads hoisted above the branch so both paths share them;
+  `hint_budget_exceeded` added to the normal return dict (=0.0) for a consistent schema.
+- `hint_reward_manager.py` — colocate-path pull-through so the flag reaches `extra_info` on both
+  rollout paths (inline path already merges all of `tool_extra_fields`).
+
+Because floored rollouts carry `acc=0`, the downward ratchet already treats them as failures —
+no `budget_manager` change needed.
+
+**Diagnostic.** New `hprl/hint_budget_exceeded` (count) and `hprl/hint_budget_exceeded_frac`
+(count / total rollouts) in `hint_budget_callback.py`. Watch the frac against
+`hprl/hint_calls_applied` early in a run: it should bite *over-budget* calls only, not chill
+legitimate in-budget hint use. Note the penalty lands on the hinted branch, so it pushes the
+same direction GRPO already does re: hint suppression.
+
+**Floor value.** Default `incorrect_reward` (−1.0) ties the bottom of the scale but only *equals*
+a plain unformatted failure (a formatted wrong answer sits higher at −0.9). To make an
+over-budget call *strictly* worse than any honest failure, set
+`+custom_reward_function.reward_kwargs.budget_exceeded_reward=-2.0` in the run script (not wired
+yet — left at default). Verified all paths with a standalone stubbed-`mathruler` `compute_score`
+test (correct-box+violation → −1.0/acc 0; custom floor; normal correct unaffected; numpy 0-d
+flag normalizes).
+
+**Files touched**
+- `hint_agent_loop.py` — flag + unconditional terminate on over-budget call; `setdefault` init
+- `hint_reward.py` — `budget_exceeded_reward` kwarg + floor-score short-circuit; hoisted state
+  reads; `hint_budget_exceeded` in both return dicts; docstring
+- `hint_reward_manager.py` — colocate pull-through for the flag
+- `hint_budget_callback.py` — new `hprl/hint_budget_exceeded{,_frac}` metrics
+- `config/hprl_trainer.yaml`, `README.md` — mark `terminate_on_budget_exceeded` retired; document
+  the floor-score semantics
+
+---
+
+## 2026-06-12 (d) — effort-gate the hint-call bonus (kill short-CoT-then-hint)
+
+**Motivation (v3 rollout pathology).** Run `…v3-20260612-141816` collapsed to "emit a
+~100-char non-attempt, then `<hint_call/>`": the fraction of rollouts calling a hint
+climbed **5.8% → 67.8%** over 22 steps (among *failing* rollouts 5.6% → 68.5%),
+hints/rollout 0.06 → 1.19, while unaided val acc stayed flat ~0.038 (dipped to 0.015 @
+step 10). The `hint_shape_coeff=0.3` effort-shaping penalty was meant to suppress exactly
+this and did **not** — `hprl/hint_shape_penalty_mean` was a healthy 0.20 the whole time.
+
+**Root cause — the deterrent and the incentive sat on opposite branches.**
+`hint_reward.compute_score` subtracted the shape penalty ONLY in the `if correct:` branch;
+the failing branch was `score = base + hint_call_bonus` with no shape term. But acc≈0.15
+→ ~85% of rollouts FAIL, and the four reward levels are structurally fixed: correct/no-hint
+**+1.10**, correct/hinted 0.40→−0.22 (floored share 0→15%), **wrong/hinted −0.80**,
+**wrong/no-hint −0.90**. So a hinted failure ALWAYS beat an unhinted failure by **+0.10**
+(the `hint_call_reward`), and that edge sat on 58% of the batch (2384/4096 wrong+hinted @
+step 22, mean shape_sum 0.99, `hint_shape_penalty` 0.297 *logged* but 99.5% scored exactly
+−0.80 = never subtracted). The penalty's real reach ≈ correct(0.15)×not-floored(~0.46) ≈
+**7% of rollouts**, fighting a +0.10 edge on 58% — outnumbered ~8:1 and on the wrong side.
+GRPO kept pushing toward the cheapest hinted failure: minimal CoT then a hint. (First run
+with `hint_call_reward`, commit `47adae9` — the anti-suppression bonus overshot into
+rewarding the cheapest hint use.)
+
+**Fix — effort-gate the bonus on the SAME branch (`hint_reward.py`).** The incorrect-branch
+bonus is now `hint_call_bonus = max(0, hint_call_reward − shape_penalty)`, reusing the same
+`shape_penalty = coeff·effort_shortfall_sum` the correct branch subtracts; the correct
+branch is unchanged. A front-loaded hinted failure (shape_sum≈0.99 → shape_pen 0.30) is
+clawed back to **−0.90 = identical to not hinting**; a genuine-struggle hinted failure
+(shape_sum≈0) keeps the full +0.10 → −0.80. With `coeff=0.3`, `hint_call_reward=0.1` the
+bonus zeroes at shape_sum≥0.333 (measured front-loaders ≈0.99 → fully clawed back). Clamped
+at 0 so a shallow hinted failure is never pushed *below* an unhinted one (that would
+re-suppress hint use — the very thing the bonus exists to prevent). Invariants preserved:
+`correct_floor` −0.75 still > best wrong −0.80; bonus still binary in hint COUNT (no spam
+incentive); `hint_shape_coeff≤0` restores the old flat bonus exactly. Verified across all
+six outcome cases + the floor by a standalone `compute_score` test.
+
+**Diagnostic.** New `hprl/hint_call_bonus_mean_hinted` in `hint_budget_callback.py` — mean
+effective bonus over hinted rollouts; drops toward 0 as the gate claws it back from
+front-loaders (the readout for whether the gate is biting on the next run).
+
+**Files touched**
+- `hint_reward.py` — effort-gate the incorrect-branch hint-call bonus; docstring/comment
+  updates (shape penalty now hits BOTH outcome branches, not correct-only)
+- `hint_budget_callback.py` — new `hprl/hint_call_bonus_mean_hinted` metric
+
+---
+
+## 2026-06-12 (c) — budget-0 prompt parity, templated eval sets, standalone re-budget script, train file → 3164
+
+**Motivation (length analysis).** Per-step rollout analysis of run `…v3-20260612-003103`
+(`logs/.../length_analysis.{csv,png}`, lengths in Qwen2.5 tokens) split two cohorts:
+full response length of **budget-0** rollouts vs. **first-turn** (pre-`<hint_call/>`)
+length of hint-call rollouts. Budget-0 length sat flat ~730–800 tok across all of
+training; hint-call first turns climbed ~400 → 860 tok (the two cross ~step 60). The
+budget-0 cohort's distinct, non-drifting shape traced to a **prompt-style difference**,
+not behavior: at budget 0 the prompt dropped the entire tool template (incl. the
+"reason step by step … `\boxed{...}`" closer).
+
+**1. Budget-0 now renders the FULL tool template (`hint_prompt.py`).** Removed the
+`budget <= 0` early-returns in `render_system`/`render_user`. At budget 0 the system
+prompt keeps the tool instruction ("at most **0** time(s)") and the user message ends
+with `render_remaining_calls(0)` = "no hint calls remaining, finish on your own." The
+budget-0 prompt is now byte-identical to a budget>0 prompt **except the budget digit**,
+so the policy sees the same framing/closer with or without hints and the budget-0
+length artifact disappears. Both prep AND the dynamic ratchet (`HintBudgetDataset`)
+inherit this (shared module). Updated the now-stale "drops the tool instruction"
+comment in `prepare_hint_data.py`. Safety: a budget-0 rollout that still emits
+`<hint_call/>` hits `hint_agent_loop`'s `len(applied) >= budget` branch → "finish your
+solution" nudge — no selector call, no crash.
+
+**2. Eval sets wrapped in the template at budget 0 (`prepare_eval_hint_template.py`,
+NEW).** `aime2024.parquet` and `dapo_sample_hard_100.parquet` shipped as bare
+single-turn rows (no `agent_name`, no hint pool), so validation ran OUT of the training
+prompt distribution. New script re-renders them with the same template at budget 0 →
+`dataset/{aime2024,dapo_sample_hard_100}-hint-mt.parquet`. **Budget 0** because these
+carry no hint pool to serve (chosen over a positive-budget hollow-call eval;
+user-confirmed) — and budget 0 means the agent loop never contacts the selector.
+`run_hprl_qwen2.5_7b.sh` `TEST_FILE`/`HARD_TEST_FILE` now point at the `-hint-mt` files;
+**originals kept untouched** for the non-HPRL baselines (`run_dapo`/`run_grpo`/
+`run_drgrpo`) that still use them. Verified `HintBudgetDataset` re-render is idempotent
+(30/30, 100/100) and resolves budget 0 (eval ids absent from the ratchet table; aime
+rows have no `problem_id` → baked-0 fallback). `data_source` preserved so verl reports
+each set separately.
+
+**3. Budget-setting factored out (`set_hint_budget.py`, NEW).** Splits the budget half
+of `prepare_hint_data.upgrade_row` into a standalone tool: input an already-templated
+`*-mt.parquet` + a zero-budget id file; recomputes B_q = #major-steps capped at
+`--max-budget` (same rule, shared `num_steps`), forces 0 for listed ids, re-renders
+system/user from the baked `hprl_system_base`/`hprl_user_base`, and updates
+`create_kwargs.{budget,problem}` + `hprl_init_budget`. **In place by default**;
+**idempotent** — same `--max-budget` + id set reproduces the parquet byte-for-byte
+(verified 3740/3740 on the simplified set). Lets a new easy-bucket curriculum be applied
+without regenerating the template or re-joining `hint_full`. ⚠️ pass the same
+`--max-budget` prep used (8) or non-zero budgets get silently re-capped.
+
+**4. Applied to `dapo-3164-hint-verl-mt.parquet` + switched TRAIN_FILE.** Ran (3) with
+`dataset/unaided_solved_ids.txt` (the same zero set as before): **809/1112** ids matched
+this 3164 set → budget 0 (25.6%); resulting dist `{0:809, 2:6, 3:116, 4:1566, 5:645,
+6:22}`. Verified 809/809 zero rows have budget-0 + full template, 2355/2355 non-listed
+rows keep budget>0 with `hprl_init_budget == create_kwargs.budget`. `run_hprl_qwen2.5_7b
+.sh` `TRAIN_FILE` → `dapo-3164-hint-verl-mt.parquet`. (303 listed ids aren't in this set
+— expected, it's a subset.)
+
+**Files touched**
+- `hint_prompt.py` — budget-0 renders the full template (removed the `<=0` drops)
+- `prepare_hint_data.py` — stale budget-0 comment updated
+- `prepare_eval_hint_template.py` (NEW) — template eval sets at budget 0
+- `set_hint_budget.py` (NEW) — standalone re-budget of a templated mt parquet
+- `run_hprl_qwen2.5_7b.sh` — `TRAIN_FILE` → 3164; `TEST_FILE`/`HARD_TEST_FILE` → `-hint-mt`
+- `dataset/` — new `aime2024-hint-mt.parquet`, `dapo_sample_hard_100-hint-mt.parquet`;
+  `dapo-3164-hint-verl-mt.parquet` re-budgeted in place
+
+---
+
+## 2026-06-12 (b) — budget ratchet: frugal-success primary rule (snap to min-correct)
+
+User spec: *"if the correct rollout has minimum hint calls less than the current
+budget, set the next budget to this minimum; else use the current mechanism."* This
+promotes the **min-correct** idea (parked in `45d4a7f`, see (c) 2026-06-11) to the
+PRIMARY tier and keeps the (N/2)-th-smallest rule as a fallback — resolving the
+aggressive-vs-conservative tension by going aggressive *only when a frugal success
+exists*.
+
+**New 2-tier rule** (`budget_manager.compute_downward_budget`; m = min hint count
+over correct rollouts):
+```
+m < current_budget  -> new = clamp(m)                  # PRIMARY, UNGATED by C  ("min_frugal")
+otherwise           -> (N/2)-th-smallest FALLBACK:
+    2C < N          -> unchanged                       # ("unchanged")
+    else            -> new = clamp(pivot - decrement)  # ("pivot")
+clamp = [min_budget, current_budget]   (strictly downward)
+```
+- **Ungated by the correct fraction:** a *single* correct rollout that solved under
+  budget snaps B_q straight to that count (vs the old `C ≥ N/2` gate). Aggressive by
+  design, per the user.
+- **The fallback now degenerates** (worth knowing): it is reached only when
+  m == current_budget (every success used the FULL budget), so the (N/2)-th-smallest
+  pivot == B_q and the branch just squeezes B_q down by `decrement`. Kept the full
+  mechanism verbatim — faithful to "use the current mechanism," and robust if a count
+  ever exceeds the budget (e.g. the `monotone-down clamp` edge case).
+
+**Metadata / API.** `BudgetUpdate` gains `rule` (`min_frugal`|`pivot`|`unchanged`) and
+`min_correct_hint_count`; `as_dict` extended. Fixed a stale dataclass comment
+("(N/2)-th-*largest*" → *smallest* — the code always sorted ascending). `hint_budget_
+callback` reads only `new_budget`/`changed`/`n_*`, so nothing downstream breaks.
+`_selftest` rewritten — **25 checks pass** (frugal: ungated / single-success /
+pre-empts-pivot / min_budget-floor / to-zero; fallback: pivot-squeeze / too-few /
+no-correct; clamp; manager round-trip + persistence).
+
+**Activation — no new toggle.** It is the *only* downward rule now (replaced in
+place), so it is live whenever the ratchet runs: master switch `data.hprl.enable`
+(`HPRL_ENABLE`, **default True**). Fires after each step via the `_update_actor` hook
+(`hprl_ray_trainer.py`) → `hprl_update_budgets` groups by problem_id →
+`compute_downward_budget` → atomic `budget_state.json` → `HintBudgetDataset`
+re-renders next epoch. Knobs unchanged: `HPRL_MIN_BUDGET` (clamp floor, BOTH tiers),
+`HPRL_DECREMENT` (FALLBACK only now), `HPRL_DEFAULT_BUDGET`. To take effect:
+**relaunch** (imports load once; the run uses the live `${SCRIPT_DIR}/budget_manager.py`,
+not the archival `hint_rl_src.*` snapshot) and start from a **fresh** per-exp
+`budget_state.json` for a clean test (the callback's monotone-down guard never
+re-raises an already-lowered B_q). Confirm via the startup line `HPRL ratchet
+enabled: budget_state=…` and the `hprl/budget_*` / `frac_ratcheted` wandb scalars.
+
+**Behavioral note / what to watch.** Materially faster, noisier ratcheting — one
+lucky low-hint success drops the whole problem's budget (exactly the trade-off (c)
+2026-06-11 parked over). Pushes problems into the harder fewer-hint regime sooner,
+synergizing with the new hint-call reward (the hint-call-reward entry below + the
+suppression memo). Watch `hprl/budget_*` / `frac_ratcheted` for over-fast collapse;
+raise `HPRL_MIN_BUDGET` if budgets bottom out too early.
+
+**Files:** `budget_manager.py` (rule body + `_clamp` helper + `BudgetUpdate`
+fields/`as_dict` + module header + docstring + `_selftest`). Memory
+`hprl-downward-budget-ratchet` updated. **Status:** unit-tested (25/25); not yet run live.
 
 ---
 

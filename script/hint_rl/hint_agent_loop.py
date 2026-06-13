@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import socket
+import time
 from typing import Any
 
 from verl.experimental.agent_loop.agent_loop import register
@@ -105,10 +106,13 @@ class HintAgentLoop(ToolAgentLoop):
         self.default_budget = int(
             hprl.get("default_budget", os.environ.get("HPRL_DEFAULT_BUDGET", self.max_assistant_turns or 8))
         )
-        # When the policy emits <hint_call/> after the budget is spent:
-        #   True  -> terminate the rollout;
-        #   False -> inject a "no hints remaining, please finish" user message.
-        self.terminate_on_budget_exceeded = bool(hprl.get("terminate_on_budget_exceeded", False))
+        # NOTE: an over-budget <hint_call/> is ALWAYS a terminating protocol
+        # violation now (see _handle_processing_tools_state) -- the rollout is
+        # flagged for the floor reward and stopped immediately. The former
+        # terminate_on_budget_exceeded knob (terminate vs "nudge the model to
+        # finish") is retired: there is no longer a free chance to finish after an
+        # illegal call. The config key is left in place for back-compat but no
+        # longer changes behavior.
         # Hint-selection + penalty strategy (single source of truth: data.hprl.strategy,
         # env HPRL_HINT_STRATEGY as a fallback). Must match the reward's hint_strategy.
         #   STRATEGY_HINT       -- inject ONE selector-chosen hint, exclude that hint
@@ -182,6 +186,30 @@ class HintAgentLoop(ToolAgentLoop):
         # the reward fn and aggregated by hint_budget_callback so a selector outage
         # is VISIBLE in hprl/* metrics instead of silently degrading every call.
         agent_data.extra_fields.setdefault("hint_call_failed", 0)
+        # Per-rollout flag: set to 1 when the policy emits <hint_call/> AFTER its
+        # budget is spent (an over-budget call). The reward short-circuits to the
+        # floor score on this flag (hint_reward.compute_score) and the answer is NOT
+        # graded. Initialized here for the same DataProto.concat reason as
+        # applied_hints -- it must be present on every rollout, including those that
+        # never go over budget.
+        agent_data.extra_fields.setdefault("hint_budget_exceeded", 0)
+        # Per-rollout selector latency: total seconds spent in the frozen selector
+        # (sum over this rollout's hint calls) and the number of those calls. The
+        # verl-native hint_select timer is dropped before aggregation (AgentLoopMetrics
+        # has no field for it), so these extra_fields are the RELIABLE selector-cost
+        # signal -- surfaced by the reward and averaged in hint_budget_callback to
+        # hprl/hint_select_time_*. Initialized for the DataProto.concat reason as
+        # applied_hints (present on every rollout, incl. hint-free ones -> 0.0/0).
+        agent_data.extra_fields.setdefault("hint_select_time", 0.0)
+        agent_data.extra_fields.setdefault("hint_select_calls", 0)
+        # Box-then-call signal: number of hint calls this rollout made (every
+        # <hint_call/> detected, served + over-budget terminal), and how many of
+        # those were emitted by a turn that ALREADY contained a \boxed{...}. The
+        # reward passes both through; hint_budget_callback derives the per-call rate
+        # (with_box / total) and the per-rollout rate (rollouts with >=1 box-then-call).
+        # Initialized for the same DataProto.concat reason as applied_hints.
+        agent_data.extra_fields.setdefault("hint_calls_total", 0)
+        agent_data.extra_fields.setdefault("hint_calls_with_box", 0)
         # Per-turn reasoning-token lengths for the reward's ORDER-AWARE effort-
         # shaping term (hint_reward.effort_shortfall_sum). Each turn is scored
         # against the SUFFIX MAXIMUM of this (ordered) list -- a turn is penalized
@@ -236,6 +264,19 @@ class HintAgentLoop(ToolAgentLoop):
         agent_data.messages.append({"role": "assistant", "content": text})
 
         if self._is_hint_call(text):
+            # Count the call and whether its emitting turn already boxed an answer
+            # (the box-then-call pattern). ``text`` is THIS turn only, so ``\boxed{``
+            # here means the model committed an answer and then asked for a hint in
+            # the same turn. Counts every detected call -- served, selector-failed, and
+            # the over-budget terminal one (all route through here before the budget
+            # check in _handle_processing_tools_state).
+            agent_data.extra_fields["hint_calls_total"] = (
+                agent_data.extra_fields.get("hint_calls_total", 0) + 1
+            )
+            if "\\boxed{" in text:
+                agent_data.extra_fields["hint_calls_with_box"] = (
+                    agent_data.extra_fields.get("hint_calls_with_box", 0) + 1
+                )
             return AgentState.PROCESSING_TOOLS  # reuse this state slot for hint injection
         return AgentState.TERMINATED
 
@@ -276,19 +317,17 @@ class HintAgentLoop(ToolAgentLoop):
         major_step_mode = self.hint_strategy == STRATEGY_MAJOR_STEP
 
         if len(applied) >= budget:
-            # Budget spent. terminate_on_budget_exceeded decides what happens when
-            # the policy still emits <hint_call/>:
+            # Budget spent and the policy STILL emitted <hint_call/>: a hard protocol
+            # violation (asking for help it cannot have). Flag the rollout so the
+            # reward short-circuits to the floor score -- hint_reward.compute_score
+            # reads extra_info["hint_budget_exceeded"] and returns budget_exceeded_reward
+            # with acc=0, NOT grading the boxed answer (even a correct box earns nothing
+            # if the rollout ended on an illegal call) -- and terminate immediately.
+            # UNCONDITIONAL: an over-budget call always terminates + zeroes; the old
+            # "nudge the model to finish" fallback is retired.
             agent_data.metrics["hint_budget_exhausted"] = agent_data.metrics.get("hint_budget_exhausted", 0) + 1
-            if self.terminate_on_budget_exceeded:
-                return AgentState.TERMINATED
-            # else: nudge the model to finish rather than inject a hint.
-            hint_message = {
-                "role": "user",
-                "content": (
-                    f"You have used all {budget} hint(s) for this problem. "
-                    "No more hints are available; please finish your solution."
-                ),
-            }
+            agent_data.extra_fields["hint_budget_exceeded"] = 1
+            return AgentState.TERMINATED
         else:
             problem = create_kwargs.get("problem", "")
             hints_obj = create_kwargs.get("hints", "")
@@ -303,12 +342,28 @@ class HintAgentLoop(ToolAgentLoop):
             call_index = len(applied)  # index of THIS hint call (before recording)
 
             # Time the (blocking, on-critical-path) call to the frozen gpt-oss
-            # selector. simple_timer accumulates (+=) across every hint call in
-            # this rollout -> per-sample TOTAL selector latency. Surfaced by
-            # AgentLoopManager._performance_metrics as timing_s/agent_loop/
-            # hint_select/{min,max,mean} (+ slowest/hint_select) in wandb.
+            # selector. Two timers, by necessity:
+            #   * simple_timer writes agent_data.metrics["hint_select"], the verl-
+            #     native path -> timing_s/agent_loop/hint_select/*. This is CURRENTLY
+            #     DROPPED: AgentLoopMetrics (a pydantic model) has no hint_select field,
+            #     so model_dump() strips it before _performance_metrics aggregates ->
+            #     the wandb metric reads a flat 0.0. Kept so it starts working for free
+            #     if verl ever adds the field.
+            #   * perf_counter -> extra_fields["hint_select_time"] (accumulated +=
+            #     across every call this rollout). extra_fields DOES survive to
+            #     non_tensor_batch (same path as hint_call_failed), so this is the
+            #     RELIABLE per-rollout selector latency the reward surfaces and
+            #     hint_budget_callback aggregates to hprl/hint_select_time_*.
+            _t0 = time.perf_counter()
             with simple_timer("hint_select", agent_data.metrics):
                 selection, _raw, err = await self._selector.select(problem, trace, hints_str)
+            select_latency_s = time.perf_counter() - _t0
+            agent_data.extra_fields["hint_select_time"] = (
+                agent_data.extra_fields.get("hint_select_time", 0.0) + select_latency_s
+            )
+            agent_data.extra_fields["hint_select_calls"] = (
+                agent_data.extra_fields.get("hint_select_calls", 0) + 1
+            )
             # Guard on dict, not just None: no selector output shape may crash the
             # rollout (a stray JSON array once killed a whole run via .get on a list).
             if not isinstance(selection, dict):
@@ -343,6 +398,9 @@ class HintAgentLoop(ToolAgentLoop):
                     "call_index": call_index,
                     "strategy": self.hint_strategy,
                     "budget": budget,
+                    # per-call selector round-trip latency (s); summed across calls
+                    # into extra_fields["hint_select_time"] for the wandb metric.
+                    "select_latency_s": round(select_latency_s, 4),
                     "applied_step_ids_before": [h.get("major_step_id") for h in applied[:call_index]],
                     "n_assistant_in_messages": sum(
                         1 for m in agent_data.messages if m.get("role") == "assistant"

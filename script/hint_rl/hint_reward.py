@@ -13,9 +13,12 @@
 #     R = incorrect_reward + b                if the answer is wrong
 #     R = correct_reward - sum_k w_{j_k}      if the answer is correct
 #
-# i.e. a wrong answer gets the base (incorrect) reward plus a one-off hint-call
-# bonus b (= hint_call_reward if the rollout RECEIVED >=1 applied hint, else 0);
-# a correct answer gets the base (correct) reward minus the summed importance
+# i.e. a wrong answer gets the base (incorrect) reward plus a one-off, EFFORT-GATED
+# hint-call bonus b (= max(0, hint_call_reward - shape_penalty) if the rollout
+# RECEIVED >=1 applied hint, else 0 -- the effort-shaping penalty claws the bonus back
+# when the hint followed too little reasoning, so a shallow hinted failure cannot
+# out-earn an unhinted one); a correct answer gets the base (correct) reward minus the
+# summed importance
 # weights {w_{j_k}} of the hints applied during the rollout (the bonus does NOT
 # apply when correct), FLOORED at the best achievable wrong score
 # (incorrect_reward + format_reward + hint_call_reward) so solving always ranks at
@@ -179,6 +182,7 @@ def compute_score(
     hint_guidance_difficulty: str = DEFAULT_GUIDANCE_DIFFICULTY,
     hint_strategy: str = STRATEGY_HINT,
     hint_shape_coeff: float = 0.0,
+    budget_exceeded_reward: Optional[float] = None,
     **kwargs,
 ) -> dict:
     """HPRL reward: outcome correctness minus the summed hint penalty.
@@ -190,20 +194,40 @@ def compute_score(
     loop ran (``data.hprl.strategy``): ``"hint"`` charges per-hint penalties,
     ``"major_step"`` charges per-step penalties directly.
 
-    ``hint_shape_coeff`` (>0) additionally subtracts the effort-shaping penalty
-    (``effort_shortfall_penalty``) from the CORRECT reward, discouraging hints
-    called after too-little reasoning. 0 disables it.
+    ``hint_shape_coeff`` (>0) additionally applies the effort-shaping penalty
+    (``coeff * effort_shortfall_sum``), discouraging hints called after too-little
+    reasoning. It now hits BOTH outcome branches: subtracted from the CORRECT reward,
+    AND clawed back from the INCORRECT branch's hint-call bonus (see below), so a
+    front-loaded hinted FAILURE cannot out-earn an unhinted failure. (Previously it was
+    correct-branch-only; on a low-accuracy regime the ~85% of rollouts that fail never
+    saw it, and the policy learned the cheapest hinted failure -- minimal CoT then a
+    hint -- for the free hint-call bonus.) 0 disables it.
 
     ``hint_call_reward`` (default 0.1) is a one-off bonus added to the INCORRECT
     reward when the rollout RECEIVED at least one hint (correct rollouts are
-    unaffected). It is binary -- one applied hint is enough; extra hints add
-    nothing, so there is no incentive to spam. The intent is to keep a positive
+    unaffected). It is binary in hint COUNT -- one applied hint is enough; extra hints
+    add nothing, so there is no incentive to spam. The intent is to keep a positive
     gradient on hint use among the failing rollouts (GRPO otherwise ranks
     unhinted-correct above hinted-correct and the policy learns to suppress hint
     use). It gates on an APPLIED hint (``len(applied_hints) >= 1``), NOT a bare
     ``<hint_call/>`` emission: a call the selector failed to serve conveyed nothing
     to the policy, and rewarding the emission alone would pay out during a selector
-    outage (when ``hint_call_failed`` spikes). 0 disables.
+    outage (when ``hint_call_failed`` spikes). It is EFFORT-GATED by
+    ``hint_shape_coeff``: the bonus is ``max(0, hint_call_reward - shape_penalty)``, so
+    a hint that followed real reasoning keeps the full bonus while a front-loaded call
+    (short CoT then ``<hint_call/>``) has it cancelled back to 0. Without this gate the
+    bonus lives ENTIRELY on the incorrect branch -- which the correct-only shape penalty
+    never reached -- so the policy learns to emit a minimal CoT then a hint for a free
+    reward. 0 disables.
+
+    ``budget_exceeded_reward`` (default ``None`` -> ``incorrect_reward``) is the FLOOR
+    score assigned when the agent loop flags an OVER-BUDGET hint call
+    (``extra_info["hint_budget_exceeded"]``): the policy emitted ``<hint_call/>`` after
+    its budget ``B_q`` was spent. This is treated as a hard protocol violation -- the
+    rollout short-circuits to this floor with ``acc=0`` and the boxed answer is NOT
+    graded (a correct box earns nothing if the rollout ended on an illegal call). Set
+    it BELOW ``incorrect_reward`` to make an over-budget call strictly worse than an
+    ordinary failure.
 
     Returns a dict whose ``score`` is the optimized reward and whose extra keys
     are logged as ``reward_extra_info`` by the reward manager (``acc`` is also
@@ -211,16 +235,7 @@ def compute_score(
     """
     extra_info = extra_info or {}
 
-    # --- outcome correctness (same as the plain GRPO run) ----------------
-    pred = extract_boxed_content(solution_str)
-    has_format = pred != _NO_BOX
-    correct = has_format and grade_answer(pred, ground_truth)
-
-    base = correct_reward if correct else incorrect_reward
-    if format_reward and has_format:
-        base += format_reward
-
-    # --- hint penalty (subtracted from the correct reward) ---------------
+    # --- per-rollout state recorded by the agent loop --------------------
     applied_hints = extra_info.get("applied_hints") or []
     # Defensive: applied_hints may arrive as a numpy 0-d object; normalize.
     if hasattr(applied_hints, "tolist"):
@@ -228,6 +243,77 @@ def compute_score(
     if applied_hints is None:
         applied_hints = []
 
+    # Count of hint calls whose selector lookup FAILED (the policy got the no-op
+    # fallback). Normalized once here (numpy 0-d safe) and reused below.
+    hint_call_failed = extra_info.get("hint_call_failed", 0)
+    if hasattr(hint_call_failed, "item"):
+        hint_call_failed = hint_call_failed.item()
+
+    # Selector latency recorded by the agent loop: total seconds spent in the frozen
+    # selector this rollout and the number of selector calls. Passed straight through
+    # to the result dict so hint_budget_callback can aggregate hprl/hint_select_time_*
+    # (the verl-native hint_select timer is dropped before aggregation; see agent loop).
+    hint_select_time = extra_info.get("hint_select_time", 0.0)
+    if hasattr(hint_select_time, "item"):
+        hint_select_time = hint_select_time.item()
+    hint_select_calls = extra_info.get("hint_select_calls", 0)
+    if hasattr(hint_select_calls, "item"):
+        hint_select_calls = hint_select_calls.item()
+
+    # Box-then-call counters recorded by the agent loop: total hint calls this
+    # rollout made, and how many were emitted by a turn that already had a \boxed{}.
+    # Passed straight through so hint_budget_callback can log the per-call and
+    # per-rollout box-then-call rates (hprl/hint_call_with_box_*).
+    hint_calls_total = extra_info.get("hint_calls_total", 0)
+    if hasattr(hint_calls_total, "item"):
+        hint_calls_total = hint_calls_total.item()
+    hint_calls_with_box = extra_info.get("hint_calls_with_box", 0)
+    if hasattr(hint_calls_with_box, "item"):
+        hint_calls_with_box = hint_calls_with_box.item()
+
+    # --- outcome correctness (same as the plain GRPO run) ----------------
+    pred = extract_boxed_content(solution_str)
+    has_format = pred != _NO_BOX
+
+    # --- protocol violation: over-budget hint call -> FLOOR score --------
+    # The agent loop sets extra_info["hint_budget_exceeded"]=1 when the policy emits
+    # <hint_call/> AFTER its budget is spent, then terminates the rollout. Asking for
+    # help it cannot have is a hard protocol violation: we SHORT-CIRCUIT to the floor
+    # reward (budget_exceeded_reward, default incorrect_reward) and do NOT grade the
+    # boxed answer -- even a correct box earns nothing if the rollout ended on an
+    # illegal call. acc=0 so it counts as a failure for GRPO group filtering and the
+    # budget ratchet; the hint penalty / shaping / call-bonus are all bypassed.
+    hint_budget_exceeded = extra_info.get("hint_budget_exceeded", 0)
+    if hasattr(hint_budget_exceeded, "item"):
+        hint_budget_exceeded = hint_budget_exceeded.item()
+    if hint_budget_exceeded:
+        floor = incorrect_reward if budget_exceeded_reward is None else float(budget_exceeded_reward)
+        return {
+            "score": float(floor),
+            "acc": 0.0,
+            "pred": pred,
+            "has_format": 1.0 if has_format else 0.0,
+            "num_hints": float(len(applied_hints)),
+            "called_hint": 1.0 if len(applied_hints) >= 1 else 0.0,
+            "hint_call_bonus": 0.0,
+            "hint_penalty": 0.0,
+            "hint_shape_sum": 0.0,
+            "hint_shape_penalty": 0.0,
+            "hint_call_failed": float(hint_call_failed or 0),
+            "hint_budget_exceeded": 1.0,
+            "hint_select_time": float(hint_select_time or 0.0),
+            "hint_select_calls": float(hint_select_calls or 0),
+            "hint_calls_total": float(hint_calls_total or 0),
+            "hint_calls_with_box": float(hint_calls_with_box or 0),
+        }
+
+    correct = has_format and grade_answer(pred, ground_truth)
+
+    base = correct_reward if correct else incorrect_reward
+    if format_reward and has_format:
+        base += format_reward
+
+    # --- hint penalty (subtracted from the correct reward) ---------------
     penalty = hint_penalty(
         applied_hints,
         extra_info,
@@ -243,8 +329,10 @@ def compute_score(
     # suffixmax_i over the ordered turn lengths) is computed ALWAYS -- even when
     # shaping is disabled (coeff <= 0) -- so the front-loading signal is logged to
     # wandb (hint_shape_sum) in the control arm too. The applied penalty is
-    # coeff * that sum, subtracted ONLY from the correct reward (a wrong answer
-    # stays at exactly the base incorrect_reward, -1).
+    # coeff * that sum; it is subtracted from the correct reward AND clawed back from
+    # the incorrect branch's hint-call bonus (see below), so front-loading is
+    # discouraged on BOTH outcomes (a wrong answer with no applied hint still stays at
+    # exactly the base incorrect_reward).
     shape_sum = effort_shortfall_sum(extra_info.get("turn_lens"))
     shape_penalty = float(hint_shape_coeff) * shape_sum if hint_shape_coeff > 0 else 0.0
 
@@ -258,10 +346,28 @@ def compute_score(
     # worse, hint_call_failed spikes during a selector OUTAGE (selectors have gone
     # down silently here), and rewarding the bare emission would pay out a bonus for
     # a no-op sentinel exactly then -- training the policy to emit it as a reward-
-    # grab decoupled from hint use. BINARY -- one applied hint is enough, extra hints
-    # add nothing -- so there is NO incentive to spam hint calls.
+    # grab decoupled from hint use. BINARY in hint COUNT -- one applied hint is enough,
+    # extra hints add nothing -- so there is NO incentive to spam hint calls.
+    #
+    # EFFORT-GATED: the bonus is reduced by the SAME effort-shaping penalty the correct
+    # branch subtracts (shape_penalty = coeff * front-loading shortfall), then clamped at
+    # 0. Rationale: this bonus lives ENTIRELY on the incorrect branch, but the shape
+    # penalty used to be applied ONLY on the correct branch -- and on a low-accuracy
+    # regime most rollouts FAIL, so the policy discovered that the cheapest hinted failure
+    # (a near-empty CoT then <hint_call/>) collects the full +hint_call_reward while the
+    # shape penalty never reaches it. Subtracting shape_penalty HERE puts the deterrent on
+    # the same branch as the incentive: a hint that followed REAL reasoning (shape_penalty
+    # ~ 0) keeps the full bonus; a front-loaded call (shape_penalty >= hint_call_reward)
+    # has the bonus cancelled to 0 -> same score as not calling. Clamped at 0 so a shallow
+    # hinted failure is never pushed BELOW an unhinted one (that would re-suppress hint
+    # use, the very thing this bonus exists to prevent) -- only made no-better. Disabling
+    # shaping (hint_shape_coeff <= 0 -> shape_penalty == 0) restores the flat bonus exactly.
     called_hint = len(applied_hints) >= 1
-    hint_call_bonus = float(hint_call_reward) if (not correct and called_hint) else 0.0
+    hint_call_bonus = (
+        max(0.0, float(hint_call_reward) - shape_penalty)
+        if (not correct and called_hint)
+        else 0.0
+    )
 
     # Floor for a CORRECT rollout's score: the BEST achievable WRONG score -- a wrong
     # answer that is well-formed (format_reward) AND called a hint (hint_call_reward).
@@ -271,7 +377,7 @@ def compute_score(
     # otherwise push GRPO to suppress solving-with-hints. (Previously floored at
     # incorrect_reward alone, which left a heavily-penalized correct rollout able to
     # dip just under a hinted failure.)
-    correct_floor = incorrect_reward + format_reward + hint_call_reward
+    correct_floor = incorrect_reward + format_reward + hint_call_reward + 0.05
 
     # Wrong answer -> base (incorrect) reward + the one-off hint-call bonus (keeps a
     # positive gradient on hint use that GRPO otherwise suppresses). Correct answer
@@ -288,11 +394,7 @@ def compute_score(
     # on extra_fields; surfaced here so it lands in non_tensor_batch for
     # hint_budget_callback to aggregate -> a selector outage shows up in hprl/*.
     # NOT rewarded (see the hint-call bonus above) -- only logged, as the signal we
-    # watch to DETECT such an outage instead of paying it out.
-    hint_call_failed = extra_info.get("hint_call_failed", 0)
-    if hasattr(hint_call_failed, "item"):
-        hint_call_failed = hint_call_failed.item()
-
+    # watch to DETECT such an outage instead of paying it out. (Normalized above.)
     return {
         "score": float(score),
         "acc": 1.0 if correct else 0.0,
@@ -305,4 +407,9 @@ def compute_score(
         "hint_shape_sum": float(shape_sum),
         "hint_shape_penalty": float(shape_penalty),
         "hint_call_failed": float(hint_call_failed or 0),
+        "hint_budget_exceeded": 0.0,
+        "hint_select_time": float(hint_select_time or 0.0),
+        "hint_select_calls": float(hint_select_calls or 0),
+        "hint_calls_total": float(hint_calls_total or 0),
+        "hint_calls_with_box": float(hint_calls_with_box or 0),
     }

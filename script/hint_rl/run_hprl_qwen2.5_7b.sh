@@ -105,7 +105,7 @@ export SELECTOR_MAX_RETRIES=${SELECTOR_MAX_RETRIES:-3}
 NNODES=${NNODES:-4}
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 
-train_prompt_bsz=256
+train_prompt_bsz=128
 n_resp_per_prompt=16
 train_prompt_mini_bsz=32
 
@@ -117,14 +117,23 @@ WORKING_DIR=${WORKING_DIR:-"${VERL_HOME}"}
 # Paths
 MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Qwen2.5-7B-Instruct"}
 CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dapo-3740-hint-verl-simplified-mt.parquet"}
-TEST_FILE=${TEST_FILE:-"${HINT_RL_HOME}/dataset/aime2024.parquet"}
-# Second held-out eval: 100 hard DAPO problems. Like aime2024 it carries NO
-# agent_name (-> unaided single-turn, the HintBudgetDataset passthrough), and its
-# problem_ids have ZERO overlap with the 3740 training rows. Its data_source is
-# "math_dapo", so verl reports it separately as val-core/math_dapo/* (aime2024
-# stays val-core/aime2024/*). verl evaluates each val file independently.
-HARD_TEST_FILE=${HARD_TEST_FILE:-"${HINT_RL_HOME}/dataset/dapo_sample_hard_100.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dapo-3164-hint-verl-mt.parquet"}
+# Templated eval sets: aime2024-hint-mt / dapo_sample_hard_100-hint-mt carry the
+# SAME hint-tool template as training (agent_name="hint_agent", full <hint_call/>
+# system instruction + budget-0 user reminder), so validation is prompt-matched to
+# training instead of running on the bare single-turn prompt. Budget is 0 -- these
+# problems have no curated hint pool -- so the eval is unaided and the agent loop
+# never contacts the selector (the len(applied)>=budget branch short-circuits).
+# Built by prepare_eval_hint_template.py from dataset/{aime2024,dapo_sample_hard_100}
+# .parquet (the originals are kept untouched for the non-HPRL baselines). Set
+# TEST_FILE back to the bare .parquet for an out-of-template unaided eval.
+TEST_FILE=${TEST_FILE:-"${HINT_RL_HOME}/dataset/aime2024-hint-mt.parquet"}
+# Second held-out eval: 100 hard DAPO problems. Its problem_ids have ZERO overlap
+# with the 3740 training rows (and with the ratchet table, so HintBudgetDataset
+# re-renders it at the baked budget 0). Its data_source is "math_dapo", so verl
+# reports it separately as val-core/math_dapo/* (aime2024 stays val-core/aime2024/*).
+# verl evaluates each val file independently.
+HARD_TEST_FILE=${HARD_TEST_FILE:-"${HINT_RL_HOME}/dataset/dapo_sample_hard_100-hint-mt.parquet"}
 # All validation files as a hydra list (RLHFDataset concatenates them, each row
 # keeping its own data_source for per-set metrics). Override VAL_FILES to change.
 VAL_FILES=${VAL_FILES:-"['${TEST_FILE}','${HARD_TEST_FILE}']"}

@@ -139,10 +139,14 @@ static-budget multi-turn GRPO run. With it **on**:
 
 Knobs (run-script env → config): `HPRL_MIN_BUDGET` (`data.hprl.min_budget`, floor,
 default 0 → can reach fully unaided), `HPRL_DECREMENT` (`data.hprl.decrement`),
-`HPRL_DEFAULT_BUDGET`, and `HPRL_TERMINATE_ON_BUDGET`
-(`data.hprl.terminate_on_budget_exceeded`, default `False`): when the policy emits
-`<hint_call/>` after `B_q` is spent, `True` ends the rollout, `False` injects a
-"no hints remaining, please finish" user message. See `downward_budget_plan.md`.
+and `HPRL_DEFAULT_BUDGET`. An over-budget `<hint_call/>` (the policy emits the
+sentinel after `B_q` is spent) is now ALWAYS a terminating **protocol violation**:
+the rollout is flagged and floored to `budget_exceeded_reward`
+(`custom_reward_function.reward_kwargs.budget_exceeded_reward`, default
+`incorrect_reward`) with `acc=0` and the boxed answer **not graded** — even a
+correct box earns nothing if the rollout ended on an illegal call. (The former
+`terminate_on_budget_exceeded` terminate-vs-"nudge to finish" knob is retired.) See
+`downward_budget_plan.md`.
 
 All verl integration is via overrides (custom dataset class + trainer subclass +
 recipe entry) — **no edits to verl core**.

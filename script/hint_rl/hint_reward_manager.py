@@ -85,6 +85,18 @@ class HintRewardManager(RewardManagerBase):
         if "hint_call_failed" not in extra_info and "hint_call_failed" in ntb:
             extra_info["hint_call_failed"] = _to_py(ntb.get("hint_call_failed"))
 
+        # Same for the over-budget protocol-violation flag (drives the reward's
+        # floor-score short-circuit in hint_reward.compute_score).
+        if "hint_budget_exceeded" not in extra_info and "hint_budget_exceeded" in ntb:
+            extra_info["hint_budget_exceeded"] = _to_py(ntb.get("hint_budget_exceeded"))
+
+        # Same for the per-rollout selector latency (total seconds / #calls) and the
+        # box-then-call counters; passed through so hint_budget_callback can log
+        # hprl/hint_select_time_* and hprl/hint_call_with_box_*.
+        for k in ("hint_select_time", "hint_select_calls", "hint_calls_total", "hint_calls_with_box"):
+            if k not in extra_info and k in ntb:
+                extra_info[k] = _to_py(ntb.get(k))
+
         extra_info["num_turns"] = ntb.get("__num_turns__", None)
         extra_info["rollout_reward_scores"] = ntb.get("reward_scores", {})
 

@@ -24,19 +24,26 @@
 #   Let N            = total rollouts for the problem this step (e.g. rollout.n).
 #       C            = number of those rollouts that reached the correct answer.
 #       h_1..h_C     = the hint-call counts of the *correct* rollouts.
+#       m            = min(h_1..h_C) -- fewest hints any correct rollout used.
 #
-#   * If C < N/2  (fewer than half correct): the policy has not yet shown it can
-#     reliably solve the problem at the current budget -> keep B_q unchanged.
-#   * Else (C >= N/2): sort the correct rollouts' hint counts in ASCENDING order
-#     and take the (N/2)-th smallest value v; set the new budget to v - decrement
-#     (default decrement = 1). Intuition: at least N/2 rollouts already succeed
-#     using <= v hints, so we squeeze the budget just under that level to push
-#     the policy to solve one step more on its own next epoch.
+#   * PRIMARY (frugal-success) rule: if some correct rollout solved with STRICTLY
+#     FEWER hints than the current budget (m < B_q), set the new budget to m. The
+#     problem is demonstrably solvable with m hints this step, so there is no
+#     reason to keep granting more. This is UNGATED by the correct fraction -- a
+#     single frugal success is sufficient evidence (aggressive by design).
+#   * FALLBACK (reached only when there is no correct rollout, or every correct
+#     rollout used the FULL budget, i.e. m == B_q): the (N/2)-th-smallest rule --
+#       - If C < N/2 (fewer than half correct): the policy has not yet shown it can
+#         reliably solve the problem at the current budget -> keep B_q unchanged.
+#       - Else (C >= N/2): sort the correct rollouts' hint counts ASCENDING and take
+#         the (N/2)-th smallest value v; set the new budget to v - decrement
+#         (default 1). When the fallback runs, every correct rollout used the full
+#         budget, so v == B_q and this simply squeezes B_q down by one.
 #
-#   The result is clamped to [min_budget, current_budget]: this is the *downward*
-#   ratchet, so it never raises B_q (the upward-on-plateau half of Section 7 is a
-#   separate concern), and never drops below ``min_budget`` (default 0 -> the
-#   problem can ratchet all the way to fully-unaided).
+#   Either way the result is clamped to [min_budget, current_budget]: this is the
+#   *downward* ratchet, so it never raises B_q (the upward-on-plateau half of
+#   Section 7 is a separate concern), and never drops below ``min_budget`` (default
+#   0 -> the problem can ratchet all the way to fully-unaided).
 # ---------------------------------------------------------------------------
 #
 # Usage as a library (trainer side):
@@ -86,9 +93,18 @@ class BudgetUpdate:
     n_total: int
     n_correct: int
     changed: bool
-    # The (N/2)-th-largest correct hint count that drove the decision (or None
-    # when the budget was left unchanged because too few rollouts were correct).
+    # Which rule decided the new budget:
+    #   "min_frugal" -- a correct rollout used < current_budget hints; the budget was
+    #                   snapped to that minimum (the primary, ungated rule).
+    #   "pivot"      -- fallback fired: new = (N/2-th smallest correct count) - decrement.
+    #   "unchanged"  -- no correct rollout, or fewer than N/2 correct at the full budget.
+    rule: str = "unchanged"
+    # The (N/2)-th-SMALLEST correct hint count that drove a "pivot" decision (None
+    # otherwise -- e.g. the fast path, or an unchanged budget).
     pivot_hint_count: Optional[int] = None
+    # Fewest hints any CORRECT rollout used this step (None if none were correct).
+    # Drives the "min_frugal" rule; recorded in every branch for logging.
+    min_correct_hint_count: Optional[int] = None
 
     def as_dict(self) -> dict:
         return {
@@ -97,7 +113,9 @@ class BudgetUpdate:
             "n_total": self.n_total,
             "n_correct": self.n_correct,
             "changed": self.changed,
+            "rule": self.rule,
             "pivot_hint_count": self.pivot_hint_count,
+            "min_correct_hint_count": self.min_correct_hint_count,
         }
 
 
@@ -123,15 +141,46 @@ def compute_downward_budget(
     Returns:
         a ``BudgetUpdate`` carrying the new budget and the decision metadata.
 
-    The rule is the one documented at the top of this file:
-        C < N/2            -> unchanged.
-        C >= N/2           -> new = (N/2-th smallest correct hint count) - decrement,
-                              clamped to [min_budget, current_budget].
+    The rule (documented in full at the top of this file):
+        m = min hints over correct rollouts.
+        m < current_budget   -> new = m            (PRIMARY frugal-success rule;
+                                                    ungated by the correct fraction)
+        otherwise            -> the (N/2)-th-smallest FALLBACK:
+            C < N/2          -> unchanged
+            C >= N/2         -> new = (N/2-th smallest correct hint count) - decrement
+        everything clamped to [min_budget, current_budget].
     """
     n_total = len(results)
     correct_hint_counts = sorted(int(h) for ok, h in results if ok)
     n_correct = len(correct_hint_counts)
+    # Fewest hints any CORRECT rollout used this step (None if none were correct).
+    min_correct = correct_hint_counts[0] if n_correct else None
 
+    def _clamp(b: int) -> int:
+        # strictly-downward ratchet: never above current_budget, never below min_budget.
+        return max(min_budget, min(b, current_budget))
+
+    # PRIMARY (frugal-success) rule: if some correct rollout solved with STRICTLY
+    # FEWER hints than the current budget, snap the budget straight down to that
+    # most-frugal success -- the problem is demonstrably solvable with min_correct
+    # hints, so there is no reason to keep granting more. Ungated by the correct
+    # fraction: a single frugal success is sufficient evidence (aggressive by
+    # design). Pre-empts the (N/2)-th-smallest fallback below.
+    if min_correct is not None and min_correct < current_budget:
+        new_budget = _clamp(min_correct)
+        return BudgetUpdate(
+            old_budget=current_budget,
+            new_budget=new_budget,
+            n_total=n_total,
+            n_correct=n_correct,
+            changed=(new_budget != current_budget),
+            rule="min_frugal",
+            pivot_hint_count=None,
+            min_correct_hint_count=min_correct,
+        )
+
+    # FALLBACK (the prior mechanism): reached only when no rollout was correct, or
+    # every correct rollout used the FULL budget (min_correct == current_budget).
     # Gate: change the budget only once at least half the rollouts are correct.
     # "C < N/2" with integer math is "2*C < N".
     if n_total == 0 or 2 * n_correct < n_total:
@@ -141,16 +190,16 @@ def compute_downward_budget(
             n_total=n_total,
             n_correct=n_correct,
             changed=False,
+            rule="unchanged",
             pivot_hint_count=None,
+            min_correct_hint_count=min_correct,
         )
 
     # The (N/2)-th smallest correct hint count. 1-based rank N//2 -> 0-based index
     # N//2 - 1. n_correct >= N/2 guarantees the index is in range.
     rank = max(1, n_total // 2)
     pivot = correct_hint_counts[rank - 1]
-
-    new_budget = pivot - decrement
-    new_budget = max(min_budget, min(new_budget, current_budget))
+    new_budget = _clamp(pivot - decrement)
 
     return BudgetUpdate(
         old_budget=current_budget,
@@ -158,7 +207,9 @@ def compute_downward_budget(
         n_total=n_total,
         n_correct=n_correct,
         changed=(new_budget != current_budget),
+        rule="pivot",
         pivot_hint_count=pivot,
+        min_correct_hint_count=min_correct,
     )
 
 
@@ -285,41 +336,71 @@ def _selftest() -> None:
         print(f"  [{'ok' if ok else 'FAIL'}] {name}: got={got} want={want}")
         assert ok, name
 
-    # N=8, fewer than half correct -> unchanged.
-    r = compute_downward_budget(5, [(True, 1), (True, 2), (True, 3), (False, 5)] + [(False, 5)] * 4)
-    chk("too-few-correct keeps budget", r.new_budget, 5)
-    chk("too-few-correct not changed", r.changed, False)
+    # ---- PRIMARY (frugal-success) rule: m < current_budget -> new = m --------
+    # Ungated by the correct fraction: 3/8 correct, min correct count 1 -> snap to 1.
+    r = compute_downward_budget(5, [(True, 1), (True, 2), (True, 3)] + [(False, 5)] * 5)
+    chk("frugal: rule", r.rule, "min_frugal")
+    chk("frugal: new budget = min correct", r.new_budget, 1)
+    chk("frugal: min_correct recorded", r.min_correct_hint_count, 1)
+    chk("frugal: no pivot", r.pivot_hint_count, None)
+    chk("frugal: changed", r.changed, True)
 
-    # N=8, 6 correct with counts [1,2,2,3,4,5]; N/2=4 -> 4th smallest = 3;
-    # new = 3 - 1 = 2.
+    # A SINGLE frugal success (1/8 correct) is enough to ratchet down.
+    r = compute_downward_budget(5, [(True, 2)] + [(False, 7)] * 7)
+    chk("frugal: single success ratchets", r.new_budget, 2)
+    chk("frugal: single success rule", r.rule, "min_frugal")
+
+    # Frugal rule PRE-EMPTS the (N/2)-th-smallest pivot (min 1 beats old pivot 3->2).
     r = compute_downward_budget(
-        5,
-        [(True, 1), (True, 2), (True, 2), (True, 3), (True, 4), (True, 5), (False, 5), (False, 5)],
+        5, [(True, 1), (True, 2), (True, 2), (True, 3), (True, 4), (True, 5), (False, 5), (False, 5)]
     )
-    chk("half-correct pivot", r.pivot_hint_count, 3)
-    chk("half-correct new budget", r.new_budget, 2)
+    chk("frugal: pre-empts pivot", r.new_budget, 1)
+    chk("frugal: pre-empts pivot rule", r.rule, "min_frugal")
 
-    # never increases above current.
+    # Frugal result still clamps to min_budget.
+    r = compute_downward_budget(5, [(True, 1)] * 8, min_budget=3)
+    chk("frugal: floored at min_budget", r.new_budget, 3)
+    r = compute_downward_budget(5, [(True, 0)] * 8, min_budget=0)
+    chk("frugal: to zero (unaided)", r.new_budget, 0)
+
+    # ---- FALLBACK ((N/2)-th-smallest): only when m == current_budget ---------
+    # Every correct rollout used the FULL budget (min == 5): pivot squeeze, C >= N/2.
+    r = compute_downward_budget(5, [(True, 5)] * 6 + [(False, 5)] * 2)
+    chk("fallback: rule", r.rule, "pivot")
+    chk("fallback: pivot count", r.pivot_hint_count, 5)
+    chk("fallback: squeeze by decrement", r.new_budget, 4)
+
+    # m == budget but fewer than half correct -> unchanged.
+    r = compute_downward_budget(5, [(True, 5)] * 2 + [(False, 5)] * 6)
+    chk("fallback: too-few-correct keeps budget", r.new_budget, 5)
+    chk("fallback: too-few-correct unchanged", r.changed, False)
+    chk("fallback: too-few-correct rule", r.rule, "unchanged")
+
+    # no correct rollout at all -> unchanged, min_correct = None.
+    r = compute_downward_budget(5, [(False, 2)] * 8)
+    chk("no-correct keeps budget", r.new_budget, 5)
+    chk("no-correct min_correct None", r.min_correct_hint_count, None)
+    chk("no-correct rule", r.rule, "unchanged")
+
+    # ---- clamp / monotonicity -------------------------------------------------
+    # Counts exceeding the budget (shouldn't happen; defensive): min 8 is NOT < 1,
+    # so the fallback runs and clamps the squeeze down to current_budget (1).
     r = compute_downward_budget(1, [(True, 8)] * 8)
     chk("monotone-down clamp", r.new_budget, 1)
 
-    # floors at min_budget.
-    r = compute_downward_budget(5, [(True, 0)] * 8, min_budget=0)
-    chk("min_budget floor", r.new_budget, 0)
-
-    # all correct, all used 3 hints, N=16 -> 8th largest = 3 -> new = 2.
+    # all correct, all used 3 hints < budget 4 -> frugal -> new = 3.
     r = compute_downward_budget(4, [(True, 3)] * 16)
-    chk("uniform-3 new budget", r.new_budget, 2)
+    chk("uniform-3 frugal", r.new_budget, 3)
 
-    # manager round-trip + persistence.
+    # ---- manager round-trip + persistence ------------------------------------
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "budget_state.json")
         bm = BudgetManager(p, default_budget=8)
-        bm.update_group("probA", [(True, 3)] * 16)  # 8th largest 3 -> 2
-        chk("manager stored", bm.get("probA"), 2)
+        bm.update_group("probA", [(True, 3)] * 16)  # min 3 < 8 -> frugal -> 3
+        chk("manager stored", bm.get("probA"), 3)
         bm.save()
         bm2 = BudgetManager(p, default_budget=8)
-        chk("manager reloaded", bm2.get("probA"), 2)
+        chk("manager reloaded", bm2.get("probA"), 3)
         chk("manager unseen default", bm2.get("probB"), 8)
 
     print("all budget_manager self-tests passed.")

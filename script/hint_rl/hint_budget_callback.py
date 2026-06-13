@@ -167,6 +167,22 @@ def hprl_update_budgets(
         pens = [float(_to_py(shape_pen_arr[i]) or 0.0) for i in range(n)]
         shape_metrics["hprl/hint_shape_penalty_mean"] = float(sum(pens) / n) if n else 0.0
 
+    # Effective anti-suppression bonus actually paid out, averaged over rollouts that
+    # applied a hint. The bonus is effort-gated (max(0, hint_call_reward - shape_penalty)),
+    # so this DROPS toward 0 as front-loading rises -- the direct readout of whether the
+    # gate is clawing the bonus back from shallow hinted failures. Diluted by correct-
+    # hinted rollouts (bonus is incorrect-only -> they contribute 0); best-effort.
+    bonus_arr = ntb.get("hint_call_bonus")
+    if bonus_arr is not None:
+        bonuses = [float(_to_py(bonus_arr[i]) or 0.0) for i in range(n)]
+        hinted_bonus = [
+            b for i, b in enumerate(bonuses)
+            if int(round(float(_to_py(num_hints[i])))) > 0
+        ]
+        shape_metrics["hprl/hint_call_bonus_mean_hinted"] = (
+            float(sum(hinted_bonus) / len(hinted_bonus)) if hinted_bonus else 0.0
+        )
+
     metrics = {
         "hprl/n_problems": float(n_problems),
         "hprl/budget_mean": float(sum(new_budgets) / n_problems),
@@ -198,6 +214,59 @@ def hprl_update_budgets(
     metrics["hprl/hint_calls_applied"] = float(applied_total)
     metrics["hprl/hint_calls_failed"] = float(failed_total)
     metrics["hprl/hint_call_failed_frac"] = float(failed_total / call_total) if call_total else 0.0
+    # -------- protocol-violation rate: over-budget hint calls ---------------
+    # Fraction of rollouts that emitted <hint_call/> after their budget was spent
+    # and were floored to budget_exceeded_reward (acc=0, answer ungraded). A rising
+    # value means the policy is still calling for help it cannot have.
+    be_arr = ntb.get("hint_budget_exceeded")
+    if be_arr is not None:
+        be_total = sum(int(round(float(_to_py(be_arr[i]) or 0))) for i in range(len(be_arr)))
+        metrics["hprl/hint_budget_exceeded"] = float(be_total)
+        metrics["hprl/hint_budget_exceeded_frac"] = float(be_total / n) if n else 0.0
+
+    # -------- selector latency (the RELIABLE timer; verl-native one is dropped) ----
+    # Per-rollout selector time + call count come through extra_fields -> reward ->
+    # ntb (the verl timing_s/agent_loop/hint_select/* is a flat 0.0 because
+    # AgentLoopMetrics has no field for it). We report: total wall-equivalent selector
+    # seconds this step, mean per rollout, mean per ACTUAL call, and the worst rollout.
+    time_arr = ntb.get("hint_select_time")
+    calls_arr = ntb.get("hint_select_calls")
+    if time_arr is not None:
+        times = [float(_to_py(time_arr[i]) or 0.0) for i in range(len(time_arr))]
+        calls = (
+            [int(round(float(_to_py(calls_arr[i]) or 0))) for i in range(len(calls_arr))]
+            if calls_arr is not None
+            else [0] * len(times)
+        )
+        total_calls = sum(calls)
+        metrics["hprl/hint_select_time_sum"] = float(sum(times))
+        metrics["hprl/hint_select_time_mean"] = float(sum(times) / len(times)) if times else 0.0
+        metrics["hprl/hint_select_time_max"] = float(max(times)) if times else 0.0
+        # mean latency per individual selector call -- the round-trip cost, undiluted
+        # by hint-free rollouts (which contribute 0 time and 0 calls).
+        metrics["hprl/hint_select_time_per_call"] = float(sum(times) / total_calls) if total_calls else 0.0
+
+    # -------- box-then-call rate: did the hint-calling turn already box an answer? --
+    # Per CALL: of all hint calls, the fraction emitted by a turn that already had a
+    # \boxed{} (the front-loading / box-then-call pattern). Per ROLLOUT: the fraction
+    # of rollouts (all, and of hint-USING ones) that did this at least once.
+    tot_arr = ntb.get("hint_calls_total")
+    box_arr = ntb.get("hint_calls_with_box")
+    if tot_arr is not None and box_arr is not None:
+        totals = [int(round(float(_to_py(tot_arr[i]) or 0))) for i in range(len(tot_arr))]
+        boxes = [int(round(float(_to_py(box_arr[i]) or 0))) for i in range(len(box_arr))]
+        sum_calls = sum(totals)
+        sum_box = sum(boxes)
+        n_hinting = sum(1 for t in totals if t > 0)
+        n_box_roll = sum(1 for b in boxes if b > 0)
+        # per HINT CALL
+        metrics["hprl/hint_call_with_box_frac"] = float(sum_box / sum_calls) if sum_calls else 0.0
+        # per ROLLOUT (over all rollouts, and over hint-using rollouts)
+        metrics["hprl/hint_call_with_box_rollout_frac"] = float(n_box_roll / n) if n else 0.0
+        metrics["hprl/hint_call_with_box_frac_of_hinting"] = (
+            float(n_box_roll / n_hinting) if n_hinting else 0.0
+        )
+
     if failed_total and applied_total == 0:
         logger.warning(
             "[HPRL step=%s] SELECTOR OUTAGE: %d hint call(s) ALL failed (0 applied) -- "
