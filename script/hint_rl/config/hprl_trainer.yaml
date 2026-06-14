@@ -51,3 +51,32 @@ data:
     #                   record + exclude the WHOLE step next call; charge the step
     #                   penalty directly (hint_penalty.applied_step_penalty).
     strategy: hint
+
+    # ---- k-pack counterfactual-probe ratchet ("double-rollout" / k-pack) ----------
+    # Measure (don't infer) whether one fewer hint would still solve a problem: split
+    # EVERY problem's rollout.n rollouts into k packs of rollout.n/k, each FORCED to a
+    # different budget B, B-1, ..., B-k+1. Each pack is its own GRPO group; the ratchet
+    # pools their correct rollouts and snaps B down to the smallest B' with
+    # >= require_successes correct rollouts at <= B' hints
+    # (budget_manager.compute_kpack_budget). Reads true need directly, sidestepping the
+    # corrupted "model always spends its budget" signal.
+    #
+    # The per-step rollout TOTAL is unchanged (== train_batch_size * rollout.n): the
+    # trainer expands the batch x k AND divides the repeat factor rollout.n by k, so each
+    # problem still yields rollout.n rollouts -- just split into k packs of rollout.n/k.
+    # REQUIRES rollout.n divisible by k (the trainer raises otherwise). With enable=false
+    # this is a pure no-op and the single-pack downward ratchet runs exactly as before.
+    kpack:
+      enable: false
+      # packs per problem: budgets B, B-1, ..., B-k+1 (k=2 == the original double-rollout).
+      # rollout.n MUST be divisible by k; each pack gets rollout.n/k rollouts (keep >= 2 so
+      # GRPO has within-group variance).
+      k: 2
+      # corroborating frugal successes required to ratchet (the >=2 guard against a lone
+      # answer-leak/fluke solve driving the budget down). 1 == aggressive single-success.
+      require_successes: 2
+      # scale ppo_mini_batch_size by k so the PPO mini-batch SAMPLE count
+      # (ppo_mini_batch_size * rollout.n) is identical to a non-k-pack run -- the update is
+      # byte-for-byte unchanged, only the GRPO grouping/budget split differs. false keeps
+      # ppo_mini_batch_size as-is (smaller, more-numerous mini-batches).
+      scale_mini_batch: true

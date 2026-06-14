@@ -115,6 +115,42 @@ def render_user(user_base: str, budget: int) -> str:
     return base + "\n\n" + render_remaining_calls(max(int(budget), 0))
 
 
+def rerender_messages_for_budget(
+    messages: list,
+    base_system: str | None,
+    user_base: str | None,
+    budget: int,
+) -> list:
+    """Return a NEW message list re-rendered to advertise ``budget``.
+
+    The single source of truth for re-rendering a prompt at a (ratcheted or probed)
+    budget. Both the dynamic-budget dataset (HintBudgetDataset.__getitem__) and the
+    k-pack probe expansion (HPRLRayPPOTrainer._hprl_expand_kpacks) call this so a probe
+    pack at ``B-j`` is byte-identical to what the dataset would have rendered at ``B-j``.
+
+    Rewrites (a shallow-copied list -- the caller's list is left untouched):
+      * the leading system turn -> ``render_system(base_system, budget)`` (inserted if
+        the prompt has no system turn), and
+      * the LAST user turn -> ``render_user(user_base, budget)`` (only when ``user_base``
+        is provided; mirrors prepare_hint_data, which stores the budget-free user text).
+
+    ``base_system`` / ``user_base`` are the budget-free bases baked by prepare_hint_data
+    into ``extra_info.hprl_system_base`` / ``extra_info.hprl_user_base``.
+    """
+    out = [dict(m) for m in (messages or [])]
+    new_system = {"role": "system", "content": render_system(base_system, budget)}
+    if out and out[0].get("role") == "system":
+        out[0] = new_system
+    else:
+        out.insert(0, new_system)
+    if user_base is not None:
+        for j in range(len(out) - 1, -1, -1):
+            if out[j].get("role") == "user":
+                out[j] = {"role": "user", "content": render_user(user_base, budget)}
+                break
+    return out
+
+
 def render_remaining_calls(remaining: int) -> str:
     """Render the one-sentence "N hint calls left" notice appended to a delivered hint.
 

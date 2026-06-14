@@ -70,6 +70,7 @@ def hprl_update_budgets(
     *,
     global_step: Optional[int] = None,
     tool_name: str = "request_hint",
+    kpack_cfg: Optional[dict] = None,
 ) -> dict[str, float]:
     """Run the per-problem downward ratchet for one training step.
 
@@ -79,6 +80,12 @@ def hprl_update_budgets(
         budget_mgr: the driver-side BudgetManager (its JSON is what the dataset
             reads). Updated in place and saved.
         global_step: current step, for logging only.
+        kpack_cfg: the ``data.hprl.kpack`` knobs. When ``kpack.enable`` is set, a
+            problem whose rollouts this step span MORE THAN ONE budget level (it was
+            probed -- see HPRLRayPPOTrainer._hprl_expand_kpacks) is ratcheted by the
+            pooled k-pack rule (budget_manager.compute_kpack_budget) instead of the
+            single-pack downward rule. Every problem's pooled outcome is recorded as
+            last-step stats for the NEXT step's probe gate regardless.
 
     Returns:
         dict of scalar ``hprl/*`` metrics (empty if the batch lacks the keys).
@@ -89,14 +96,19 @@ def hprl_update_budgets(
             logger.warning("hprl_update_budgets: batch missing non_tensor key %r; skipping ratchet", key)
             return {}
 
+    kpack_cfg = kpack_cfg or {}
+    kpack_enable = bool(kpack_cfg.get("enable", False))
+
     extra = ntb["extra_info"]
     acc = ntb["acc"]
     num_hints = ntb["num_hints"]
     n = len(acc)
 
-    # group rollouts by problem_id
+    # group rollouts by problem_id, POOLING across all of a problem's packs. Track the
+    # set of distinct budget levels each problem ran under: >1 level == it was probed
+    # this step (the k-pack rule applies); 1 level == an ordinary single-pack group.
     groups: dict[str, list[tuple[bool, int]]] = defaultdict(list)
-    gen_budget: dict[str, int] = {}
+    pack_budgets: dict[str, set[int]] = defaultdict(set)
     for i in range(n):
         ei = _to_py(extra[i]) or {}
         pid = ei.get("problem_id")
@@ -106,20 +118,36 @@ def hprl_update_budgets(
         correct = float(_to_py(acc[i])) >= 0.5
         hcnt = int(round(float(_to_py(num_hints[i]))))
         groups[pid].append((correct, hcnt))
-        if pid not in gen_budget:
-            gen_budget[pid] = _gen_budget_from_extra(ei, budget_mgr.default_budget, tool_name)
+        pack_budgets[pid].add(_gen_budget_from_extra(ei, budget_mgr.default_budget, tool_name))
 
     if not groups:
         logger.warning("hprl_update_budgets: no problem_id found in batch; skipping ratchet")
         return {}
 
-    # fold each group through the downward rule
+    # fold each problem's pooled packs through the right rule.
     updates = []
+    n_probed = 0
+    n_probed_ratcheted = 0
+    probed_delta_sum = 0
     for pid, results in groups.items():
-        # monotone-down guard: never ratchet up from an already-lower stored B_q,
-        # even if this batch ran under a (stale, higher) budget.
-        cur = min(gen_budget[pid], budget_mgr.get(pid, gen_budget[pid]))
-        upd = budget_mgr.update_group(pid, results, current_budget=cur)
+        budgets = pack_budgets[pid]
+        num_packs = len(budgets)
+        # current budget == the ceiling the ratchet lowers from == MAX over the packs
+        # (pack 0's budget B; the forced probe packs ran below it). Monotone-down guard:
+        # never ratchet up from an already-lower stored B_q.
+        ceiling = max(budgets) if budgets else budget_mgr.default_budget
+        cur = min(ceiling, budget_mgr.get(pid, ceiling))
+        # >1 distinct budget == this problem was split into probe packs this step -> use the
+        # pooled k-pack rule; otherwise (all packs at the same budget, e.g. B already at the
+        # floor) fall back to the single-pack downward rule.
+        if kpack_enable and num_packs > 1:
+            upd = budget_mgr.update_group_kpack(pid, results, current_budget=cur, num_packs=num_packs)
+            n_probed += 1
+            if upd.changed:
+                n_probed_ratcheted += 1
+            probed_delta_sum += upd.old_budget - upd.new_budget
+        else:
+            upd = budget_mgr.update_group(pid, results, current_budget=cur)
         updates.append(upd)
 
     budget_mgr.save()
@@ -197,6 +225,16 @@ def hprl_update_budgets(
         "hprl/num_active_learning": float(n_active),
         **shape_metrics,
     }
+
+    # -------- k-pack probe ratchet: how many probed problems actually moved -------
+    # n_probed = problems whose rollouts spanned >1 budget this step (the k-pack rule
+    # ran). num_kpack_ratcheted / mean delta show whether the counterfactual probe is
+    # finding real frontier (budget descends) vs holding (<2 corroborating successes).
+    if kpack_enable:
+        metrics["hprl/kpack_num_probed"] = float(n_probed)
+        metrics["hprl/kpack_num_ratcheted"] = float(n_probed_ratcheted)
+        metrics["hprl/kpack_ratcheted_frac"] = float(n_probed_ratcheted / n_probed) if n_probed else 0.0
+        metrics["hprl/kpack_budget_delta_mean"] = float(probed_delta_sum / n_probed) if n_probed else 0.0
 
     # -------- selector health: applied vs failed hint calls -----------------
     # Total hints actually applied this step vs total hint calls that hit the

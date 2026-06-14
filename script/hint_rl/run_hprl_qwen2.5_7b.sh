@@ -106,7 +106,7 @@ NNODES=${NNODES:-4}
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 
 train_prompt_bsz=128
-n_resp_per_prompt=16
+n_resp_per_prompt=32
 train_prompt_mini_bsz=32
 
 # Ray
@@ -148,7 +148,7 @@ REWARD_MGR_CLASS=${REWARD_MGR_CLASS:-"HintRewardManager"}
 # WITHOUT regenerating the dataset: total penalty across all hints of a problem,
 # the per-difficulty-level multiplier (harder = HARD_FACTOR x), and the difficulty
 # assigned to the X.0 guidance hint.
-HINT_PENALTY_TOTAL=${HINT_PENALTY_TOTAL:-1.8}
+HINT_PENALTY_TOTAL=${HINT_PENALTY_TOTAL:-0.8}
 HINT_PENALTY_HARD_FACTOR=${HINT_PENALTY_HARD_FACTOR:-1.5}
 HINT_GUIDANCE_DIFFICULTY=${HINT_GUIDANCE_DIFFICULTY:-moderate}
 
@@ -161,7 +161,7 @@ HINT_GUIDANCE_DIFFICULTY=${HINT_GUIDANCE_DIFFICULTY:-moderate}
 # own mean turn length) is penalized; one emitted after a real struggle is ~free.
 # Subtracted from the CORRECT reward only (incorrect stays at -1). 0 disables it.
 # Start small (~0.3) and watch rollouts for filler-padding before raising.
-HINT_SHAPE_COEFF=${HINT_SHAPE_COEFF:-0.3}
+HINT_SHAPE_COEFF=${HINT_SHAPE_COEFF:-0.15}
 
 # ---- hint-call reward (anti-suppression bonus) ----------------------------
 # One-off bonus ADDED to the INCORRECT reward when a failing rollout RECEIVED a
@@ -173,7 +173,7 @@ HINT_SHAPE_COEFF=${HINT_SHAPE_COEFF:-0.3}
 # correct out-ranks hinted-correct -> the policy stops calling hints) by keeping a
 # positive gradient on hint use among the rollouts that fail anyway. 0 disables it.
 # (hint_reward.compute_score reward_kwargs.hint_call_reward.)
-HINT_CALL_REWARD=${HINT_CALL_REWARD:-0.1}
+HINT_CALL_REWARD=${HINT_CALL_REWARD:-0.05}
 
 # ---- hint-selection + penalty strategy ------------------------------------
 # Selects HOW a hint call is answered and penalized. The same value is given to
@@ -209,6 +209,19 @@ BUDGET_STATE_PATH=${BUDGET_STATE_PATH:-"${EXP_LOG_DIR}/budget_state.json"}
 HPRL_MIN_BUDGET=${HPRL_MIN_BUDGET:-0}
 HPRL_DECREMENT=${HPRL_DECREMENT:-1}
 HPRL_DEFAULT_BUDGET=${HPRL_DEFAULT_BUDGET:-${max_turns}}
+
+# k-pack counterfactual-probe ratchet ("double-rollout" / k-pack). OFF by default ->
+# the single-pack downward ratchet runs unchanged. When on, EVERY problem's rollout.n
+# rollouts are split into k packs of rollout.n/k, each forced to a different budget
+# B,B-1,..,B-k+1 (each its own GRPO group); the ratchet pools their successes and snaps
+# B to the smallest B' with >= require_successes correct rollouts at <= B' hints. The
+# per-step rollout TOTAL is unchanged (rollout.n is divided by k internally). REQUIRES
+# rollout.n divisible by k. See config/hprl_trainer.yaml.
+HPRL_KPACK_ENABLE=${HPRL_KPACK_ENABLE:-true}
+HPRL_KPACK_K=${HPRL_KPACK_K:-2}
+HPRL_KPACK_REQUIRE_SUCCESSES=${HPRL_KPACK_REQUIRE_SUCCESSES:-2}
+# scale ppo_mini_batch_size by k so the PPO mini-batch sample count is unchanged.
+HPRL_KPACK_SCALE_MINI_BATCH=${HPRL_KPACK_SCALE_MINI_BATCH:-true}
 
 # Archive a verbatim snapshot of the WHOLE hint_rl script folder alongside the
 # run's logs -- not just this launcher, but every HPRL source it pulls in (agent
@@ -307,6 +320,10 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     data.hprl.decrement=${HPRL_DECREMENT} \
     data.hprl.default_budget=${HPRL_DEFAULT_BUDGET} \
     data.hprl.strategy=${HINT_STRATEGY} \
+    data.hprl.kpack.enable=${HPRL_KPACK_ENABLE} \
+    data.hprl.kpack.k=${HPRL_KPACK_K} \
+    data.hprl.kpack.require_successes=${HPRL_KPACK_REQUIRE_SUCCESSES} \
+    data.hprl.kpack.scale_mini_batch=${HPRL_KPACK_SCALE_MINI_BATCH} \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
@@ -375,8 +392,8 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     reward_model.reward_loop_class_name="${REWARD_MGR_CLASS}" \
     custom_reward_function.path="${REWARD_FN_PATH}" \
     custom_reward_function.name="${REWARD_FN_NAME}" \
-    +custom_reward_function.reward_kwargs.correct_reward=1.0 \
-    +custom_reward_function.reward_kwargs.incorrect_reward=-1.0 \
+    +custom_reward_function.reward_kwargs.correct_reward=0.9 \
+    +custom_reward_function.reward_kwargs.incorrect_reward=0.0 \
     +custom_reward_function.reward_kwargs.format_reward=0.1 \
     +custom_reward_function.reward_kwargs.hint_call_reward=${HINT_CALL_REWARD} \
     +custom_reward_function.reward_kwargs.hint_penalty_total=${HINT_PENALTY_TOTAL} \

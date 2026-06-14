@@ -22,11 +22,12 @@ custom dataset, and a `RayPPOTrainer` subclass — with **no edits to verl core*
 | `hint_reward.py` | `compute_score`: outcome correctness (mathruler) **minus** the summed hint penalty (`R = R_acc − Σ wₖ`, penalty applied only when correct). Penalty knobs arrive as tunable `reward_kwargs`. |
 | `hint_penalty.py` | Pure (verl-free) importance weights `wₖ` from the difficulty-annotated pool: `total_penalty` split across steps then hints by `hard_factor**difficulty_level`. Per-hint (`compute_hint_penalties` / `applied_penalty`) for the `hint` strategy, per-step (`compute_step_penalties` / `applied_step_penalty`) for `major_step`. |
 | `hint_reward_manager.py` | `HintRewardManager`: merges the per-rollout `applied_hints` state into `extra_info` so the reward function sees it. |
-| `hint_prompt.py` | Shared system-prompt renderer (`render_system`, `TOOL_INSTRUCTION`) used by both the data prep and the dynamic-budget dataset so the budget sentence is identical. |
-| `budget_manager.py` | Pure downward-ratchet rule (`compute_downward_budget`) + JSON-backed per-problem budget store (`BudgetManager`). verl-free; unit-tested via `--selftest`. |
+| `hint_prompt.py` | Shared prompt renderer (`render_system`, `render_user`, `rerender_messages_for_budget`, `TOOL_INSTRUCTION`) used by the data prep, the dynamic-budget dataset, AND the k-pack probe expansion so the budget sentence is byte-identical at any budget. |
+| `budget_manager.py` | Pure ratchet logic (`compute_downward_budget` single-pack rule, `compute_kpack_budget` pooled k-pack rule, `get/set_create_budget`) + JSON-backed per-problem budget store (`BudgetManager`). verl-free; unit-tested via `--selftest`. |
 | `hint_dataset.py` | `HintBudgetDataset(RLHFDataset)` — **injection side** of the ratchet: reads each problem's current `B_q` from the budget-state JSON and re-renders the prompt + `tools_kwargs` budget. No-op unless `data.hprl.enable`. |
-| `hint_budget_callback.py` | `hprl_update_budgets` — **update side**: groups a step's rollouts by `problem_id`, applies the downward rule, persists the new budgets. |
-| `hprl_ray_trainer.py` | `HPRLRayPPOTrainer(RayPPOTrainer)` — flag-gated override of `_update_actor` that runs the ratchet each step. Identical to base when the flag is off. |
+| `hint_budget_callback.py` | `hprl_update_budgets` — **update side**: pools a step's rollouts by `problem_id`, applies the single-pack downward rule (or the k-pack rule for problems split across >1 budget), persists the new budgets. |
+| `kpack_expand.py` | Verl-free `render_variant_rows`: turns `select_idxs`'d rows into budget packs (deep-copy → re-render prompt + tool budget at the pack budget, fresh `uid` + unique index; source rows untouched). Unit-tested via `test_kpack_expansion.py`. |
+| `hprl_ray_trainer.py` | `HPRLRayPPOTrainer(RayPPOTrainer)` — flag-gated overrides: `_update_actor` runs the ratchet each step; `fit` → `_hprl_apply_kpack_split_config` divides the repeat factor by `k`; `_get_gen_batch` → `_hprl_expand_kpacks` splits each problem into `k` budget packs (train-only). Identical to base when the flags are off. |
 | `main_hprl.py` / `config/hprl_trainer.yaml` | Recipe entry: stock `TaskRunner`/`run_ppo` with the trainer swapped for `HPRLRayPPOTrainer`; config = `ppo_trainer` + the `data.hprl` knobs. |
 | `run_hprl_qwen2.5_7b.sh` | Launch script (multi-turn GRPO + dynamic budget, derived from `script/run_grpo_qwen2.5_7b_npu.sh`). |
 | `launch_hprl_cluster.sh` | 5-node cluster entrypoint (run on every pod): the selector node serves `gpt-oss-20b` via vLLM (DP=8); the other 4 nodes run `ray_cluster_launch.sh` → `run_hprl`. |
@@ -150,6 +151,34 @@ correct box earns nothing if the rollout ended on an illegal call. (The former
 
 All verl integration is via overrides (custom dataset class + trainer subclass +
 recipe entry) — **no edits to verl core**.
+
+### k-pack counterfactual probe (`data.hprl.kpack.*`, default off)
+
+The plain ratchet *infers* whether one fewer hint would work — but the policy
+spends whatever budget it is granted, so that signal is corrupted (budgets freeze).
+The k-pack probe **measures** it instead: it **splits every problem's `rollout.n`
+rollouts into `k` packs of `rollout.n/k`**, each **forced** to a different budget
+`B, B−1, … B−k+1`. Each pack is its own GRPO group (a fresh `uid`); the ratchet
+(`budget_manager.compute_kpack_budget`) pools their correct rollouts and snaps `B`
+down to the smallest `B′` with `≥ require_successes` correct rollouts at `≤ B′` hints
+(the `require_successes`-th smallest pooled correct hint count — default 2, the guard
+against a lone leak/fluke). A forced solve at a low budget is genuine evidence, not a
+greedy-policy artifact.
+
+The **per-step rollout total is unchanged** (`= train_batch_size × rollout.n`): the
+trainer expands the batch ×`k` rows (`_get_gen_batch` → `_hprl_expand_kpacks`,
+`kpack_expand.render_variant_rows`) **and** divides the repeat factor `rollout.n` by
+`k` (`fit` → `_hprl_apply_kpack_split_config`), so each problem still yields
+`rollout.n` rollouts. It **requires `rollout.n` divisible by `k`** (the trainer raises
+otherwise) and scales `ppo_mini_batch_size` ×`k` (default) so the PPO mini-batch is
+byte-identical to a non-k-pack run — only the GRPO grouping/budget split differs. This
+sidesteps the no-auto-pad train-path constraint above (the post-repeat row count stays
+`N×k×(n/k) = N×n`). Knobs (env → config): `HPRL_KPACK_ENABLE`
+(`data.hprl.kpack.enable`), `HPRL_KPACK_K` (`…kpack.k`, packs/problem),
+`HPRL_KPACK_REQUIRE_SUCCESSES`, `HPRL_KPACK_SCALE_MINI_BATCH`. `enable=false` → the
+single-pack downward ratchet above runs unchanged. Unit-tested:
+`python budget_manager.py --selftest`, `python test_kpack_expansion.py`, and (real verl)
+`…/envs/verl/bin/python test_kpack_real_verl.py`.
 
 ## Hint-selection strategy (`HINT_STRATEGY`)
 

@@ -5,13 +5,18 @@ and ``run_hint_selection_model.py``) via a sys.path hack. They are vendored here
 that everything the HPRL rollout needs lives inside ``script/hint_rl`` and the package
 has no cross-folder import dependency.
 
-The <output> parser is kept verbatim. The prompt template is the ``v2_final_gate``
-variant (selector/prompt_variants.py): the original offline template plus the
-"Ground rules for crediting progress" and "Guard the final step" sections, which cut
-unearned final-step (answer-bearing) reveals 32.1% -> 9.4% @T=0.7 / 7.0% @T=0.1 on
-replayed failure cases -- see selector/prompt_improvement_progress.md. NOTE: those
-gains assume the selector sees the student's reasoning; they require the
-blind-trace fix in hint_agent_loop (assistant turns appended to agent_data.messages).
+The <output> parser is kept verbatim. The prompt template is the ``v4_cite``
+variant (selector/prompt_variants.py): the v2_final_gate template ("Ground rules for
+crediting progress" + "Guard the final step") plus a "Cite your evidence" section and
+a ``completed_steps`` output field requiring a verbatim student-quote citation for
+each earlier candidate step. This cut unearned final-step (answer-bearing) reveals
+32.1% -> 6.4% @T=0.7 / 4.2% @T=0.1 on replayed failure cases (and to 3.0% / 0.8% with
+the optional citation-enforcement guard in the loop) -- see
+selector/prompt_improvement_progress.md. NOTE: those gains assume the selector sees
+the student's reasoning; they require the blind-trace fix in hint_agent_loop
+(assistant turns appended to agent_data.messages). The ``completed_steps`` field is
+currently ignored by the loop (a drop-in), pending the enforcement guard in
+_record_major_step.
 """
 from __future__ import annotations
 
@@ -65,6 +70,18 @@ Go through the major steps in order and, for each one, **verify whether the stud
 
 The current step is the **earliest step the student has not yet completed correctly**. Note that this may be *earlier* than where the student feels stuck: if the student's work first went wrong at an earlier step, anchor on that step, not on the point they report being stuck. Justify your choice with specific evidence from the trace, including any error you found in the student's earlier work.
 
+### Cite your evidence
+For every candidate step you judge completed, you must QUOTE the student's own
+words that carry out that step: an exact, verbatim excerpt (roughly 10-200
+characters) copied character-for-character from the student's writing in the
+trace. Text inside a `[hint given]` block is the tutor's, not the student's --
+quoting it does not count. Paraphrases do not count. These citations go into
+the `completed_steps` array of your output, one entry per candidate step
+listed BEFORE your selected step. If you cannot produce a verbatim student
+quote for some earlier candidate step, that step is not completed -- select it
+instead. An empty `completed_steps` array means you selected the earliest
+remaining candidate step.
+
 ### Guard the final step
 The last major step typically states the final answer. Selecting it gives the
 answer away, so it is justified **only** when the student's own written work
@@ -94,6 +111,7 @@ Return a single JSON object wrapped in <output> tags. `hint_id` is the id of the
 
 <output>
 {
+  "completed_steps": [{"step_id": <id of a candidate step earlier than your selection>, "quote": <verbatim excerpt from the student's own writing that carries out this step>, "why": <one line: why this excerpt completes the step>}, ...] (one entry for EVERY candidate step listed before your selected step; [] if you selected the earliest),
   "major_step_id": <step_id>,
   "reasoning_of_major_step": <why this is the earliest step not yet completed correctly: cite the trace, and state how you verified whether each prior step was actually done correctly (note any error that makes an earlier step incomplete)>,
   "confidence_of_major_step": <1-5>,

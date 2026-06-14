@@ -29,41 +29,15 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Optional
+from typing import Optional
 
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
-from budget_manager import load_budget_table
-from hint_prompt import DEFAULT_BASE_SYSTEM, render_system, render_user
+from budget_manager import get_create_budget, load_budget_table, set_create_budget
+from hint_prompt import DEFAULT_BASE_SYSTEM, rerender_messages_for_budget
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-
-def _set_create_budget(tools_kwargs: Any, budget: int, tool_name: str = "request_hint") -> None:
-    """Set ``tools_kwargs[tool_name].create_kwargs.budget = budget`` in place.
-
-    No-op if the structure isn't the expected nested dict (defensive: a row may
-    legitimately carry no tools_kwargs).
-    """
-    if not isinstance(tools_kwargs, dict):
-        return
-    tool = tools_kwargs.get(tool_name)
-    if not isinstance(tool, dict):
-        return
-    ck = tool.get("create_kwargs")
-    if isinstance(ck, dict):
-        ck["budget"] = int(budget)
-
-
-def _get_create_budget(tools_kwargs: Any, default: int, tool_name: str = "request_hint") -> int:
-    if isinstance(tools_kwargs, dict):
-        tool = tools_kwargs.get(tool_name)
-        if isinstance(tool, dict):
-            ck = tool.get("create_kwargs")
-            if isinstance(ck, dict) and ck.get("budget") is not None:
-                return int(ck["budget"])
-    return int(default)
 
 
 class HintBudgetDataset(RLHFDataset):
@@ -128,39 +102,29 @@ class HintBudgetDataset(RLHFDataset):
         problem_id = extra_info.get("problem_id")
         tools_kwargs = row.get("tools_kwargs") or {}
 
-        baked = _get_create_budget(tools_kwargs, self.hprl_default_budget, self.hprl_tool_name)
+        baked = get_create_budget(tools_kwargs, self.hprl_default_budget, self.hprl_tool_name)
         budget = self._budget_for(problem_id, baked)
 
-        # 1) re-render the system prompt to advertise the current budget.
+        # 1) re-render the system + trailing user budget reminder for B_q. Shared
+        #    with the k-pack probe expansion (hint_prompt.rerender_messages_for_budget)
+        #    so a probe pack at B-j is byte-identical to a dataset render at B-j.
+        #    hprl_user_base is the budget-free, CoT-stripped user text baked by
+        #    prepare_hint_data; the reminder tracks the ratchet (and vanishes at
+        #    budget 0, when the tool is disabled).
         base_system = extra_info.get("hprl_system_base", DEFAULT_BASE_SYSTEM)
         messages = row.get("raw_prompt")
         if isinstance(messages, list) and messages:
-            new_system = {"role": "system", "content": render_system(base_system, budget)}
-            if messages[0].get("role") == "system":
-                messages[0] = new_system
-            else:
-                messages.insert(0, new_system)
-            # 1b) re-render the user message's trailing budget reminder for B_q.
-            # Mirrors the system re-render: hprl_user_base is the budget-free,
-            # CoT-stripped user text baked by prepare_hint_data; re-append the
-            # current budget so the reminder tracks the ratchet (and vanishes at
-            # budget 0, when the tool is disabled). Last user turn only.
             user_base = extra_info.get("hprl_user_base")
-            if user_base is not None:
-                for j in range(len(messages) - 1, -1, -1):
-                    if messages[j].get("role") == "user":
-                        messages[j] = {"role": "user",
-                                       "content": render_user(user_base, budget)}
-                        break
+            row["raw_prompt"] = rerender_messages_for_budget(messages, base_system, user_base, budget)
         else:
             logger.warning("HintBudgetDataset: row %s has no raw_prompt to re-render", item)
 
         # 2) overwrite the enforced budget (tool) and the extra_info copy (the
         #    "budget these rollouts ran under" that the ratchet reads back).
-        _set_create_budget(tools_kwargs, budget, self.hprl_tool_name)
+        set_create_budget(tools_kwargs, budget, self.hprl_tool_name)
         ei_tools = extra_info.get("tools_kwargs")
         if ei_tools is not tools_kwargs:  # keep the two copies consistent
-            _set_create_budget(ei_tools, budget, self.hprl_tool_name)
+            set_create_budget(ei_tools, budget, self.hprl_tool_name)
 
         row["tools_kwargs"] = tools_kwargs
         row["extra_info"] = extra_info

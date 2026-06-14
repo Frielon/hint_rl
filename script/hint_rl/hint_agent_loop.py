@@ -417,6 +417,9 @@ class HintAgentLoop(ToolAgentLoop):
                         }
                         for m in agent_data.messages
                     ],
+                    # problem + trace + candidate_hints_str are the three inputs to
+                    # selector_prompt(); together they re-render the exact prompt sent.
+                    "problem": problem,
                     "trace": trace,
                     "candidate_hints_str": hints_str,
                     "selection": selection if isinstance(selection, dict) else None,

@@ -9,86 +9,220 @@ entry once it lands.
 
 # TODO / Planned (not yet done)
 
-## Counterfactual-probe budget ratchet ("double-rollout") — set the budget at the true frontier
-
-**Logged:** 2026-06-13 (idea from user, 2026-06-13). **Status:** design only — not implemented.
-
-**Motivation — the ratchet reads a corrupted need-signal, so budgets don't descend.**
-Analysis of the hard set (`data_pipeline/dapo_17k_zero_first_epoch_acc_no_improvement.parquet`)
-across the two v3 hint runs (`…-003103`, `…-171235`) vs the no-hint GRPO baseline
-(`…-20260608-223250`) surfaced three linked facts (numbers + plots in
-`logs/experiment_stats.md`, tools in `logs/plot_tool/`):
-
-1. **The policy calls a hint whenever it has budget.** Voluntary abstention rate (of
-   `hint_budget>0` rollouts, the fraction with `called_hint==0`) starts ~92–94% and
-   **collapses to ~0% by step ~18–20** (`hint_abstention_rate.py`). Calling a hint is
-   not itself bad behavior — but it means the model *fills whatever budget it is granted*.
-2. **So the frugal-success signal is self-corrupted.** Because the model spends up to the
-   budget, "fewest hints any correct rollout used" `m ≈ B_q`: in run 003103 **72.6%** of
-   correct `budget>0` rollouts used the FULL budget, 171235 **50.2%**. When `m == B_q` the
-   PRIMARY frugal rule (`budget_manager.compute_downward_budget`) is **dormant**, and
-   downsizing falls entirely to the FALLBACK, which is **gated at ≥50% correct** — a bar
-   hard problems rarely clear. Net: the budget can't tell *true need* from *granted budget*,
-   and freezes at its initial `K_q`.
-3. **The ratchet is purely downward — a frozen budget stays frozen forever** (no
-   upward-on-plateau half is implemented; see budget_manager.py:44). The unaided-solve
-   coverage curve (`unaided_solved_over_steps.py`) **plateaus at ~step 18–20** — exactly
-   when abstention hits 0 — while the GRPO baseline keeps climbing (227–238 vs 666). Once
-   the policy always calls a hint, it stops practicing/expanding unaided solving.
-
-**The idea (user, 2026-06-13).** Stop *inferring* whether one fewer hint would work — *measure*
-it. Each step, for a problem currently at budget `B`, sample **two packs**:
-- a normal pack at budget `B`, and
-- a **probe pack at budget `B−1`** (the same problem, prompt re-rendered at `B−1`).
-
-If the `B−1` pack produces a correct rollout (or a success using even fewer hints), **downsize**
-the budget — to `B−1`, or straight to the min hint count of any correct probe rollout. The probe
-is a genuine counterfactual: the pack was *forced* to ≤`B−1`, so a solve there is real evidence the
-problem is doable with fewer, not an artifact of a greedy policy.
-
-**Why this is the right fix.**
-- **Clean equilibrium = "the correct level."** The budget settles at the smallest `B` such that the
-  probe at `B−1` *fails* but `B` succeeds — i.e. the frontier where removing one hint breaks the
-  problem. The minimal sufficient budget per problem, with no 50% gate and no corrupted frugal read.
-- **The probe pack is not wasted compute — it IS the frugality curriculum.** Rollouts forced to `B−1`
-  are exactly the slightly-more-frugal trajectories we want the policy to learn from, so we train on
-  them too (not probe-only).
-
-**Design choices to settle before building.**
-- **Gate the probe to control cost.** Doubling rollouts everywhere is expensive and pointless on
-  problems that are all-wrong at `B` (they'll be all-wrong at `B−1` too). Only fire the `B−1` probe
-  for problems that cleared some success bar at `B` (this step / last step) → extra cost is sublinear
-  and focused where the budget can actually move.
-- **GRPO grouping — keep the two packs as SEPARATE groups.** `B` and `B−1` are different conditions
-  (different difficulty); each should be advantage-normalized within itself. verl groups by prompt/uid,
-  so two rendered variants form two groups naturally — just make the ratchet read both.
-- **Robustness of the downsize trigger.** "Any correct at `B−1`" mirrors today's aggressive
-  single-success philosophy but is vulnerable to the answer-leak artifact (see the 2026-06-10 (d)
-  entry / `hprl-answer-leak-major-step`: ~5% of late solves are leak-only). Cheap guards: require ≥2
-  probe successes, exclude leak-only solves, or require probe success-rate ≥ the `B`-pack's. Tunable.
-- **Keep an in-probe frugal rule for multi-level descent.** Probing only `B−1` is a one-step-per-update
-  search. To recover fast multi-level jumps, also snap to "min hints used by a correct rollout *in the
-  `B−1` pack*" — since that pack was forced to ≤`B−1`, a solve using `k<B−1` is genuine, uncorrupted
-  evidence.
-- **Periodic re-probe of stuck problems (non-stationarity).** The policy improves, so a problem that
-  fails the `B−1` probe at step 20 may pass it at step 60; since the ratchet is downward-only, re-probe
-  held-budget problems every `K` steps so late capability keeps pulling budgets down.
-- **(Optional, separate) symmetric upward probe at `B+1`** for problems that go all-wrong at `B`
-  (zero GRPO variance, wasted) — pull them back into the learnable zone. Not bundled with this change.
-
-**Implementation touchpoints (when built).**
-- `hint_dataset.HintBudgetDataset` — emit the `B−1` (probe) prompt variant for gated problems.
-- `hint_budget_callback.py` — collect both groups per problem, pass probe results to the ratchet.
-- `budget_manager.compute_downward_budget` — consume probe success (+ in-probe frugal) instead of the
-  corrupted full-budget frugal signal; retire / demote the 50% gate.
-
-**Status:** design only — not implemented. Analysis scripts that motivate it are in `logs/plot_tool/`
-(`unaided_solved_analysis.py`, `unaided_solved_over_steps.py`, `hint_abstention_rate.py`); stats in
-`logs/experiment_stats.md`.
+- **Citation-enforcement guard** in `hint_agent_loop._record_major_step`: for a pick that skips earlier
+  unrevealed candidates, substring-validate each `completed_steps` quote against the student-only trace
+  (`analyze_citations.classify_quote` / `student_only`) and clamp the pick to the earliest uncited step.
+  Deterministic, no extra model call — turns the `v4_cite` citations (prompt adopted 2026-06-14) into a
+  contract. Drops unearned final-step reveal **6.4%→3.0%** @T0.7 / **4.2%→0.8%** @T0.1. Optional companion:
+  tighten `utils._as_selection_dict` to a selection-shaped-dict check so the degraded-parse fallback can't
+  return a nested `completed_steps` entry as the selection.
 
 ---
 
 # Done log
+
+## 2026-06-14 — `v4_cite` selector prompt adopted; selector dump made self-contained; reward reconfigured (~2× compression) for the next run
+
+**Selector prompt → `v4_cite` (Template E).** Swapped `utils.selector_prompt` from `v2_final_gate` to
+`v4_cite` (the Round-3 winner, devlog 2026-06-11 entry): inserted the **"Cite your evidence"** workflow
+section (a verbatim student-quote citation for every earlier candidate step) and a `completed_steps` array
+at the head of the `<output>` JSON; module docstring updated to match. Rendered template verified
+byte-identical to Template E in `selector/prompt_improvement_progress.md`. **Drop-in**: the extra
+`completed_steps` field is parsed-but-IGNORED by the loop (the guard that would consume it is the TODO
+above). Real-failure-case numbers it buys: unearned final-step reveal **9.4%→6.4%** @T0.7 / **7.0%→4.2%**
+@T0.1 (→3.0%/0.8% once the enforcement guard lands).
+
+**Parser unaffected — verified, no change.** `parse_output` keeps the new key on the happy path
+(json.loads of the whole block) and every consumer reads fields by name, so `completed_steps` is inert
+downstream. `_hard_parse`'s target keys (`major_step_id`/`hint_id`/`hint`/`reasoning_*`/`confidence_*`) are
+**disjoint** from `completed_steps`' keys (`step_id`/`quote`/`why`) → no false matches; scanning the whole
+completion it still recovers the real scalar fields even when the (now leading) `completed_steps` array is
+the malformed part — confirmed by a test forcing the hard path with a raw newline + unescaped quote inside
+a `quote` value (recovered `major_step_id`/`hint_id`/`hint` correctly). `max_tokens=16000` leaves ample
+headroom for the longer output. Noted but NOT applied (rare, ≤~1%, no crash): tighten `_as_selection_dict`
+to a selection-shaped-dict check so the degraded-parse fallback can't latch onto a nested `completed_steps`
+entry.
+
+**Selector dump now self-contained.** Added `"problem"` to `_dump_selector_call`'s record
+(`hint_agent_loop.py`), beside `trace`/`candidate_hints_str` — the three inputs to `selector_prompt()`. A
+dump row now re-renders the EXACT prompt the selector saw
+(`selector_prompt(row["problem"], row["trace"], row["candidate_hints_str"])`), so `v4_cite` citations can
+be audited offline against live calls (`selector_raw`/`selection` carry `completed_steps`; `trace` retains
+the `[hint given]` markers for `analyze_citations.student_only`). Dump stays gated on
+`HPRL_SELECTOR_DUMP_DIR` (on by default → `${EXP_LOG_DIR}/selector_calls`).
+
+**Reward reconfigured for the next run** (`run_hprl_qwen2.5_7b.sh`, vs the `20260612-171235` snapshot) —
+the whole reward compressed ~2× and k-pack flipped on:
+- `correct_reward 1.0→0.9`, `incorrect_reward −1.0→0.0`, `hint_penalty_total 1.8→0.8`,
+  `hint_shape_coeff 0.3→0.15`, `hint_call_reward 0.1→0.05`; `n_resp_per_prompt 16→32`;
+  `HPRL_KPACK_ENABLE=true` (k=2, require_successes=2, scale_mini_batch=true).
+- **Score landscape** (format=0.1): correct/0-hint **1.0**, correct/full-budget **0.20** (= floor),
+  incorrect/+hint 0.15, incorrect/no-hint 0.10, over-budget·malformed 0.0. Group span **2.1→1.0**.
+- **Analysis (under `norm_adv_by_std_in_grpo=False`).** Std-norm is off, so the span compression
+  ≈**halves the advantage/gradient** → gentler updates (plausibly intended after the prior
+  over-call/abstention collapse). `incorrect_reward=0.0` is a no-op *alone* under critic-free GRPO (only
+  within-group spread matters); its effect is purely via the span. Bonus/penalty ratio ≈ preserved
+  (0.056→0.0625); the absolute hint-call pull is halved → mildly *less* over-call pressure. The
+  correct-branch room `= correct+format−floor = 0.80` exactly equals `penalty_total=0.8`, so the penalty
+  sits **exactly at the floor-saturation knee** — any `penalty_total≥0.8` is inert, and the solve-vs-fail
+  margin is now the hardcoded floor `+0.05` (was an un-pinned 0.10 when penalty 1.8 < the old 1.85 knee).
+  `budget_exceeded_reward` (unset) inherits `incorrect_reward` → floor now **0.0** (was −1.0); the
+  0.10-below-a-normal-failure deterrent is preserved in relative terms. `n 16→32` keeps 16 rollouts/pack
+  under k=2 at the cost of **2× rollout generation**; `ppo_mini_batch` auto-scales 32→64.
+
+**Decisions taken (discussed, no change made).**
+- **Keep the floor `+0.05`** (declined shrinking to `+0.03`): at `penalty_total=0.8` it is nearly inert
+  (only un-clamps 0.02 of already-unused room) and it IS the anti-suppression safety margin — wrong lever
+  to trim in a std-off, already-halved-gradient regime. Matched levers instead: `correct_reward` (branch
+  width) for more frugality bite, `hint_call_reward` (incorrect branch) for less over-call.
+- **Keep `norm_adv_by_std_in_grpo=False`.** Std-on rescales every group to unit variance, which promotes
+  the only signal varying in all-wrong groups — the **hint-call bonus** (span ≤0.15) — up to parity with
+  the outcome signal from mixed groups, i.e. it amplifies the exact gradient behind over-calling.
+  Compounding risks here: no `filter_groups` (we run `use_dynamic_bsz`=token batching, NOT DAPO dynamic
+  *sampling*) to drop degenerate groups, and no KL (`kl_coef=0`) to dampen the `std→0` blow-up; it would
+  also nullify the deliberate scale compression. Revisit only if easy/hard prompts are seen contributing
+  ~zero gradient, and only paired with `filter_groups`.
+
+**Follow-ups (not done).** (1) the citation-enforcement guard (see TODO); (2) optional `_as_selection_dict`
+shape guard; (3) stale comment at `run_hprl_qwen2.5_7b.sh` ~L162 ("Subtracted from the CORRECT reward only
+(incorrect stays at -1)") — `incorrect_reward` is now 0.0, comment wrong. Next: a live run with `v4_cite` +
+the reconfigured reward + k-pack.
+
+
+## 2026-06-13 (i) — k-pack redesigned: split each problem's n rollouts into k packs (supersedes (h))
+
+**Why.** The (h) build realized k-pack as cross-problem SUBSTITUTION (probe packs displaced
+already-solved rows; gated by last-step success; capped by `max_probe`). On review the user
+specified a cleaner shape: **keep total rollouts at `train_batch × rollout.n`, probe EVERY
+problem, and split each problem's own `n` rollouts into `k` packs of `n/k`** at budgets
+`B, B−1, … B−k+1`. No gating, no substitution, no dropped problems.
+
+**Mechanics (the crux: verl repeats every prompt row uniformly by `rollout.n` and groups by
+`uid`).** To get `k` groups of `n/k` per problem, the pre-repeat batch must be `N×k` rows and
+the repeat factor `n/k`:
+- `fit()` override → `_hprl_apply_kpack_split_config` (once, before `super().fit()`): validate
+  `rollout.n % k == 0` (**the user's requested check — raises `ValueError` otherwise**), set
+  `rollout.n → n/k`, and scale `actor.ppo_mini_batch_size × k` (default) so the PPO mini-batch
+  SAMPLE count (`ppo_mini_batch_size × rollout.n`, ray_trainer.py:1311) is unchanged — the update
+  is byte-identical, only GRPO grouping/budgets differ. Verified safe: the rollout ENGINE never
+  reads `rollout.n` (agent-loop = one request per repeated row; grep of `verl/workers/rollout` +
+  `agent_loop` is clean), GRPO ignores `num_repeat` (groups by `uid`), and validation uses
+  `val_kwargs.n`.
+- `_get_gen_batch` → `_hprl_expand_kpacks` now GROWS `N → N×k` (every row gains `k−1` variants at
+  `clamp(B−1)…clamp(B−k+1)`); after the `÷k` repeat the post-repeat count is `N×k×(n/k) = N×n`,
+  identical to a non-kpack run, so the no-auto-pad train-path constraint (memory
+  `verl-no-train-path-autopad`) is satisfied without padding. Floor clamp collapses redundant
+  sub-budgets (a problem already at the floor → repeated `min_budget` packs; the callback then sees
+  1 distinct budget → falls back to the single-pack downward rule).
+
+**Removed (the substitution machinery):** `budget_manager.plan_kpack_substitution` + its self-tests,
+`BudgetManager.record_stats/get_stats/_stats` (+ the `stats` JSON key), the callback's `record_stats`
+call, and the `gate_min_correct` / `max_probe_problems` knobs (config + `HPRL_KPACK_*` env). Added the
+`scale_mini_batch` knob (`HPRL_KPACK_SCALE_MINI_BATCH`, default true). **Kept:** `compute_kpack_budget`
+(the pooled `require_successes`-th-smallest rule), `update_group_kpack`, `kpack_expand.render_variant_rows`,
+and the callback's pool-by-`problem_id` + `>1-distinct-budget → k-pack rule` dispatch (`current_budget =
+max` over packs).
+
+**Tests.** `python budget_manager.py --selftest` and `python test_kpack_expansion.py` (now: prompt
+re-render, variant build with source rows untouched, the `N→N×k` split + floor clamp, callback dispatch)
+both green; and `test_kpack_real_verl.py` (verl env python) drives the real `fit`-config split +
+`_get_gen_batch` on a real `DataProto` and asserts the headline invariant — **total rollouts after the
+repeat == `N × the ORIGINAL rollout.n`** (`128` for `N=4, n=32`), plus `rollout.n 32→16`,
+`ppo_mini_batch 32→64`, the `n%k` `ValueError`, every problem spanning `{B,B−1}`, and the no-`uid`
+validation no-op. Launch wiring unchanged (`HPRL_KPACK_*` → `data.hprl.kpack.*` hydra CLI overrides).
+Still pending: a full live cluster TRAINING run with `HPRL_KPACK_ENABLE=true` (needs `rollout.n` a
+multiple of `k`, e.g. 32 & k=2 → packs of 16).
+
+**Follow-up fix (first cluster launch).** The first `HPRL_KPACK_ENABLE=true` launch crashed at step 1
+in verl's `_write_generations` (the OPTIONAL rollout-generation dump, `rollout_data_dir`) with
+`IndexError`: it builds `gts` via `for item in batch`, which integer-indexes until a non_tensor
+column runs out — so any non_tensor key SHORTER than the tensor batch makes `gts` short and the dump
+dies. Training itself is unaffected (GRPO groups by `uid` and the trained tensors are full length —
+both verified `N×n`); only the dump's full-non_tensor scan trips. Offline repro of the k-pack
+expand→repeat→union path is clean (all `N×n`), so the short key is reward/agent-loop/env specific and
+not reproducible offline. Made `_log_rollout_data` self-healing: it logs any length-mismatched
+non_tensor key (names the culprit) and DROPS it just for the dump, then guards the whole dump in
+try/except so it can never crash training. Verified against real verl that a short key makes `for
+item in batch` stop early and that dropping mismatched keys restores full iteration
+(`test_kpack_real_verl.py`). Next launch's log line "rollout dump: non_tensor keys with len != batch
+len" will name the key for a root fix; immediate workaround is to unset `rollout_data_dir`.
+
+
+## 2026-06-13 (h) — k-pack counterfactual-probe budget ratchet (built)
+
+**What.** Implemented the counterfactual-probe ratchet from the TODO, generalized from the
+user's "double-rollout" to a **`k`-pack** probe. For a recently-solved problem at budget `B`,
+the trainer also rolls out probe packs FORCED to `B−1 … B−k+1`; each pack is its own GRPO
+group, and the ratchet pools their correct rollouts to read *true need* directly instead of
+the corrupted "the policy always spends its budget" signal (the motivation analysis in the
+old TODO / `logs/experiment_stats.md`). Flag-gated under `data.hprl.kpack.enable`, **default
+off** → the single-pack downward ratchet runs byte-for-byte as before.
+
+**The rule (k>1, user 2026-06-13).** Gather every correct rollout across all `k` packs; set the
+new budget to the smallest `B'` with `≥ require_successes` correct rollouts at `≤ B'` hints —
+i.e. the `require_successes`-th smallest pooled correct hint count (`require_successes` default
+**2**, the guard against a lone answer-leak/fluke solve; see `hprl-answer-leak-major-step`).
+Downward-only, no upward. `k=1` keeps the existing `compute_downward_budget`. A deep probe that
+solves frugally pulls the budget down multiple levels in one update.
+
+**Key design pivot — length-preserving SUBSTITUTION, not growth.** Background verification found
+this verl build does **not** auto-pad the actor TRAIN path (only the eval path pads): the
+per-step row count must stay divisible by `ppo_mini_batch_size` or the dispatch/`_balance_batch`/
+`make_iterator` asserts crash (recorded in memory `verl-no-train-path-autopad`). So the expansion
+does **not** add rows — it SUBSTITUTES probe packs for an equal number of already-solved,
+not-probed rows (`plan_kpack_substitution`), keeping `len(out) == len(in)`. Every divisibility
+invariant stock verl already satisfies therefore still holds; no padding, no extra memory, same
+step time. (True growth would need `E·n` to be a multiple of `512`, or pad+mask — noted for later.)
+
+**How it threads through verl (no core edits — `verl-changes-flag-gated`).**
+- Each dataloader row already gets a fresh `uuid` → its own GRPO group, *before* the rollout
+  repeat. So `k` budget-variant rows for one problem naturally form `k` groups; the ratchet
+  pools them by `problem_id`. The agent loop re-tokenizes from `raw_prompt` (not the dataset's
+  `input_ids`, which is a throwaway `dummy_tensor` here), so a probe variant is fully defined by
+  re-rendering its messages + `tools_kwargs` budget — no tokenization in the trainer.
+- `HPRLRayPPOTrainer._get_gen_batch` (train-only; guarded on `uid` present, which validation
+  lacks) expands gated problems in place before the uid/ repeat, then defers to super.
+
+**Files.**
+- `budget_manager.py` — `compute_kpack_budget` (the pooled rule), `plan_kpack_substitution` (pure,
+  length-preserving probe/drop planner), `update_group_kpack`, per-problem last-step stats
+  (`record_stats`/`get_stats`) for the probe gate, persisted in the state JSON; shared
+  `get_create_budget`/`set_create_budget` moved here (verl-free); self-tests extended.
+- `hint_prompt.py` — `rerender_messages_for_budget`, the single prompt re-render shared by the
+  dataset and the probe expansion (byte-identical at any budget); `hint_dataset` refactored onto it.
+- `kpack_expand.py` (new, verl-free) — `render_variant_rows`: deep-copies `select_idxs`'d rows
+  (which alias their source) then re-renders prompt + tool budget, stamps a fresh `uid` and a
+  unique negative `index` (keeps the rollout-trace counter from merging packs). Source rows untouched.
+- `hprl_ray_trainer.py` — `_get_gen_batch` override + `_hprl_expand_kpacks` (classify → plan →
+  `select_idxs`/`render_variant_rows`/`concat`); probe summary metrics merged into the step.
+- `hint_budget_callback.py` — pools packs by `problem_id`, detects probed problems (>1 distinct
+  budget) → k-pack rule with `current_budget = max` over packs, records gate stats, `hprl/kpack_*`
+  metrics.
+- `config/hprl_trainer.yaml` + `run_hprl_qwen2.5_7b.sh` — `data.hprl.kpack.{enable,k,
+  require_successes,gate_min_correct,max_probe_problems}` knobs (+ `HPRL_KPACK_*` env).
+
+**Gate / cost.** Only problems with `≥ gate_min_correct` correct rollouts last step are probed
+(probing all-wrong problems is wasted — they're all-wrong at `B−1` too). Drops prefer
+already-solved (gated) rows so hard-problem training is preserved; default `max_probe_problems
+= ⌊train_batch_size/k⌋` keeps substitution always feasible. Because a problem keeps being probed
+as long as its normal pack keeps succeeding, stuck-problem re-probing is largely automatic (the
+explicit periodic re-probe and the symmetric `B+1` upward probe from the TODO are NOT built).
+
+**Tests.** Three suites green: `python budget_manager.py --selftest` (rule + planner length-
+preservation/gating/dedup/feasibility); `python test_kpack_expansion.py` (verl-free: prompt
+re-render, variant construction with **source rows provably untouched**, substitution pooling,
+and the callback's k-pack dispatch via a mock batch); and `test_kpack_real_verl.py` run with the
+verl env python (`/share5/users/xutao.ma/miniconda3/envs/verl/bin/python`) — drives the ACTUAL
+`HPRLRayPPOTrainer._get_gen_batch` against a real `DataProto`, confirming verl's
+`select_idxs`/`concat`/`repeat`/pop behave (length preserved, probed problem spans {B,B-1} in
+both `extra_info` and `gen_batch`, `batch.repeat(n)` stays aligned with `gen_batch.repeat(n)`, and
+the no-`uid` validation guard no-ops). That smoke test surfaced two test-only setup bugs (reading
+the popped top-level `tools_kwargs` instead of the surviving `extra_info.tools_kwargs`; missing the
+master `data.hprl.enable` in the fake config) — the production paths were correct. Launch wiring
+verified: `HPRL_KPACK_*` env → `run_hprl` → `data.hprl.kpack.*` hydra CLI overrides (via
+`launch_hprl_cluster.sh` → `ray_cluster_launch.sh`). Still pending: a full live cluster TRAINING
+run with `HPRL_KPACK_ENABLE=true` to watch `hprl/kpack_*` + budget-descent curves.
+
 
 ## 2026-06-12 (g) — box-then-call rate as a live training metric
 

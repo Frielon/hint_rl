@@ -84,6 +84,35 @@ def load_budget_table(path: str) -> dict[str, int]:
         return {}
 
 
+def get_create_budget(tools_kwargs, default: int, tool_name: str = "request_hint") -> int:
+    """Read ``tools_kwargs[tool_name].create_kwargs.budget`` (``default`` if absent).
+
+    The single reader for the per-row tool budget. Shared by the dataset (injection),
+    the trainer (k-pack probe expansion), so they agree on what budget a row runs under.
+    Defensive: returns ``default`` for any shape that isn't the expected nested dict.
+    """
+    if isinstance(tools_kwargs, dict):
+        tool = tools_kwargs.get(tool_name)
+        if isinstance(tool, dict):
+            ck = tool.get("create_kwargs")
+            if isinstance(ck, dict) and ck.get("budget") is not None:
+                return int(ck["budget"])
+    return int(default)
+
+
+def set_create_budget(tools_kwargs, budget: int, tool_name: str = "request_hint") -> None:
+    """Set ``tools_kwargs[tool_name].create_kwargs.budget = budget`` in place (no-op if
+    the structure isn't the expected nested dict). The single writer, shared as above."""
+    if not isinstance(tools_kwargs, dict):
+        return
+    tool = tools_kwargs.get(tool_name)
+    if not isinstance(tool, dict):
+        return
+    ck = tool.get("create_kwargs")
+    if isinstance(ck, dict):
+        ck["budget"] = int(budget)
+
+
 @dataclass
 class BudgetUpdate:
     """The outcome of one downward-ratchet evaluation (for logging / debugging)."""
@@ -98,6 +127,10 @@ class BudgetUpdate:
     #                   snapped to that minimum (the primary, ungated rule).
     #   "pivot"      -- fallback fired: new = (N/2-th smallest correct count) - decrement.
     #   "unchanged"  -- no correct rollout, or fewer than N/2 correct at the full budget.
+    #   "kpack"      -- the k-pack counterfactual-probe rule fired: new = the smallest
+    #                   B' at which >= ``require_successes`` correct rollouts (pooled over
+    #                   all probe packs) used <= B' hints (== the require_successes-th
+    #                   smallest pooled correct hint count). See compute_kpack_budget.
     rule: str = "unchanged"
     # The (N/2)-th-SMALLEST correct hint count that drove a "pivot" decision (None
     # otherwise -- e.g. the fast path, or an unchanged budget).
@@ -105,6 +138,12 @@ class BudgetUpdate:
     # Fewest hints any CORRECT rollout used this step (None if none were correct).
     # Drives the "min_frugal" rule; recorded in every branch for logging.
     min_correct_hint_count: Optional[int] = None
+    # k-pack only: the chosen frontier B' (the require_successes-th smallest pooled
+    # correct hint count) that drove a "kpack" decision. None for every other rule.
+    kpack_threshold: Optional[int] = None
+    # k-pack only: how many distinct probe packs (budget levels) were pooled for this
+    # decision. 1 means no probe ran (the k=1 path uses compute_downward_budget instead).
+    kpack_num_packs: Optional[int] = None
 
     def as_dict(self) -> dict:
         return {
@@ -116,6 +155,8 @@ class BudgetUpdate:
             "rule": self.rule,
             "pivot_hint_count": self.pivot_hint_count,
             "min_correct_hint_count": self.min_correct_hint_count,
+            "kpack_threshold": self.kpack_threshold,
+            "kpack_num_packs": self.kpack_num_packs,
         }
 
 
@@ -213,6 +254,91 @@ def compute_downward_budget(
     )
 
 
+def compute_kpack_budget(
+    current_budget: int,
+    results: Sequence[Result],
+    *,
+    min_budget: int = 0,
+    require_successes: int = 2,
+    num_packs: Optional[int] = None,
+) -> BudgetUpdate:
+    """The k-pack counterfactual-probe downward rule (paper §7 "double-rollout"/k-pack).
+
+    Used INSTEAD of ``compute_downward_budget`` when a problem was probed this step --
+    i.e. its rollouts were generated under MORE THAN ONE budget (the normal pack at
+    ``B`` plus probe packs forced down to ``B-1 ... B-k+1``). ``results`` is the POOLED
+    ``(correct, num_hints)`` over ALL of that problem's packs this step.
+
+    Rule (user, 2026-06-13): gather every CORRECT rollout across all packs; find the
+    smallest budget ``B'`` at which at least ``require_successes`` of them used ``<= B'``
+    hints, and set the new budget to that ``B'``. Because a rollout that solved with
+    ``h`` hints is genuine evidence the problem is doable with ``h`` (the probe packs
+    were *forced* to a low budget, so a frugal solve there is real, not an artifact of a
+    greedy policy that always spends its budget), this reads true need directly instead
+    of the corrupted full-budget-usage signal.
+
+    The smallest ``B'`` with ``>= require_successes`` correct rollouts at ``<= B'`` is
+    exactly the ``require_successes``-th smallest pooled correct hint count: at that value
+    the ``require_successes`` most-frugal correct rollouts all qualify, and below it fewer
+    than ``require_successes`` do. ``require_successes >= 2`` is the robustness guard
+    against a single answer-leak / fluke solve driving the budget down (see
+    hprl-answer-leak-major-step); set it to 1 to recover the aggressive single-success
+    behavior.
+
+    Strictly downward: clamped to ``[min_budget, current_budget]``; never raises B_q. If
+    fewer than ``require_successes`` correct rollouts exist (no corroborated frontier),
+    the budget is HELD (rule "unchanged") -- there is no evidence one fewer hint works.
+
+    Args:
+        current_budget: the problem's current budget ``B`` (the MAX over its packs --
+            the ceiling the ratchet is lowering from).
+        results: pooled ``(correct, num_hints)`` over every pack this step.
+        min_budget: floor (default 0 -> a problem may ratchet to fully unaided).
+        require_successes: how many corroborating frugal successes are needed (default 2).
+        num_packs: how many distinct budget levels were pooled (logging only).
+    """
+    n_total = len(results)
+    correct_hint_counts = sorted(int(h) for ok, h in results if ok)
+    n_correct = len(correct_hint_counts)
+    min_correct = correct_hint_counts[0] if n_correct else None
+
+    def _clamp(b: int) -> int:
+        return max(min_budget, min(b, current_budget))
+
+    require = max(1, int(require_successes))
+    if n_correct >= require:
+        # require-th smallest pooled correct hint count == smallest B' with >= require
+        # correct rollouts at <= B'. (For require==1 this is the most-frugal success.)
+        threshold = correct_hint_counts[require - 1]
+        new_budget = _clamp(threshold)
+        return BudgetUpdate(
+            old_budget=current_budget,
+            new_budget=new_budget,
+            n_total=n_total,
+            n_correct=n_correct,
+            changed=(new_budget != current_budget),
+            rule="kpack",
+            pivot_hint_count=None,
+            min_correct_hint_count=min_correct,
+            kpack_threshold=threshold,
+            kpack_num_packs=num_packs,
+        )
+
+    # Fewer than ``require`` corroborating successes -> no trustworthy frontier; hold.
+    return BudgetUpdate(
+        old_budget=current_budget,
+        new_budget=current_budget,
+        n_total=n_total,
+        n_correct=n_correct,
+        changed=False,
+        rule="unchanged",
+        pivot_hint_count=None,
+        min_correct_hint_count=min_correct,
+        kpack_threshold=None,
+        kpack_num_packs=num_packs,
+    )
+
+
 class BudgetManager:
     """JSON-backed, problem_id-keyed store of the current per-problem budget B_q.
 
@@ -230,11 +356,14 @@ class BudgetManager:
         default_budget: int = 8,
         min_budget: int = 0,
         decrement: int = 1,
+        kpack_require_successes: int = 2,
     ):
         self.path = path
         self.default_budget = int(default_budget)
         self.min_budget = int(min_budget)
         self.decrement = int(decrement)
+        # k-pack rule: corroborating frugal successes needed to ratchet (compute_kpack_budget).
+        self.kpack_require_successes = int(kpack_require_successes)
         # problem_id -> current budget B_q
         self._budgets: dict[str, int] = {}
         if path and os.path.exists(path):
@@ -286,6 +415,34 @@ class BudgetManager:
         self._budgets[problem_id] = upd.new_budget
         return upd
 
+    def update_group_kpack(
+        self,
+        problem_id: str,
+        results: Sequence[Result],
+        *,
+        current_budget: Optional[int] = None,
+        num_packs: Optional[int] = None,
+        require_successes: Optional[int] = None,
+    ) -> BudgetUpdate:
+        """Fold a PROBED problem's pooled (over all packs) rollouts through the k-pack rule.
+
+        Use this when the problem was probed this step (rollouts under >1 budget). ``results``
+        is the pooled ``(correct, num_hints)`` across every pack; ``current_budget`` defaults
+        to the stored B_q (the ceiling). Returns the ``BudgetUpdate`` and persists the new
+        budget. See ``compute_kpack_budget``.
+        """
+        if current_budget is None:
+            current_budget = self.get(problem_id)
+        upd = compute_kpack_budget(
+            current_budget,
+            results,
+            min_budget=self.min_budget,
+            require_successes=(self.kpack_require_successes if require_successes is None else require_successes),
+            num_packs=num_packs,
+        )
+        self._budgets[problem_id] = upd.new_budget
+        return upd
+
     # ------------------------------------------------------------------ #
     # persistence (atomic write)
     # ------------------------------------------------------------------ #
@@ -298,6 +455,7 @@ class BudgetManager:
         self.default_budget = int(meta.get("default_budget", self.default_budget))
         self.min_budget = int(meta.get("min_budget", self.min_budget))
         self.decrement = int(meta.get("decrement", self.decrement))
+        self.kpack_require_successes = int(meta.get("kpack_require_successes", self.kpack_require_successes))
 
     def save(self, path: Optional[str] = None) -> None:
         path = path or self.path
@@ -308,6 +466,7 @@ class BudgetManager:
                 "default_budget": self.default_budget,
                 "min_budget": self.min_budget,
                 "decrement": self.decrement,
+                "kpack_require_successes": self.kpack_require_successes,
             },
             "budgets": self._budgets,
         }
@@ -392,15 +551,64 @@ def _selftest() -> None:
     r = compute_downward_budget(4, [(True, 3)] * 16)
     chk("uniform-3 frugal", r.new_budget, 3)
 
+    # ---- k-pack counterfactual-probe rule ------------------------------------
+    # Two packs at B=5 and B=4 pooled. Correct hint counts: 4 (full B-pack), 4, 3 (probe).
+    # require=2 -> 2nd smallest correct count = 4 -> ratchet 5 -> 4.
+    r = compute_kpack_budget(5, [(True, 4), (True, 4), (True, 3), (False, 5)], num_packs=2)
+    chk("kpack: rule", r.rule, "kpack")
+    chk("kpack: 2nd-smallest frontier", r.new_budget, 4)
+    chk("kpack: threshold recorded", r.kpack_threshold, 4)
+    chk("kpack: num_packs recorded", r.kpack_num_packs, 2)
+    chk("kpack: changed", r.changed, True)
+
+    # A deep probe pack solving frugally pulls multiple levels in one update.
+    # Pooled correct counts 1,1,5 -> 2nd smallest = 1 -> B 5 -> 1 (multi-level jump).
+    r = compute_kpack_budget(5, [(True, 1), (True, 1), (True, 5)] + [(False, 5)] * 3, num_packs=3)
+    chk("kpack: multi-level jump", r.new_budget, 1)
+    chk("kpack: multi-level rule", r.rule, "kpack")
+
+    # Only ONE correct rollout (a lone fluke/leak): require=2 not met -> HOLD.
+    r = compute_kpack_budget(5, [(True, 2)] + [(False, 5)] * 7, num_packs=2)
+    chk("kpack: single success holds", r.new_budget, 5)
+    chk("kpack: single success unchanged", r.changed, False)
+    chk("kpack: single success rule", r.rule, "unchanged")
+    chk("kpack: single success min recorded", r.min_correct_hint_count, 2)
+
+    # require_successes=1 recovers aggressive single-success (most-frugal) behavior.
+    r = compute_kpack_budget(5, [(True, 2)] + [(False, 5)] * 7, require_successes=1)
+    chk("kpack: require=1 single success ratchets", r.new_budget, 2)
+
+    # Every correct rollout used the full budget (no frugal evidence) -> unchanged.
+    r = compute_kpack_budget(5, [(True, 5)] * 4 + [(False, 5)] * 4, num_packs=2)
+    chk("kpack: all-full-budget holds", r.new_budget, 5)
+    chk("kpack: all-full-budget rule", r.rule, "kpack")
+    chk("kpack: all-full-budget unchanged", r.changed, False)
+
+    # No correct rollout at all -> hold, min_correct None.
+    r = compute_kpack_budget(5, [(False, 1)] * 8, num_packs=2)
+    chk("kpack: no-correct holds", r.new_budget, 5)
+    chk("kpack: no-correct min None", r.min_correct_hint_count, None)
+
+    # Clamp to min_budget: pooled frontier 0 but floor 2 -> 2.
+    r = compute_kpack_budget(5, [(True, 0), (True, 0)], min_budget=2, num_packs=2)
+    chk("kpack: floored at min_budget", r.new_budget, 2)
+    # Probe down to fully unaided: two correct at 0 hints -> ratchet to 0.
+    r = compute_kpack_budget(2, [(True, 0), (True, 0), (False, 2)], min_budget=0, num_packs=3)
+    chk("kpack: to zero (unaided)", r.new_budget, 0)
+
     # ---- manager round-trip + persistence ------------------------------------
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "budget_state.json")
         bm = BudgetManager(p, default_budget=8)
         bm.update_group("probA", [(True, 3)] * 16)  # min 3 < 8 -> frugal -> 3
         chk("manager stored", bm.get("probA"), 3)
+        # k-pack manager path: pooled probe successes ratchet via the kpack rule.
+        bm.update_group_kpack("probK", [(True, 2), (True, 4)], current_budget=6, num_packs=2)
+        chk("manager kpack stored", bm.get("probK"), 4)  # 2nd-smallest of {2,4} = 4
         bm.save()
         bm2 = BudgetManager(p, default_budget=8)
         chk("manager reloaded", bm2.get("probA"), 3)
+        chk("manager kpack reloaded", bm2.get("probK"), 4)
         chk("manager unseen default", bm2.get("probB"), 8)
 
     print("all budget_manager self-tests passed.")

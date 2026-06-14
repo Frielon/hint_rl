@@ -109,51 +109,9 @@ def user_problem(prompt) -> str:
     return prompt[-1].get("content", "") if len(prompt) else ""
 
 
-# --- truncated-problem detection -------------------------------------------
-# A handful of source rows have the problem statement cut off mid-sentence --
-# the body severed to "How many of the", or ending "...If the odometer",
-# "...each term after the", etc. In rollouts these collapse first-turn
-# reasoning (mean ~49 tok for the worst) and trigger a spurious <hint_call/>:
-# the model writes "the statement is incomplete ... I need more information"
-# and immediately calls a hint. ~27/3164 rows in dapo-3164-hint-verl-mt.
-# These are silent label-quality noise, so drop them by default.
-_BUDGET_TAIL_RE = re.compile(r"\n+You have (?:no |\d+ )?hint calls?.*$", re.IGNORECASE | re.DOTALL)
-# Trailing figure / URL references: the QUESTION before them can be complete
-# (e.g. "...same point as $1993$? \n\nAIME 1993 Problem 9.png"), so strip these
-# tails before judging truncation -- a missing figure is a separate concern.
-_ASSET_TAIL_RE = re.compile(
-    r"(?:\[img\].*?\[/img\]|https?://\S+|\S+\.(?:png|jpe?g|gif)|"
-    r"For diagram[^\n]*|AIME[^\n]*\.png)\s*$",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def problem_is_truncated(text: str) -> bool:
-    """True if the problem statement appears cut off mid-sentence.
-
-    Strips the appended budget reminder and any trailing figure/URL references,
-    then flags the row if what remains ends in a letter or comma -- i.e. no
-    terminal punctuation, display-math close, or CJK full stop, the signature of
-    a mid-prose truncation. Empty bodies count. A complete problem keeps its
-    real ending here -- including answer-format tails like "..., please provide
-    the value of m + n." or "...within \\boxed{}." -- which end in punctuation,
-    so they are NOT stripped (stripping them would land on a comma and misfire).
-    """
-    t = _BUDGET_TAIL_RE.sub("", text or "").strip()
-    # strip trailing asset refs (possibly several) so a complete "...?" before
-    # a stray ".png" is not misread as truncated.
-    for _ in range(3):
-        new = _ASSET_TAIL_RE.sub("", t).strip()
-        if new == t:
-            break
-        t = new
-    if not t:
-        return True
-    # complete statements end in real punctuation, a display-math close, a
-    # closing brace/paren/bracket (incl. [asy]...[/asy]), $, or a CJK full stop.
-    if t[-1] in ".?!}])$" or t[-1] in "。．" or t.endswith("\\]") or t.endswith("\\)"):
-        return False
-    return bool(re.search(r"[A-Za-z一-鿿,]$", t))
+# NOTE: truncated-problem detection/removal lives in remove_truncated.py now.
+# Run it on the mt-type output of this script to drop rows whose problem
+# statement is cut off mid-sentence.
 
 
 def upgrade_row(row: dict, max_budget: int, agent_name: str = "hint_agent", hint_full=None,
@@ -245,10 +203,6 @@ def main():
                     choices=["hint_agent", "tool_agent"],
                     help="rollout to route rows through: 'hint_agent' (<hint_call/> "
                          "sentinel) or legacy 'tool_agent' (hermes request_hint tool)")
-    ap.add_argument("--keep-truncated", action="store_true",
-                    help="keep rows whose problem statement is cut off mid-sentence "
-                         "(default: drop them -- they collapse first-turn reasoning "
-                         "and trigger spurious <hint_call/>s)")
     ap.add_argument("--zero-budget-ids", default=None,
                     help="file of problem_ids (one per line) to force to budget 0 (no hints) "
                          "-- the hard-problem curriculum's 'easy' bucket from "
@@ -265,20 +219,6 @@ def main():
 
     df = pd.read_parquet(args.in_path)
     print(f"read {len(df)} rows from {args.in_path}")
-
-    # --- drop truncated problem statements -------------------------------
-    if not args.keep_truncated:
-        mask = df["prompt"].map(lambda p: problem_is_truncated(user_problem(list(p))))
-        n_tr = int(mask.sum())
-        if n_tr:
-            print(f"dropping {n_tr} rows with truncated problem statements:")
-            for idx in df.index[mask]:
-                pid = (df.at[idx, "extra_info"] or {}).get("problem_id")
-                body = _BUDGET_TAIL_RE.sub("", user_problem(list(df.at[idx, "prompt"]))).strip()
-                print(f"  - problem_id={pid!r}: ...{body[-60:]!r}")
-            df = df[~mask].reset_index(drop=True)
-        else:
-            print("no truncated problem statements found")
 
     # Join the ORIGINAL difficulty-annotated hint pool by problem_id.
     pid_to_full = {}
