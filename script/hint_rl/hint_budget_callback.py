@@ -109,6 +109,16 @@ def hprl_update_budgets(
     # this step (the k-pack rule applies); 1 level == an ordinary single-pack group.
     groups: dict[str, list[tuple[bool, int]]] = defaultdict(list)
     pack_budgets: dict[str, set[int]] = defaultdict(set)
+    # Pack-wise view (for the GRPO-honest active-learning metrics): each ``uid`` is one
+    # GRPO group == one k-pack pack (verl normalizes advantages within a uid). We track
+    # correctness per uid alongside the problem_id pooling, so we can report the contrast
+    # GRPO ACTUALLY sees (within a pack) -- not just the pooled-by-problem view, which
+    # flags a problem active even when its correct & wrong rollouts live in DIFFERENT
+    # packs (a contrast no single group ever sees). ``uid`` is assigned on the training
+    # path only; absent (validation / legacy / mock batches) -> pack-wise metrics skipped.
+    uid_arr = ntb.get("uid")
+    pack_correct: dict[str, list[bool]] = defaultdict(list)  # uid -> rollout correctness
+    pack_to_pid: dict[str, str] = {}                         # uid -> problem_id
     for i in range(n):
         ei = _to_py(extra[i]) or {}
         pid = ei.get("problem_id")
@@ -119,6 +129,11 @@ def hprl_update_budgets(
         hcnt = int(round(float(_to_py(num_hints[i]))))
         groups[pid].append((correct, hcnt))
         pack_budgets[pid].add(_gen_budget_from_extra(ei, budget_mgr.default_budget, tool_name))
+        if uid_arr is not None:
+            uid = _to_py(uid_arr[i])
+            if uid is not None:
+                pack_correct[str(uid)].append(correct)
+                pack_to_pid[str(uid)] = pid
 
     if not groups:
         logger.warning("hprl_update_budgets: no problem_id found in batch; skipping ratchet")
@@ -226,6 +241,29 @@ def hprl_update_budgets(
         **shape_metrics,
     }
 
+    # -------- pack-wise active learning (the GRPO-honest views) -------------------
+    # active_learning_frac above POOLS a problem's packs, so it flags a problem active
+    # whenever some correct AND some wrong rollout exist anywhere in the problem -- even
+    # when they sit in DIFFERENT packs (e.g. one pack all-correct, another all-wrong).
+    # GRPO never sees that contrast: advantages are normalized WITHIN each uid (pack).
+    # Two honest views over the per-uid (pack) groups:
+    #   * _packwise: fraction of PACKS whose own rollouts span correct & wrong (0<C<N).
+    #   * _anypack:  fraction of PROBLEMS with AT LEAST ONE such internally-mixed pack
+    #                -- the real per-problem learnability (>= it iff a pack truly mixes).
+    # _anypack <= active_learning_frac always (an internally-mixed pack also mixes the
+    # pool, but a mixed pool can come from uniform packs). With k-pack off there is one
+    # uid per problem, so both collapse onto active_learning_frac. Skipped if no uid.
+    if pack_correct:
+        n_packs = len(pack_correct)
+        active_pack_uids = [u for u, oks in pack_correct.items() if any(oks) and not all(oks)]
+        n_active_packs = len(active_pack_uids)
+        n_active_anypack = len({pack_to_pid[u] for u in active_pack_uids})
+        metrics["hprl/active_learning_frac_packwise"] = float(n_active_packs / n_packs)
+        metrics["hprl/num_active_packs"] = float(n_active_packs)
+        metrics["hprl/num_packs"] = float(n_packs)
+        metrics["hprl/active_learning_frac_anypack"] = float(n_active_anypack / n_problems)
+        metrics["hprl/num_active_learning_anypack"] = float(n_active_anypack)
+
     # -------- k-pack probe ratchet: how many probed problems actually moved -------
     # n_probed = problems whose rollouts spanned >1 budget this step (the k-pack rule
     # ran). num_kpack_ratcheted / mean delta show whether the counterfactual probe is
@@ -261,6 +299,21 @@ def hprl_update_budgets(
         be_total = sum(int(round(float(_to_py(be_arr[i]) or 0))) for i in range(len(be_arr)))
         metrics["hprl/hint_budget_exceeded"] = float(be_total)
         metrics["hprl/hint_budget_exceeded_frac"] = float(be_total / n) if n else 0.0
+
+    # -------- out-of-hints rate: pool-exhausted hint calls ------------------
+    # Hint calls that found an EMPTY candidate pool (every hint already surfaced) and
+    # got the no-hint no-op instead of a selector round-trip. Kept DISTINCT from
+    # hint_call_failed (a selector outage): a rising value here is benign and EXPECTED
+    # under cumulative step-exclude once a rollout has revealed its last/highest step.
+    # The frac is over ALL hint-call attempts (applied + failed + exhausted).
+    exh_arr = ntb.get("hint_pool_exhausted")
+    if exh_arr is not None:
+        exhausted_total = sum(int(round(float(_to_py(exh_arr[i]) or 0))) for i in range(len(exh_arr)))
+        attempts_total = call_total + exhausted_total
+        metrics["hprl/hint_pool_exhausted"] = float(exhausted_total)
+        metrics["hprl/hint_pool_exhausted_frac"] = (
+            float(exhausted_total / attempts_total) if attempts_total else 0.0
+        )
 
     # -------- selector latency (the RELIABLE timer; verl-native one is dropped) ----
     # Per-rollout selector time + call count come through extra_fields -> reward ->

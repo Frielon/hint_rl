@@ -280,34 +280,119 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
         try:
             reward_extra_infos_dict = self._hprl_rollout_log_columns(batch, reward_extra_infos_dict)
         except Exception as e:  # logging must never crash training
-            logger.warning("HPRL rollout-log augmentation failed at step %s: %s", self.global_steps, e)
+            print(f"[HPRL step={self.global_steps}] rollout-log augmentation failed: {e}", flush=True)
 
-        # The rollout-generation DUMP is non-essential and must NEVER crash training.
-        # verl's _write_generations builds `gts` via `for item in batch`, which iterates
-        # by integer indexing until a non_tensor column runs out -> if ANY non_tensor key
-        # is shorter than the tensor batch, gts comes up short and _write_generations dies
-        # with IndexError. Defend: log any length-mismatched non_tensor key (so the
-        # culprit is named) and drop it for the dump, then guard the call and restore.
-        orig_ntb = batch.non_tensor_batch
+        # The dump's actual write runs in a background thread; its failure surfaces (via
+        # f.result()) inside _dump_generations (guarded below) AND the _write_generations
+        # override below makes the write itself never IndexError + names the short column.
+        # Guard this call anyway.
         try:
-            n = len(batch)
-            mism = {k: len(v) for k, v in orig_ntb.items() if len(v) != n}
-            if mism:
-                logger.warning(
-                    "[HPRL step=%s] rollout dump: non_tensor keys with len != batch len %d: %s "
-                    "-- dropping them for the dump (training unaffected; please report this key set)",
-                    self.global_steps, n, mism,
-                )
-                batch.non_tensor_batch = {k: v for k, v in orig_ntb.items() if len(v) == n}
             super()._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
-        except Exception as e:  # any other dump failure: skip the dump, keep training
-            logger.warning(
-                "HPRL rollout dump failed at step %s (skipped; training continues): %s",
-                self.global_steps, e,
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[HPRL step={self.global_steps}] rollout dump skipped (failed): "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+        return None
+
+    @staticmethod
+    def _write_generations(inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps):
+        """Robust + diagnostic replacement for verl's background JSONL writer.
+
+        The batch columns were all length-consistent (the `dumplens` check showed uniform),
+        yet verl's `_write_generations` still IndexErrors at `entry = {k: v[i] ...}` for
+        `i in range(len(inputs))` -- so the short column is one of the DERIVED base_data
+        lists (`input`/`output`/`gts`/`score`) or a `reward_*` column, not a batch column.
+        This override builds base_data exactly like verl, then (1) PRINTS any column whose
+        length != len(inputs) -- naming the culprit -- and (2) writes only `min(lengths)`
+        rows so it can NEVER IndexError. Self-resolves via `self._write_generations` from
+        verl's `_dump_generations`. print() so it reaches the cluster console log.
+        """
+        import json
+        import os
+
+        n = len(inputs)
+        base_data = {
+            "input": inputs,
+            "output": outputs,
+            "gts": gts,
+            "score": scores,
+            "step": [global_steps] * n,
+        }
+        for k, v in reward_extra_infos_dict.items():
+            if len(v) == n:
+                base_data[k] = v
+
+        lens = {k: len(v) for k, v in base_data.items()}
+        n_safe = min(lens.values()) if lens else 0
+        if n_safe != n:
+            short = {k: L for k, L in lens.items() if L != n}
+            print(
+                f"[HPRL DUMP step={global_steps}] SHORT base_data columns (len(inputs)={n}, "
+                f"writing {n_safe} rows): {short}  (full lens={lens})",
+                flush=True,
+            )
+
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{global_steps}.jsonl")
+        with open(filename, "w") as f:
+            for i in range(n_safe):
+                entry = {k: v[i] for k, v in base_data.items()}
+                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        print(f"Dumped generations to {filename}", flush=True)
+
+    def _dump_generations(self, *args, **kwargs):
+        """Make the background rollout-dump truly non-fatal.
+
+        verl's ``_dump_generations`` re-raises a failed background write via ``f.result()``
+        and then SKIPS clearing ``self._dump_futures`` (the line after the raise is never
+        reached) -- so a single failed write re-raises on EVERY subsequent step and finally
+        propagates uncaught (shutdown). Here we swallow the surfaced error and PURGE all
+        done futures, so a bad write can never re-surface and never kills training.
+        """
+        if not self._hprl_cfg().get("enable", False):
+            return super()._dump_generations(*args, **kwargs)
+        try:
+            super()._dump_generations(*args, **kwargs)
+        except Exception as e:  # a previously-submitted background write failed
+            print(
+                f"[HPRL step={self.global_steps}] rollout dump background write failed "
+                f"(ignored): {type(e).__name__}: {e}",
+                flush=True,
             )
         finally:
-            batch.non_tensor_batch = orig_ntb
-        return None
+            try:  # drop DONE futures (success or failure) so none can re-raise again
+                self._dump_futures = [f for f in getattr(self, "_dump_futures", []) if not f.done()]
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _shutdown_dump_executor(self):
+        """Drain the rollout-dump executor without letting a failed background dump crash.
+
+        Belt-and-suspenders for the non-essential rollout dump: verl writes generations in
+        a background thread and re-raises a failed write via ``f.result()`` -- not only in
+        ``_log_rollout_data`` (guarded above) but ALSO here at shutdown/checkpoint/exception
+        cleanup (ray_trainer.py:1399/1758/1770), which is OUTSIDE that guard. Swallow + log
+        any such surfaced dump error so training/checkpointing is never killed by logging.
+        """
+        if not self._hprl_cfg().get("enable", False):
+            return super()._shutdown_dump_executor()
+        try:
+            return super()._shutdown_dump_executor()
+        except Exception as e:  # a background dump failed; the dump is non-essential
+            # print(), not logger.warning -- see _log_rollout_data note (logger.warning
+            # does not reach the cluster console log from the trainer).
+            print(
+                f"[HPRL] rollout-dump executor surfaced a failed dump at shutdown (ignored): "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+            try:  # still drain + close so the executor is not leaked
+                self._dump_futures.clear()
+                self._dump_executor.shutdown(wait=True)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _hprl_rollout_log_columns(self, batch, reward_extra_infos_dict) -> dict:
         ntb = batch.non_tensor_batch

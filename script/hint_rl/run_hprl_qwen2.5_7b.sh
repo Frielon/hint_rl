@@ -58,7 +58,7 @@ wandb_project=${wandb_project:-"hint_rl"}
 
 # ---- GRPO algorithm (identical to the plain GRPO run) ---------------------
 adv_estimator=grpo
-norm_adv_by_std_in_grpo=False
+norm_adv_by_std_in_grpo=True
 use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
@@ -70,7 +70,7 @@ loss_agg_mode="token-mean"
 # ---- lengths: multi-turn trajectories accumulate tokens across turns ------
 max_prompt_length=2048
 # bumped from 8192: prompt + N*(assistant turn + hint tool result).
-max_response_length=16384
+max_response_length=8192
 
 # ---- multi-turn / hint knobs ----------------------------------------------
 # Cap on assistant turns; must be >= the largest per-problem hint budget B_q.
@@ -117,7 +117,7 @@ WORKING_DIR=${WORKING_DIR:-"${VERL_HOME}"}
 # Paths
 MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Qwen2.5-7B-Instruct"}
 CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dapo-3164-hint-verl-mt.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dapo-3139-hint-verl-mt-clean.parquet"}
 # Templated eval sets: aime2024-hint-mt / dapo_sample_hard_100-hint-mt carry the
 # SAME hint-tool template as training (agent_name="hint_agent", full <hint_call/>
 # system instruction + budget-0 user reminder), so validation is prompt-matched to
@@ -148,9 +148,17 @@ REWARD_MGR_CLASS=${REWARD_MGR_CLASS:-"HintRewardManager"}
 # WITHOUT regenerating the dataset: total penalty across all hints of a problem,
 # the per-difficulty-level multiplier (harder = HARD_FACTOR x), and the difficulty
 # assigned to the X.0 guidance hint.
-HINT_PENALTY_TOTAL=${HINT_PENALTY_TOTAL:-0.8}
+HINT_PENALTY_TOTAL=${HINT_PENALTY_TOTAL:-0.9}
 HINT_PENALTY_HARD_FACTOR=${HINT_PENALTY_HARD_FACTOR:-1.5}
 HINT_GUIDANCE_DIFFICULTY=${HINT_GUIDANCE_DIFFICULTY:-moderate}
+
+# "No hint available" penalty: each pool-exhausted <hint_call/> (the loop had no
+# candidate left to serve -- common terminal state of cumulative step-exclude) costs
+# this factor x the MINIMUM major-step penalty in the pool (factor 0.1, min step
+# penalty 0.2 -> 0.02 per call). Summed over the rollout's exhausted calls and
+# subtracted from the CORRECT reward (shares the correct_floor). 0 disables it.
+# (hint_reward.compute_score reward_kwargs.no_hint_penalty_factor.)
+NO_HINT_PENALTY_FACTOR=${NO_HINT_PENALTY_FACTOR:-0.1}
 
 # ---- effort-shaping penalty (premature/shallow hint calls) ----------------
 # Fixes the front-loading pathology: with a timing-blind hint penalty the policy
@@ -161,7 +169,7 @@ HINT_GUIDANCE_DIFFICULTY=${HINT_GUIDANCE_DIFFICULTY:-moderate}
 # own mean turn length) is penalized; one emitted after a real struggle is ~free.
 # Subtracted from the CORRECT reward only (incorrect stays at -1). 0 disables it.
 # Start small (~0.3) and watch rollouts for filler-padding before raising.
-HINT_SHAPE_COEFF=${HINT_SHAPE_COEFF:-0.15}
+HINT_SHAPE_COEFF=${HINT_SHAPE_COEFF:-0.0}
 
 # ---- hint-call reward (anti-suppression bonus) ----------------------------
 # One-off bonus ADDED to the INCORRECT reward when a failing rollout RECEIVED a
@@ -173,7 +181,7 @@ HINT_SHAPE_COEFF=${HINT_SHAPE_COEFF:-0.15}
 # correct out-ranks hinted-correct -> the policy stops calling hints) by keeping a
 # positive gradient on hint use among the rollouts that fail anyway. 0 disables it.
 # (hint_reward.compute_score reward_kwargs.hint_call_reward.)
-HINT_CALL_REWARD=${HINT_CALL_REWARD:-0.05}
+HINT_CALL_REWARD=${HINT_CALL_REWARD:-0.0}
 
 # ---- hint-selection + penalty strategy ------------------------------------
 # Selects HOW a hint call is answered and penalized. The same value is given to
@@ -187,6 +195,25 @@ HINT_CALL_REWARD=${HINT_CALL_REWARD:-0.05}
 #                 state and is excluded from the next call; the reward subtracts the
 #                 per-step penalty directly (hint_penalty.applied_step_penalty).
 HINT_STRATEGY=${HINT_STRATEGY:-major_step}
+
+# ---- major-step exclusion mode (selector prompt construction) -------------
+# Only meaningful with HINT_STRATEGY=major_step. Chooses which already-revealed
+# major steps are dropped from the selector's candidate pool before the next call
+# (agent-loop side only -- no effect on the reward/penalty):
+#   applied     : drop only the steps actually revealed so far (default).
+#   cumulative  : drop EVERY step id <= the latest revealed step -- once step 5 is
+#                 revealed, steps 1..5 are removed and only 6, 7, ... remain, forcing
+#                 the selector strictly forward (no re-offering an earlier step).
+HINT_STEP_EXCLUDE_MODE=${HINT_STEP_EXCLUDE_MODE:-cumulative}
+
+# ---- finalize-incorrect (score wrong answers as correct-with-more-hints) ---
+# When a rollout ends on an answer turn (no <hint_call/>), the agent loop grades it; if
+# WRONG, it makes ONE final selector call to find the hint the student still needs, and
+# the reward scores the rollout as correct_reward - penalty(used) - penalty(stuck-hint k
+# .. last) - no_hint_penalty (acc stays 0). Given to BOTH the agent loop
+# (data.hprl.finalize_incorrect) and the reward (reward_kwargs.finalize_incorrect); they
+# MUST agree. Adds a blocking selector call per INCORRECT rollout. false -> off.
+HINT_FINALIZE_INCORRECT=${HINT_FINALIZE_INCORRECT:-true}
 
 # The directory holding hint_tool.py must be importable by the rollout workers
 # (the tool config's class_name "hint_tool.HintTool" is resolved with importlib).
@@ -320,6 +347,8 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     data.hprl.decrement=${HPRL_DECREMENT} \
     data.hprl.default_budget=${HPRL_DEFAULT_BUDGET} \
     data.hprl.strategy=${HINT_STRATEGY} \
+    data.hprl.step_exclude_mode=${HINT_STEP_EXCLUDE_MODE} \
+    data.hprl.finalize_incorrect=${HINT_FINALIZE_INCORRECT} \
     data.hprl.kpack.enable=${HPRL_KPACK_ENABLE} \
     data.hprl.kpack.k=${HPRL_KPACK_K} \
     data.hprl.kpack.require_successes=${HPRL_KPACK_REQUIRE_SUCCESSES} \
@@ -401,6 +430,8 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     +custom_reward_function.reward_kwargs.hint_guidance_difficulty=${HINT_GUIDANCE_DIFFICULTY} \
     +custom_reward_function.reward_kwargs.hint_strategy=${HINT_STRATEGY} \
     +custom_reward_function.reward_kwargs.hint_shape_coeff=${HINT_SHAPE_COEFF} \
+    +custom_reward_function.reward_kwargs.no_hint_penalty_factor=${NO_HINT_PENALTY_FACTOR} \
+    +custom_reward_function.reward_kwargs.finalize_incorrect=${HINT_FINALIZE_INCORRECT} \
     trainer.logger="['console','file','wandb']" \
     trainer.project_name="${wandb_project}" \
     trainer.experiment_name="${exp_name}" \

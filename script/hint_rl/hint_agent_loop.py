@@ -44,15 +44,35 @@ from verl.workers.rollout.replica import TokenOutput
 from hint_penalty import STRATEGY_MAJOR_STEP, normalize_strategy
 from hint_prompt import render_remaining_calls
 from hint_selector import (
+    STEP_EXCLUDE_CUMULATIVE,
     HintSelector,
     build_trace,
     exclude_applied_hints,
     exclude_applied_steps,
+    exclude_steps_through_latest,
     format_step_hints,
     hint_id_of,
     hints_for_step,
+    normalize_step_exclude_mode,
+    pool_is_exhausted,
     step_id_of,
 )
+
+# Answer grader for the finalize_incorrect option (grade the terminal answer IN the
+# loop, to decide whether to make a final selector call). Same grader the reward uses;
+# guarded so the module still imports where mathruler is absent (the option is off then).
+try:
+    from mathruler.grader import extract_boxed_content as _extract_boxed, grade_answer as _grade_answer
+
+    _GRADER_OK = True
+except Exception:  # noqa: BLE001
+    _GRADER_OK = False
+
+    def _extract_boxed(_s):  # type: ignore[misc]
+        return "None"
+
+    def _grade_answer(_p, _g):  # type: ignore[misc]
+        return False
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -61,6 +81,18 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 HINT_SENTINEL = "<hint_call/>"
 # tools_kwargs key carrying this problem's create_kwargs (problem/hints/budget).
 HINT_KWARGS_KEY = "request_hint"
+# The no-op hint turn injected when a <hint_call/> cannot be served -- either the
+# selector failed (hint_call_failed) OR the candidate pool is exhausted
+# (hint_pool_exhausted, common in cumulative step-exclude mode). Same wording for
+# both: the policy is simply told to carry on unaided.
+HINT_UNAVAILABLE_MSG = "No hint is available right now; continue reasoning on your own."
+
+
+def _as_bool(value) -> bool:
+    """Parse a config/env flag to bool (tolerant of '1'/'true'/'yes'/'on', any case)."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 # --- DEBUG: per-selector-call dump ------------------------------------------ #
 # Set HPRL_SELECTOR_DUMP_DIR to a writable dir to record EVERY hint-selection
@@ -123,6 +155,30 @@ class HintAgentLoop(ToolAgentLoop):
             hprl.get("strategy", os.environ.get("HPRL_HINT_STRATEGY", "hint"))
         )
         logger.warning("HintAgentLoop: hint strategy = %s", self.hint_strategy)
+        # Major-step exclusion mode (major_step strategy only): which already-revealed
+        # steps the next selector prompt drops from the candidate pool.
+        #   "applied"    -- drop only the steps actually revealed (exclude_applied_steps).
+        #   "cumulative" -- drop every step id <= the latest revealed step
+        #                   (exclude_steps_through_latest); forces strictly-forward picks.
+        self.step_exclude_mode = normalize_step_exclude_mode(
+            hprl.get("step_exclude_mode", os.environ.get("HPRL_STEP_EXCLUDE_MODE", "applied"))
+        )
+        logger.warning("HintAgentLoop: step exclude mode = %s", self.step_exclude_mode)
+        # finalize_incorrect: when a rollout ends on an answer turn (no <hint_call/>),
+        # grade it here; if WRONG, make ONE final selector call to identify the hint the
+        # student still needs (final_hint_step) so the reward can score it as "correct but
+        # consuming hints from there to the end" (hint_reward + hint_penalty.penalty_from_k).
+        # Off by default. Adds a blocking selector call per incorrect rollout when on.
+        self.finalize_incorrect = _as_bool(
+            hprl.get("finalize_incorrect", os.environ.get("HPRL_FINALIZE_INCORRECT", "false"))
+        )
+        if self.finalize_incorrect and not _GRADER_OK:
+            logger.warning(
+                "HintAgentLoop: finalize_incorrect requested but mathruler grader is "
+                "unavailable -- the option is DISABLED for this run."
+            )
+            self.finalize_incorrect = False
+        logger.warning("HintAgentLoop: finalize_incorrect = %s", self.finalize_incorrect)
         self._selector = HintSelector.from_env()
 
     # NOTE: run() is intentionally NOT overridden. The inherited ToolAgentLoop.run
@@ -219,6 +275,18 @@ class HintAgentLoop(ToolAgentLoop):
         # (final solve turn + hint-free rollouts included). Initialized here for
         # the same DataProto.concat reason as applied_hints.
         agent_data.extra_fields.setdefault("turn_lens", [])
+        # "No hint available" (pool-exhausted) call count -> no_hint penalty + hprl/* logs.
+        # Initialized for the same DataProto.concat reason as applied_hints (every rollout
+        # must carry the key even if it never exhausts the pool).
+        agent_data.extra_fields.setdefault("hint_pool_exhausted", 0)
+        # finalize_incorrect state (only ever set on WRONG rollouts the loop finalizes):
+        # the as-correct flag, the stuck hint k (step/hint id; "" means none), and the
+        # pool-empty marker. Initialized here so EVERY rollout carries the keys (consistent
+        # non_tensor_batch for DataProto.concat), defaulting to the not-finalized values.
+        agent_data.extra_fields.setdefault("finalized_incorrect", 0)
+        agent_data.extra_fields.setdefault("final_hint_step", "")
+        agent_data.extra_fields.setdefault("final_hint_id", "")
+        agent_data.extra_fields.setdefault("final_hint_exhausted", 0)
 
         agent_data.assistant_turns += 1
         agent_data.response_ids = output.token_ids
@@ -278,6 +346,14 @@ class HintAgentLoop(ToolAgentLoop):
                     agent_data.extra_fields.get("hint_calls_with_box", 0) + 1
                 )
             return AgentState.PROCESSING_TOOLS  # reuse this state slot for hint injection
+
+        # Terminal answer turn (no hint call). With finalize_incorrect ON: grade the
+        # answer here; if WRONG, make one final selector call so the reward can score the
+        # rollout as "correct but consuming the hints from where it got stuck to the end"
+        # (see _finalize_incorrect + hint_reward). A CORRECT answer just terminates as usual
+        # -- no wasted selector call. Off (default) -> behaves exactly as before.
+        if self.finalize_incorrect:
+            await self._maybe_finalize_incorrect(agent_data)
         return AgentState.TERMINATED
 
     def _is_hint_call(self, text: str) -> bool:
@@ -292,6 +368,81 @@ class HintAgentLoop(ToolAgentLoop):
         last_nl = stripped.rfind("\n")
         last_line = stripped[last_nl + 1 :] if last_nl != -1 else stripped
         return last_line.strip() == self.hint_sentinel
+
+    # ------------------------------------------------------------------ #
+    # finalize_incorrect: grade the terminal answer; on a WRONG one, probe the
+    # selector ONCE for the hint the student still needs (recorded for the reward,
+    # NOT injected -- the rollout is over and the model's budget is not consulted).
+    # ------------------------------------------------------------------ #
+    async def _maybe_finalize_incorrect(self, agent_data) -> None:
+        """If the rollout's answer is WRONG, record where it got stuck for the reward.
+
+        Grades the model's own writing (all assistant turns; the final ``\\boxed{}`` is in
+        the last) with the SAME grader the reward uses, so the correct/incorrect split
+        agrees. A CORRECT answer returns immediately (no selector call). A WRONG answer
+        makes one final selector call to identify the hint ``k`` the student still needs
+        and records ``final_hint_step``/``final_hint_id`` + ``finalized_incorrect=1``; the
+        reward then scores it as "correct but consuming hints k..last"
+        (hint_penalty.penalty_from_k). If the pool is already exhausted, records the
+        no-hint case (charged via the existing no_hint penalty) instead.
+        """
+        create_kwargs = {}
+        tk = agent_data.tools_kwargs.get(self.hint_kwargs_key) if agent_data.tools_kwargs else None
+        if isinstance(tk, dict):
+            create_kwargs = tk.get("create_kwargs", {}) or {}
+        ground_truth = create_kwargs.get("ground_truth", "")
+
+        solution = "\n".join(
+            str(m.get("content") or "")
+            for m in agent_data.messages
+            if m.get("role") == "assistant"
+        )
+        pred = _extract_boxed(solution)
+        if pred != "None" and _grade_answer(pred, ground_truth):
+            return  # correct -> nothing to finalize, no selector call
+
+        # Wrong: mark the rollout and find the hint it still needs from the current trace.
+        applied = agent_data.extra_fields.setdefault("applied_hints", [])
+        agent_data.extra_fields["finalized_incorrect"] = 1
+        problem = create_kwargs.get("problem", "")
+        hints_obj = create_kwargs.get("hints", "")
+        if self.hint_strategy == STRATEGY_MAJOR_STEP:
+            if self.step_exclude_mode == STEP_EXCLUDE_CUMULATIVE:
+                hints_str = exclude_steps_through_latest(hints_obj, applied)
+            else:
+                hints_str = exclude_applied_steps(hints_obj, applied)
+        else:
+            hints_str = exclude_applied_hints(hints_obj, applied)
+
+        if pool_is_exhausted(hints_str):
+            # Nothing left to finish from -> the no_hint penalty (as implemented) applies.
+            agent_data.extra_fields["hint_pool_exhausted"] = (
+                agent_data.extra_fields.get("hint_pool_exhausted", 0) + 1
+            )
+            agent_data.extra_fields["final_hint_exhausted"] = 1
+            return
+
+        trace = build_trace(agent_data.messages)
+        _t0 = time.perf_counter()
+        selection, _raw, err = await self._selector.select(problem, trace, hints_str)
+        agent_data.extra_fields["hint_select_time"] = (
+            agent_data.extra_fields.get("hint_select_time", 0.0) + (time.perf_counter() - _t0)
+        )
+        agent_data.extra_fields["hint_select_calls"] = (
+            agent_data.extra_fields.get("hint_select_calls", 0) + 1
+        )
+        if isinstance(selection, dict) and step_id_of(selection) is not None:
+            agent_data.extra_fields["final_hint_step"] = step_id_of(selection)
+            hid = hint_id_of(selection)
+            if hid is not None:
+                agent_data.extra_fields["final_hint_id"] = str(hid)
+        else:
+            # Final selector call failed / unusable -> no k to charge (penalty_from_k stays
+            # 0, leaving final_hint_step/id at their "" defaults). Logged via hint_call_failed
+            # (already initialized) so a selector outage on the final call is still visible.
+            agent_data.extra_fields["hint_call_failed"] = (
+                agent_data.extra_fields.get("hint_call_failed", 0) + 1
+            )
 
     # ------------------------------------------------------------------ #
     # hint selection + inject as a USER message
@@ -334,12 +485,30 @@ class HintAgentLoop(ToolAgentLoop):
             # Exclude what's already been surfaced this rollout so the selector
             # cannot re-offer it: individual hints (hint strategy) or whole major
             # steps (major_step strategy). It must pick from the remaining candidates.
+            # In major_step mode step_exclude_mode chooses which steps are dropped:
+            # only the revealed ones ("applied"), or every step up to and including
+            # the latest revealed one ("cumulative", exclude_steps_through_latest).
             if major_step_mode:
-                hints_str = exclude_applied_steps(hints_obj, applied)
+                if self.step_exclude_mode == STEP_EXCLUDE_CUMULATIVE:
+                    hints_str = exclude_steps_through_latest(hints_obj, applied)
+                else:
+                    hints_str = exclude_applied_steps(hints_obj, applied)
             else:
                 hints_str = exclude_applied_hints(hints_obj, applied)
             trace = build_trace(agent_data.messages)
             call_index = len(applied)  # index of THIS hint call (before recording)
+
+            # Out of hints: every candidate has already been surfaced, so the
+            # post-exclusion pool is empty. This is the terminal state of the
+            # cumulative step-exclude mode (once the latest/highest step is revealed
+            # nothing remains), but it also happens in any mode when the budget
+            # outlasts the pool. There is nothing for the selector to pick -- skip the
+            # pointless (and re-offer-prone) selector round-trip and inject the no-hint
+            # turn below. Counted SEPARATELY from hint_call_failed so a benign
+            # exhaustion never looks like a selector OUTAGE (that signal must stay clean).
+            pool_exhausted = pool_is_exhausted(hints_str)
+            select_latency_s = 0.0
+            selection, _raw, err = None, None, None
 
             # Time the (blocking, on-critical-path) call to the frozen gpt-oss
             # selector. Two timers, by necessity:
@@ -354,19 +523,30 @@ class HintAgentLoop(ToolAgentLoop):
             #     non_tensor_batch (same path as hint_call_failed), so this is the
             #     RELIABLE per-rollout selector latency the reward surfaces and
             #     hint_budget_callback aggregates to hprl/hint_select_time_*.
-            _t0 = time.perf_counter()
-            with simple_timer("hint_select", agent_data.metrics):
-                selection, _raw, err = await self._selector.select(problem, trace, hints_str)
-            select_latency_s = time.perf_counter() - _t0
-            agent_data.extra_fields["hint_select_time"] = (
-                agent_data.extra_fields.get("hint_select_time", 0.0) + select_latency_s
-            )
-            agent_data.extra_fields["hint_select_calls"] = (
-                agent_data.extra_fields.get("hint_select_calls", 0) + 1
-            )
+            if not pool_exhausted:  # an exhausted call makes no selector round-trip
+                _t0 = time.perf_counter()
+                with simple_timer("hint_select", agent_data.metrics):
+                    selection, _raw, err = await self._selector.select(problem, trace, hints_str)
+                select_latency_s = time.perf_counter() - _t0
+                agent_data.extra_fields["hint_select_time"] = (
+                    agent_data.extra_fields.get("hint_select_time", 0.0) + select_latency_s
+                )
+                agent_data.extra_fields["hint_select_calls"] = (
+                    agent_data.extra_fields.get("hint_select_calls", 0) + 1
+                )
+            # Out of hints -> the no-hint turn (NOT a selector failure). Checked first
+            # so an exhausted call is never miscounted as hint_call_failed.
+            if pool_exhausted:
+                agent_data.metrics["hint_pool_exhausted"] = (
+                    agent_data.metrics.get("hint_pool_exhausted", 0) + 1
+                )
+                agent_data.extra_fields["hint_pool_exhausted"] = (
+                    agent_data.extra_fields.get("hint_pool_exhausted", 0) + 1
+                )
+                hint_message = {"role": "user", "content": HINT_UNAVAILABLE_MSG}
             # Guard on dict, not just None: no selector output shape may crash the
             # rollout (a stray JSON array once killed a whole run via .get on a list).
-            if not isinstance(selection, dict):
+            elif not isinstance(selection, dict):
                 logger.warning(
                     "hint selection failed (request=%s): %s",
                     agent_data.request_id,
@@ -376,10 +556,7 @@ class HintAgentLoop(ToolAgentLoop):
                     agent_data.extra_fields.get("hint_call_failed", 0) + 1
                 )
                 agent_data.metrics["hint_call_failed"] = agent_data.metrics.get("hint_call_failed", 0) + 1
-                hint_message = {
-                    "role": "user",
-                    "content": "No hint is available right now; continue reasoning on your own.",
-                }
+                hint_message = {"role": "user", "content": HINT_UNAVAILABLE_MSG}
             else:
                 if major_step_mode:
                     content = self._record_major_step(selection, hints_obj, applied, budget, agent_data)
@@ -391,12 +568,15 @@ class HintAgentLoop(ToolAgentLoop):
             # build_trace path can be verified on a live run. agent_data.messages
             # is captured BEFORE the hint turn below is appended -- i.e. exactly
             # what the selector saw. No-op unless HPRL_SELECTOR_DUMP_DIR is set;
-            # covers both successful and failed (non-dict) selections.
+            # covers successful, failed (non-dict), AND pool-exhausted (no selector
+            # call -- selection/raw/err all None, candidate_hints_str empty) calls.
             _dump_selector_call(
                 {
                     "request_id": getattr(agent_data, "request_id", None),
                     "call_index": call_index,
                     "strategy": self.hint_strategy,
+                    "step_exclude_mode": self.step_exclude_mode,
+                    "pool_exhausted": pool_exhausted,
                     "budget": budget,
                     # per-call selector round-trip latency (s); summed across calls
                     # into extra_fields["hint_select_time"] for the wandb metric.

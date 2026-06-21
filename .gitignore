@@ -38,3 +38,20 @@ selector/**/*.json
 selector/**/**/*.json
 
 dataset/
+
+# --- large / generated artifacts (regenerable, multi-GB; never commit) ---
+# merged checkpoint weights + tokenizers (each shard ~4.7GB)
+eval/merged/
+# eval sample dumps (samples.jsonl, tens of MB each)
+eval/results/
+# selector hint-selection test/label outputs (incl. results.jsonl aggregates)
+selector/test_cite/results/
+selector/test_cite/.codex_label_sessions/
+selector/test_cite/gpt_oss_eval/results/
+selector/test_cite/gpt_oss_eval/logs/
+# catch-all for large model-weight / binary artifacts anywhere in the tree
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+*.gguf

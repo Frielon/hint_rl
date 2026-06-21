@@ -147,6 +147,34 @@ item in batch` stop early and that dropping mismatched keys restores full iterat
 (`test_kpack_real_verl.py`). Next launch's log line "rollout dump: non_tensor keys with len != batch
 len" will name the key for a root fix; immediate workaround is to unset `rollout_data_dir`.
 
+**k-pack training CONFIRMED working on the cluster (run `…-20260614-004248`).** Step 1 logged healthy
+metrics — `hprl/n_problems:128`, `hprl/kpack_num_probed:90`, `hprl/kpack_num_ratcheted:5`,
+`hprl/budget_mean:2.82` (min 0/max 5), normal `pg_loss`/`grad_norm` — and rollout dumps for steps
+1–10 wrote fine. The only failure is the rollout dump at a LATER (resumed) step: a STRUCTURAL
+non_tensor key (NOT a reward key — the dumped columns are all per-rollout reward keys) goes short
+data-dependently. The crashed job was a RESUME (ray session 07:41) that ran PRE-fix code (the
+traceback shows the un-wrapped `_log_rollout_data` super() call propagating uncaught). Also added a
+`_shutdown_dump_executor` override (backstop): verl re-raises a failed background dump there too
+(ray_trainer.py:1399/1758/1770), OUTSIDE `_log_rollout_data`, so a dump error at shutdown/checkpoint
+could still crash — now swallowed+logged. Net: a relaunch/resume on the live code self-heals the dump
+and names the short key.
+
+**Correction + real root cause of the CRASH (runs `…-020140`).** Two earlier theories were wrong:
+(1) the short column is NOT a non_tensor key — the live run printed no `mism`, so dropping non_tensor
+keys can't help; (2) "self-heal" was insufficient. The actual reason the JOB DIES is a verl bug in
+the background-dump executor: `_dump_generations` re-raises a failed background write via `f.result()`
+and then SKIPS clearing `self._dump_futures` (the clear line is after the raise) — so the SAME failed
+write re-raises on EVERY subsequent step (caught by my `_log_rollout_data` guard, hence the repeated
+"rollout dump failed" prints + an 8-deep nested `_log_rollout_data→_dump_generations→f.result()`
+traceback) and ultimately propagates UNCAUGHT at shutdown. Fix: override `_dump_generations` to swallow
+the surfaced error AND **purge all DONE futures** so a bad write can never re-surface (standalone repro:
+verl re-raises 5/5 steps; override → 0 uncaught). The dump is now genuinely non-fatal regardless of WHY
+a write fails. Replaced the non_tensor-only check with a full **`dumplens` diagnostic** that prints
+EVERY dump column's length (tensor + non_tensor + reward) each step (`DUMP LEN MISMATCH` when one is
+off) — the next run will finally NAME the short column for a root fix. The short column itself (why the
+write fails) is still unidentified — offline repros are all length-consistent; it's data-dependent on
+the cluster.
+
 
 ## 2026-06-13 (h) — k-pack counterfactual-probe budget ratchet (built)
 
@@ -1150,9 +1178,22 @@ verl only auto-aggregates `reward_extra_info` to wandb on the **validation** pat
 signals must be emitted explicitly by `hint_budget_callback` (which already builds
 the `hprl/*` scalars). Added:
 
-- **`hprl/active_learning_frac`** — fraction of prompt-groups with BOTH a correct
-  and an incorrect rollout (`0 < C < N`); the groups GRPO actually learns a
-  correctness contrast from. Plus `hprl/num_active_learning`.
+- **`hprl/active_learning_frac`** — fraction of *problems* (pooled across packs) with
+  BOTH a correct and an incorrect rollout (`0 < C < N`). Plus `hprl/num_active_learning`.
+  **Caveat under k-pack:** this POOLS a problem's packs, so it counts a problem active
+  even when its correct & wrong rollouts live in different packs (one pack all-correct,
+  another all-wrong) — a contrast GRPO never sees, since advantages are normalized
+  WITHIN each uid (pack). It is therefore an upper bound on the correctness signal GRPO
+  trains on. The two views below are the GRPO-honest versions:
+- **`hprl/active_learning_frac_packwise`** — fraction of *packs* (uids = GRPO groups)
+  whose own rollouts span correct & wrong. Denominator is the pack count
+  (`hprl/num_packs`, ≈ `k × n_problems`); plus `hprl/num_active_packs`. This is the
+  true rate at which a GRPO group carries a correctness contrast.
+- **`hprl/active_learning_frac_anypack`** — fraction of *problems* with AT LEAST ONE
+  internally-mixed pack (the real per-problem learnability). Always
+  `≤ active_learning_frac`; equals it with k-pack off (one uid per problem). Plus
+  `hprl/num_active_learning_anypack`. The gap `active_learning_frac − _anypack` is the
+  share of problems whose pooled contrast is a split-pack artifact GRPO can't use.
 - **`hprl/hint_shape_sum_mean_hinted`** — coeff-free shortfall sum averaged over
   rollouts that applied a hint. **The front-loading curve to watch** (should fall
   toward 0). Plus `hprl/hint_shape_sum_mean` (all rollouts) and

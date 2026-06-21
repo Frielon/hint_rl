@@ -93,7 +93,12 @@ class HintRewardManager(RewardManagerBase):
         # Same for the per-rollout selector latency (total seconds / #calls) and the
         # box-then-call counters; passed through so hint_budget_callback can log
         # hprl/hint_select_time_* and hprl/hint_call_with_box_*.
-        for k in ("hint_select_time", "hint_select_calls", "hint_calls_total", "hint_calls_with_box"):
+        for k in (
+            "hint_select_time", "hint_select_calls", "hint_calls_total",
+            "hint_calls_with_box", "hint_pool_exhausted",
+            # finalize_incorrect: the WRONG-rollout-as-correct signal + the stuck hint k.
+            "finalized_incorrect", "final_hint_step", "final_hint_id", "final_hint_exhausted",
+        ):
             if k not in extra_info and k in ntb:
                 extra_info[k] = _to_py(ntb.get(k))
 

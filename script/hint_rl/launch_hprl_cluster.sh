@@ -119,7 +119,7 @@ export SELECTOR_MAX_RETRIES=${SELECTOR_MAX_RETRIES:-3}
 # prior run before this pod binds its ports, preventing the EADDRINUSE bring-up
 # failure (run v3-20260611-150247 -> 173707). Set to 1 to skip the reap entirely
 # (e.g. when you KNOW the nodes are clean, or to avoid touching co-located procs).
-HPRL_SKIP_PRELAUNCH_CLEAN=${HPRL_SKIP_PRELAUNCH_CLEAN:-1}
+HPRL_SKIP_PRELAUNCH_CLEAN=${HPRL_SKIP_PRELAUNCH_CLEAN:-0}
 
 # NOTE: the per-launch selector-endpoint rendezvous DIR (RDV_DIR) is defined
 # below, AFTER JOB_STAMP -- it is keyed on the shared per-launch stamp so a

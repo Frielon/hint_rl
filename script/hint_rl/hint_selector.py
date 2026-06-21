@@ -24,6 +24,47 @@ from typing import Any, Optional
 from utils import selector_prompt, hint_id_of, parse_output
 
 
+# Major-step exclusion mode for the selector prompt -- i.e. which already-revealed
+# major steps are dropped from the candidate pool before the NEXT selector call.
+# Only meaningful under the major_step strategy. Selected by the agent loop
+# (data.hprl.step_exclude_mode / env HPRL_STEP_EXCLUDE_MODE).
+#   STEP_EXCLUDE_APPLIED    -- drop only the steps actually revealed so far
+#                              (``exclude_applied_steps``); the default.
+#   STEP_EXCLUDE_CUMULATIVE -- drop EVERY step id <= the latest revealed step
+#                              (``exclude_steps_through_latest``); forces the
+#                              selector strictly forward (no re-offering an earlier step).
+STEP_EXCLUDE_APPLIED = "applied"
+STEP_EXCLUDE_CUMULATIVE = "cumulative"
+_CUMULATIVE_ALIASES = {
+    "cumulative", "prefix", "through_latest", "thru_latest", "upto", "up_to", "leq", "le",
+}
+
+
+def normalize_step_exclude_mode(mode) -> str:
+    """Canonicalize a step-exclude mode to ``STEP_EXCLUDE_CUMULATIVE`` or, by default,
+    ``STEP_EXCLUDE_APPLIED`` (anything not a known cumulative alias)."""
+    s = str(mode or "").strip().lower()
+    return STEP_EXCLUDE_CUMULATIVE if s in _CUMULATIVE_ALIASES else STEP_EXCLUDE_APPLIED
+
+
+def _step_num(value) -> Optional[int]:
+    """Best-effort integer value of a (major) step id, for ordering.
+
+    Step ids are small integers: the pool's ``step_id`` and the string form of the
+    selector's ``major_step_id`` recorded on the rollout state (e.g. ``"5"``). Mirrors
+    ``step_id_of``: take the part before any dot and ``int()`` it. Returns None when
+    the id can't be read as a number (such ids are treated as un-orderable -- the
+    cumulative filter keeps them rather than guess).
+    """
+    if value is None:
+        return None
+    head = str(value).strip().split(".")[0]
+    try:
+        return int(head)
+    except (TypeError, ValueError):
+        return None
+
+
 def exclude_applied_hints(hints_obj, applied: list[dict]) -> str:
     """Return the hint pool as a JSON string with already-applied hints removed.
 
@@ -72,6 +113,69 @@ def exclude_applied_steps(hints_obj, applied: list[dict]) -> str:
 
     new_steps = [s for s in pool.get("steps", []) if str(s.get("step_id")) not in used_steps]
     return json.dumps({**pool, "steps": new_steps}, ensure_ascii=False)
+
+
+def exclude_steps_through_latest(hints_obj, applied: list[dict]) -> str:
+    """Return the hint pool with every MAJOR STEP up to and INCLUDING the latest
+    revealed one removed -- a *cumulative* (prefix) variant of ``exclude_applied_steps``.
+
+    Where ``exclude_applied_steps`` drops only the steps that were actually revealed,
+    this drops EVERY step whose ``step_id`` is <= the highest ``major_step_id`` revealed
+    so far: once the selector has revealed step 5, steps 1..5 are all removed and only
+    steps 6, 7, ... remain as candidates. The premise is monotonic progress -- a student
+    given step 5 is past steps 1-5 -- so the selector is forced strictly forward instead
+    of being free to re-offer an earlier step. (Because each successive pick is then
+    necessarily a higher step, the "latest" revealed step is also the highest, so the
+    threshold never moves backward.) Steps with an unparseable id are kept (they can't be
+    ordered). On any parse problem the pool is passed through unfiltered.
+    """
+    threshold: Optional[int] = None
+    for h in applied:
+        n = _step_num(h.get("major_step_id")) if isinstance(h, dict) else None
+        if n is not None and (threshold is None or n > threshold):
+            threshold = n
+
+    try:
+        pool = json.loads(hints_obj) if isinstance(hints_obj, str) else hints_obj
+    except Exception:  # noqa: BLE001 -- malformed pool: pass it through unfiltered
+        return hints_obj if isinstance(hints_obj, str) else json.dumps(hints_obj, ensure_ascii=False)
+
+    if threshold is None or not isinstance(pool, dict) or "steps" not in pool:
+        return pool if isinstance(pool, str) else json.dumps(pool, ensure_ascii=False)
+
+    new_steps = []
+    for s in pool.get("steps", []):
+        n = _step_num(s.get("step_id"))
+        if n is None or n > threshold:  # keep un-orderable ids + strictly-later steps
+            new_steps.append(s)
+    return json.dumps({**pool, "steps": new_steps}, ensure_ascii=False)
+
+
+def pool_is_exhausted(hints_str) -> bool:
+    """True when the (post-exclusion) candidate pool has no hint left to offer.
+
+    The selector prompt lists candidates as major steps each carrying a ``hints``
+    list; once exclusion has removed every step (or emptied every step's hints)
+    there is nothing for the selector to pick. Detecting this lets the agent loop
+    skip a pointless -- and re-offer-prone -- selector round-trip and inject the
+    "no hint available" turn directly. This is the common terminal state of the
+    cumulative step-exclude mode (once the latest/highest step is revealed the pool
+    is empty), but it also happens in any mode when the budget outlasts the pool.
+
+    A pool that can't be PARSED is treated as NOT exhausted: that's a malformed/empty
+    pool (a config issue), distinct from "ran out of hints" -- fall through to the
+    normal selector path and its existing failure handling rather than masking it.
+    """
+    try:
+        pool = json.loads(hints_str) if isinstance(hints_str, str) else hints_str
+    except Exception:  # noqa: BLE001 -- unparseable pool: not the exhausted case
+        return False
+    if not isinstance(pool, dict) or "steps" not in pool:
+        return False
+    for s in pool.get("steps", []):
+        if isinstance(s, dict) and s.get("hints"):
+            return False  # a step with >=1 candidate hint remains -> not exhausted
+    return True
 
 
 def hints_for_step(hints_obj, step_id) -> list[dict]:

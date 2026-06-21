@@ -263,11 +263,67 @@ def test_callback_ratchet():
         chk_true("callback: no kpack metric when off", "hprl/kpack_num_probed" not in m)
 
 
+def test_callback_active_learning_variants():
+    print("hint_budget_callback active-learning views (pooled vs pack-wise vs any-pack):")
+    import os as _os
+    import tempfile
+
+    from budget_manager import BudgetManager
+    from hint_budget_callback import hprl_update_budgets
+
+    # 3 problems, k=2 packs each (2 rollouts/pack). The split-pack case is the whole point:
+    #   pX: pack x0 all-correct, pack x1 all-wrong  -> pool mixed, but NO pack internally mixed
+    #   pY: pack y0 mixed (1c/1w), pack y1 all-correct -> pool mixed AND one pack mixed
+    #   pZ: both packs all-correct -> not active anywhere
+    rows_ei = [
+        _ei("pX", 5), _ei("pX", 5), _ei("pX", 4), _ei("pX", 4),
+        _ei("pY", 5), _ei("pY", 5), _ei("pY", 4), _ei("pY", 4),
+        _ei("pZ", 5), _ei("pZ", 5), _ei("pZ", 4), _ei("pZ", 4),
+    ]
+    uid = ["x0", "x0", "x1", "x1", "y0", "y0", "y1", "y1", "z0", "z0", "z1", "z1"]
+    acc = [1, 1, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1]
+    ntb = {
+        "extra_info": _obj_arr(rows_ei),
+        "acc": np.array(acc, dtype=float),
+        "num_hints": np.zeros(len(acc)),  # irrelevant to the active-learning metrics
+        "uid": _obj_arr(uid),
+    }
+
+    with tempfile.TemporaryDirectory() as d:
+        bm = BudgetManager(_os.path.join(d, "s.json"), default_budget=8)
+        for p in ("pX", "pY", "pZ"):
+            bm.set(p, 5)
+        m = hprl_update_budgets(_MockBatch(ntb), bm, global_step=1, kpack_cfg={"enable": True})
+
+    # pooled (existing): pX & pY mixed once packs are pooled, pZ not -> 2/3.
+    chk_true("pooled active_learning_frac = 2/3", abs(m["hprl/active_learning_frac"] - 2 / 3) < 1e-9)
+    # pack-wise: only y0 is internally mixed; 6 packs total -> 1/6.
+    chk("num_packs = 6", m["hprl/num_packs"], 6.0)
+    chk("num_active_packs = 1", m["hprl/num_active_packs"], 1.0)
+    chk_true("packwise frac = 1/6", abs(m["hprl/active_learning_frac_packwise"] - 1 / 6) < 1e-9)
+    # any-pack (real per-problem): only pY has a mixed pack -> 1/3. pX (split packs) is NOT counted.
+    chk("num_active_learning_anypack = 1", m["hprl/num_active_learning_anypack"], 1.0)
+    chk_true("anypack frac = 1/3", abs(m["hprl/active_learning_frac_anypack"] - 1 / 3) < 1e-9)
+    # the split-pack problem (pX) inflates the pooled view but not the honest ones.
+    chk_true("anypack <= pooled", m["hprl/active_learning_frac_anypack"] <= m["hprl/active_learning_frac"])
+
+    # no uid (legacy / validation batch) -> pack-wise metrics are simply absent, no crash.
+    ntb_no_uid = {k: v for k, v in ntb.items() if k != "uid"}
+    with tempfile.TemporaryDirectory() as d:
+        bm = BudgetManager(_os.path.join(d, "s.json"), default_budget=8)
+        for p in ("pX", "pY", "pZ"):
+            bm.set(p, 5)
+        m2 = hprl_update_budgets(_MockBatch(ntb_no_uid), bm, global_step=1, kpack_cfg={"enable": True})
+    chk_true("no uid -> no packwise metric", "hprl/active_learning_frac_packwise" not in m2)
+    chk_true("no uid -> pooled still present", "hprl/active_learning_frac" in m2)
+
+
 def main():
     test_rerender()
     test_render_variant_rows_no_source_mutation()
     test_end_to_end_split()
     test_callback_ratchet()
+    test_callback_active_learning_variants()
     print("all kpack expansion tests passed.")
 
 

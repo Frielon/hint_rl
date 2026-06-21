@@ -1,0 +1,3 @@
+# generated test outputs and server logs -- keep the scripts, ignore the results
+results/
+logs/

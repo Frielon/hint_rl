@@ -146,6 +146,49 @@ _V4 = _edit(
 
 
 # --------------------------------------------------------------------------- #
+# v5: v2 + per-SUBSTEP verbatim citations (user idea 2026-06-16). v4 cited at
+# major-step granularity -- one quote can hand-wave a whole multi-substep step.
+# Each major step is broken into substep_hints (X.1, X.2, ...); v5 forces the
+# selector to cite the student's own words for EVERY substep that precedes the
+# selected hint_id (all substeps of earlier major steps + the earlier substeps
+# of the selected step). Finer-grained, harder to skip-ahead, machine-checkable
+# at the substep level by the same substring/student-only logic as v4.
+# --------------------------------------------------------------------------- #
+_V5_CITE_RULE = """### Cite your evidence for every passed substep
+The candidate hints break each major step into ordered substeps (`X.1`, `X.2`,
+...). The substep you select is the earliest one the student has NOT yet carried
+out; every substep that comes before it -- across all earlier major steps AND
+the earlier substeps of your selected step -- is therefore one the student must
+already have done in their own writing.
+
+For EACH such passed substep you must QUOTE the student's own words that carry
+it out: an exact, verbatim excerpt (roughly 10-200 characters) copied
+character-for-character from the student's writing in the trace. Text inside a
+`[hint given]` block is the tutor's, not the student's -- quoting it does not
+count. Paraphrases do not count. List one entry per passed substep, in order, in
+the `completed_substeps` array of your output. If you cannot produce a verbatim
+student quote for some earlier substep, the student has NOT passed it -- select
+that substep instead. An empty `completed_substeps` array means you selected the
+earliest substep of the first major step.
+
+"""
+
+_A_HINT_ID = '"hint_id": <hint_id of the selected hint>,'
+
+_V5 = _edit(_V2, _A_GUARD, _V5_CITE_RULE + _A_GUARD)
+_V5 = _edit(
+    _V5,
+    _A_MAJOR_ID,
+    '"completed_substeps": [{"hint_id": <id of a substep_hint before your selection, e.g. "1.1">, '
+    '"quote": <verbatim excerpt from the student\'s own writing that carries out this substep>, '
+    '"why": <one line: why this excerpt carries out this substep>}, ...] '
+    '(one entry for EVERY substep_hint that precedes your selected hint_id, across all earlier '
+    'major steps and the earlier substeps of your selected step; [] if you selected the earliest substep),\n'
+    '  ' + _A_MAJOR_ID,
+)
+
+
+# --------------------------------------------------------------------------- #
 # registry
 # --------------------------------------------------------------------------- #
 VARIANTS: Dict[str, Variant] = {
@@ -169,6 +212,9 @@ VARIANTS: Dict[str, Variant] = {
     "v4_cite": Variant(
         "v2 + machine-checkable verbatim citations of student work per completed step",
         "trace_full", _fill(_V4)),
+    "v5_substep_cite": Variant(
+        "v2 + verbatim student citation per PASSED SUBSTEP (finer than v4's per-step)",
+        "trace_full", _fill(_V5)),
 }
 
 

@@ -52,6 +52,25 @@ data:
     #                   penalty directly (hint_penalty.applied_step_penalty).
     strategy: hint
 
+    # which already-revealed major steps the NEXT selector prompt drops from the
+    # candidate pool (major_step strategy only; agent-loop side, no reward effect):
+    #   "applied"    -> drop only the steps actually revealed so far (default;
+    #                   hint_selector.exclude_applied_steps).
+    #   "cumulative" -> drop EVERY step id <= the latest revealed step -- once step 5
+    #                   is revealed, steps 1..5 are removed and only 6, 7, ... remain,
+    #                   forcing the selector strictly forward
+    #                   (hint_selector.exclude_steps_through_latest).
+    step_exclude_mode: cumulative
+
+    # finalize_incorrect: when a rollout ends on an answer turn (no <hint_call/>), the
+    # agent loop grades it; if WRONG, it makes ONE final selector call to find the hint
+    # the student still needs, and the reward scores the rollout as "correct but consuming
+    # the hints from there to the end" (hint_reward.compute_score +
+    # hint_penalty.penalty_from_k). MUST be matched by
+    # custom_reward_function.reward_kwargs.finalize_incorrect. Adds a blocking selector
+    # call per INCORRECT rollout when on. false -> ordinary incorrect scoring.
+    finalize_incorrect: true
+
     # ---- k-pack counterfactual-probe ratchet ("double-rollout" / k-pack) ----------
     # Measure (don't infer) whether one fewer hint would still solve a problem: split
     # EVERY problem's rollout.n rollouts into k packs of rollout.n/k, each FORCED to a

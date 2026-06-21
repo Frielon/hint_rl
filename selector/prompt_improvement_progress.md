@@ -122,6 +122,59 @@ Citation audit (`analyze_citations.py`):
 - Side benefit: the structured `completed_steps` field stabilizes the output
   format — parse failures drop 11.2% → 2.5% (T=0.7) and to 0 at T=0.1.
 
+### Round 4 — substep-level citations, `v5_substep_cite` (tags `round4_substep`, `round4_substep_lowtemp`)
+
+Motivation (user, 2026-06-16): v3 cited at **major-step** granularity — one quote
+can hand-wave a whole multi-substep step, and the user found that contract not
+robust. v5 pushes the citation down to the **substep**: the candidate hints break
+each major step into ordered substeps (`X.1`, `X.2`, ...); to select hint_id `S.j`
+the selector must produce a verbatim student quote for EVERY substep that precedes
+it — all substeps of earlier candidate major steps **and** the earlier substeps of
+the selected step — in a `completed_substeps` JSON array. Same v2 base as v4, so
+v4 vs v5 is a clean head-to-head.
+
+Variant: `v5_substep_cite` = v2_final_gate + "Cite your evidence for every passed
+substep" section + `completed_substeps` output field (`prompt_variants.py`).
+Validation + enforcement at substep granularity: `analyze_substep_citations.py`
+(clamp the pick to the MAJOR step of the earliest substep lacking a valid_student
+quote). **v4_cite and v5_substep_cite were run on the SAME sampled rows** (seed 0),
+so the two columns are directly comparable within each temperature.
+
+| run | variant | n | T | fail_last | + enforcement | pick_expected (→ enforced) | parse_fail | mean_tok |
+|---|---|---|---|---|---|---|---|---|
+| round4_substep | v4_cite | 240 | 0.7 | 3.9% | 1.7% | 94.4% → 97.0% | 8/240 | 1114 |
+| round4_substep | **v5_substep_cite** | 240 | 0.7 | **2.6%** | **0.0%** | 96.1% → 98.7% | 6/240 | 1276 |
+| round4_substep_lowtemp | v4_cite | 120 | 0.1 | 2.5% | 0.8% | 95.8% → 98.3% | 0/120 | 1154 |
+| round4_substep_lowtemp | **v5_substep_cite** | 120 | 0.1 | **2.5%** | **0.0%** | 91.7% → 95.0% | 0/120 | 1307 |
+
+(Note: v4's raw fail_last here, 3.9% @0.7 / 2.5% @0.1, runs below its round-3
+numbers, 6.4% / 4.2% — same rows but a fresh T-sampled draw; treat the within-run
+v4-vs-v5 deltas as the signal, not cross-round absolute rates.)
+
+Substep-citation audit (`analyze_substep_citations.py`):
+- **Enforcement drives v5's unearned reveal to exactly 0 at BOTH temperatures**
+  (0/233 @0.7, 0/120 @0.1) vs v4's 1.7% / 0.8%. The mechanism: **none** of v5's
+  skip-ahead picks were fully cited with valid student quotes (0/9 @0.7, 0/5 @0.1),
+  so every skip-ahead gets clamped. v4 still let "fully cited+valid" skip-aheads
+  through (4/10 @0.7, 1/4 @0.1) — the genuinely-earned-looking ones plus the
+  occasional convincing fabrication.
+- Why the finer granularity is harder to game: a skip now needs a clean quote for
+  *each* intervening substep, not one quote per major step. When the model does try
+  to justify a skip, it fabricates — substep quotes on skip-aheads are almost all
+  `fabricated` (6/7 @0.7, 6/7 @0.1) and the substring check catches all of them.
+- Trade-off: v5 is slightly more conservative in RAW form — at T=0.1 its raw
+  pick_expected drops to 91.7% (more non-last `other` picks) vs v4's 95.8%; after
+  enforcement it's 95.0% vs 98.3%. v5 trades a little raw expected-anchoring for a
+  zero unearned-reveal rate. Costs ~150 more completion tokens/call than v4.
+- Parse robustness holds: `completed_substeps` keeps the structured output (6/240
+  @0.7, 0/120 @0.1), on par with v4.
+
+Round-4 read: **v5_substep_cite ≥ v4_cite on every axis that matters for the target
+failure** — equal-or-lower raw fail_last and, decisively, enforced fail_last 0% at
+both temperatures because the substep contract leaves no fully-citable unearned
+skip. The cost is a touch more conservatism and ~150 tok/call. v5 supersedes v4 as
+the recommended prompt + enforcement guard.
+
 ## Findings
 
 - **The deployed failures are stochastic, not deterministic**: replaying the same
@@ -153,36 +206,45 @@ Citation audit (`analyze_citations.py`):
 - Parse failures (all variants, 3–12%) are "no <output> block" with finish=stop;
   production's 3-attempt retry in `HintSelector.select` absorbs most of them.
 
-## Conclusion (2026-06-10, updated 2026-06-11 after Round 3)
+## Conclusion (2026-06-10, updated 2026-06-11 after Round 3, 2026-06-16 after Round 4)
 
-Winner: **`v4_cite`** (v2's rules + machine-checkable verbatim citations,
-user-proposed design) **+ citation enforcement in the loop**. Unearned
-final-step reveal rate on real failure cases:
+Winner: **`v5_substep_cite`** (v2's rules + machine-checkable verbatim citations
+at **substep** granularity, user-proposed 2026-06-16) **+ substep-citation
+enforcement in the loop**. It supersedes `v4_cite` (per-major-step citations):
+on the same rows, v5 has equal-or-lower raw fail_last and, decisively, drives the
+**enforced** unearned-reveal rate to **0% at both temperatures** (v4: 1.7% / 0.8%)
+because no skip-ahead can produce a fully valid substep citation chain.
+
+Unearned final-step reveal rate on real failure cases:
 
 | condition | fail_last (T=0.7 / T=0.1) |
 |---|---|
 | deployed (blind trace, deployed prompt) | 32.1% / – |
 | trace fix only (deployed prompt) | 22.6% / 16.1% |
 | v2_final_gate prompt | 9.4% / 7.0% |
-| **v4_cite prompt** | **6.4% / 4.2%** |
-| **v4_cite + citation enforcement** | **3.0% / 0.8%** |
+| v4_cite prompt | 6.4% / 4.2%  (round3); 3.9% / 2.5% (round4, same rows as v5) |
+| v4_cite + per-step enforcement | 3.0% / 0.8% (round3); 1.7% / 0.8% (round4) |
+| **v5_substep_cite prompt** | **2.6% / 2.5%** |
+| **v5_substep_cite + per-substep enforcement** | **0.0% / 0.0%** |
 
 Recommended production config, in order of importance:
 1. **Fix the blind-trace bug** in `hint_agent_loop._handle_generating_state`
    (append the decoded assistant turn to `agent_data.messages`) — all full-trace
    gains assume it.
-2. **Adopt the v4_cite prompt** (template in `prompt_variants.py`; extra
-   `completed_steps` JSON field is ignored by the current loop, so it is a
-   drop-in for `utils.selector_prompt`).
-3. **Citation-enforcement guard in `_record_major_step`**: for a pick that skips
-   earlier unrevealed steps, substring-validate each `completed_steps` quote
-   against the student-only trace (logic in `analyze_citations.py`:
-   `student_only`/`classify_quote`); on any missing/fabricated/hint-only quote,
-   clamp the pick to the earliest unproven step. Deterministic, no extra model
-   calls — turns the justification into a contract.
-4. **Lower `SELECTOR_TEMPERATURE` 0.7 → 0.1** — fail_last 3.0% → 0.8% with
-   enforcement, and parse failures hit 0 (v4's structured output already cuts
-   them 11.2% → 2.5% at T=0.7).
+2. **Adopt the v5_substep_cite prompt** (template in `prompt_variants.py`; extra
+   `completed_substeps` JSON field is ignored by the current loop, so it is a
+   drop-in for `utils.selector_prompt`). v4_cite is the fallback if the extra
+   ~150 tok/call or the slight raw-conservatism (lower raw pick_expected at T=0.1)
+   is a concern — but enforcement makes v5 strictly safer on the target failure.
+3. **Substep-citation-enforcement guard in `_record_major_step`**: for a pick that
+   skips earlier unrevealed substeps, substring-validate each `completed_substeps`
+   quote against the student-only trace (logic in `analyze_substep_citations.py`:
+   reuses `student_only`/`classify_quote`); on any earlier substep missing a
+   valid_student quote, clamp the pick to the MAJOR step of the earliest unproven
+   substep. Deterministic, no extra model calls — turns the justification into a
+   contract, now at substep resolution.
+4. **Lower `SELECTOR_TEMPERATURE` 0.7 → 0.1** — both v4 and v5 already hit 0
+   parse failures at T=0.1; v5's enforced fail_last is 0% at either temperature.
 
 ## Status / next steps
 
@@ -193,8 +255,12 @@ Recommended production config, in order of importance:
 - [x] Round 3: v4_cite (citation-grounded, user design) → 6.4%/4.2%; with
       enforcement 3.0%/0.8% — new winner, supersedes v2 + the blanket
       last-step-refusal guard idea (citation guard is finer-grained)
-- [ ] Apply to production: blind-trace fix; v4_cite into `utils.selector_prompt`;
-      citation-enforcement guard in `_record_major_step`; temp 0.1
+- [x] Round 4: v5_substep_cite (per-substep citations, user design 2026-06-16) vs
+      v4 on identical rows → 2.6%/2.5% raw, **0.0%/0.0% enforced** (v4: 1.7%/0.8%);
+      new winner — substep contract leaves no fully-citable unearned skip
+      (`analyze_substep_citations.py`)
+- [ ] Apply to production: blind-trace fix; v5_substep_cite into `utils.selector_prompt`;
+      substep-citation-enforcement guard in `_record_major_step`; temp 0.1
 - [ ] Optional: re-test `spamwalk_last` rows under a marked-revealed-steps protocol
       (needs `hints_full` + re-anchoring rules; parquet already carries the columns)
 
@@ -641,4 +707,39 @@ Return a single JSON object wrapped in <output> tags. `hint_id` is the id of the
   "hint": <the selected hint text, rephrased per step 3 if necessary>
 }
 </output>
+````
+
+### Template F — `v5_substep_cite` (`{{trace}}` = `trace_full`) — WINNER after Round 4
+
+Template C + a **per-SUBSTEP** "Cite your evidence" section (replacing v4's
+per-major-step one) inserted before "### Guard the final step", and a
+`completed_substeps` field added to the output JSON (before `major_step_id`).
+The cited quotes are machine-checkable at substep resolution; see
+`analyze_substep_citations.py` for validation + enforcement. Only the citation
+section and the output field differ from Template E; the rest is identical.
+Citation section as sent:
+
+````text
+### Cite your evidence for every passed substep
+The candidate hints break each major step into ordered substeps (`X.1`, `X.2`,
+...). The substep you select is the earliest one the student has NOT yet carried
+out; every substep that comes before it -- across all earlier major steps AND
+the earlier substeps of your selected step -- is therefore one the student must
+already have done in their own writing.
+
+For EACH such passed substep you must QUOTE the student's own words that carry
+it out: an exact, verbatim excerpt (roughly 10-200 characters) copied
+character-for-character from the student's writing in the trace. Text inside a
+`[hint given]` block is the tutor's, not the student's -- quoting it does not
+count. Paraphrases do not count. List one entry per passed substep, in order, in
+the `completed_substeps` array of your output. If you cannot produce a verbatim
+student quote for some earlier substep, the student has NOT passed it -- select
+that substep instead. An empty `completed_substeps` array means you selected the
+earliest substep of the first major step.
+````
+
+Output field (replaces v4's `completed_steps`, before `major_step_id`):
+
+````text
+  "completed_substeps": [{"hint_id": <id of a substep_hint before your selection, e.g. "1.1">, "quote": <verbatim excerpt from the student's own writing that carries out this substep>, "why": <one line: why this excerpt carries out this substep>}, ...] (one entry for EVERY substep_hint that precedes your selected hint_id, across all earlier major steps and the earlier substeps of your selected step; [] if you selected the earliest substep),
 ````

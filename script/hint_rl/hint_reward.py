@@ -45,7 +45,9 @@ from hint_penalty import (
     STRATEGY_MAJOR_STEP,
     applied_penalty,
     applied_step_penalty,
+    no_hint_penalty,
     normalize_strategy,
+    penalty_from_k,
 )
 
 # Sentinel returned by extract_boxed_content when nothing is boxed.
@@ -182,6 +184,8 @@ def compute_score(
     hint_guidance_difficulty: str = DEFAULT_GUIDANCE_DIFFICULTY,
     hint_strategy: str = STRATEGY_HINT,
     hint_shape_coeff: float = 0.0,
+    no_hint_penalty_factor: float = 0.1,
+    finalize_incorrect: bool = False,
     budget_exceeded_reward: Optional[float] = None,
     **kwargs,
 ) -> dict:
@@ -220,6 +224,32 @@ def compute_score(
     never reached -- so the policy learns to emit a minimal CoT then a hint for a free
     reward. 0 disables.
 
+    ``no_hint_penalty_factor`` (default 0.1) prices a "no hint available" hint call --
+    a ``<hint_call/>`` the loop could not serve because the candidate pool was exhausted
+    (``extra_info["hint_pool_exhausted"]``, the common terminal state of cumulative
+    step-exclude). Each such call costs ``factor`` x the MINIMUM major-step penalty in
+    the pool (factor 0.1, min step penalty 0.2 -> 0.02 per call; see
+    hint_penalty.no_hint_penalty), summed over the rollout's exhausted calls. Like the
+    other hint penalties it is subtracted from the CORRECT reward only (and is subject
+    to the same ``correct_floor``, so it bites only while the served-hint penalty hasn't
+    already floored the score). 0 disables it.
+
+    ``finalize_incorrect`` (default False) changes how a WRONG answer is scored: instead
+    of ``incorrect_reward`` + hint-call bonus, it is viewed as CORRECT but having to consume
+    every remaining hint from where it got stuck to the end. The agent loop (with the
+    matching ``data.hprl.finalize_incorrect``) grades the answer and, when wrong, probes the
+    selector once for that stuck hint ``k`` (``extra_info["final_hint_step"]``/
+    ``["final_hint_id"]``, or ``["final_hint_exhausted"]`` when the pool is empty). The score
+    is ``correct_reward (+ format_reward if well-formed) - penalty(applied) -
+    penalty_from_k(k..last) - no_hint_penalty`` with ``acc`` still 0 (the answer is wrong --
+    GRPO filtering and the budget ratchet are unaffected). It uses the SAME correct base a
+    solved rollout gets (correct_reward + format_reward), so a well-formed wrong answer is
+    not docked the format bonus. It only applies to rollouts the loop actually finalized
+    (``extra_info["finalized_incorrect"]``); a wrong rollout that bypassed finalize (e.g. a
+    hard length/turn cap) keeps the ordinary incorrect scoring. No shape penalty or floor is
+    applied to this branch; with ``hint_penalty_total < correct_reward`` the score stays in
+    ``[correct_reward - total_penalty, correct_reward + format_reward]``.
+
     ``budget_exceeded_reward`` (default ``None`` -> ``incorrect_reward``) is the FLOOR
     score assigned when the agent loop flags an OVER-BUDGET hint call
     (``extra_info["hint_budget_exceeded"]``): the policy emitted ``<hint_call/>`` after
@@ -235,6 +265,11 @@ def compute_score(
     """
     extra_info = extra_info or {}
 
+    # Defensive: a reward_kwarg may arrive as the string "false"/"true" rather than a
+    # bool (non-empty "false" is truthy -> would silently ENABLE the option). Coerce.
+    if isinstance(finalize_incorrect, str):
+        finalize_incorrect = finalize_incorrect.strip().lower() in {"1", "true", "yes", "y", "on"}
+
     # --- per-rollout state recorded by the agent loop --------------------
     applied_hints = extra_info.get("applied_hints") or []
     # Defensive: applied_hints may arrive as a numpy 0-d object; normalize.
@@ -248,6 +283,14 @@ def compute_score(
     hint_call_failed = extra_info.get("hint_call_failed", 0)
     if hasattr(hint_call_failed, "item"):
         hint_call_failed = hint_call_failed.item()
+
+    # Count of "no hint available" calls: <hint_call/>s the loop could not serve
+    # because the candidate pool was exhausted (every hint already surfaced -- the
+    # common terminal state of cumulative step-exclude). Distinct from hint_call_failed
+    # (a selector outage). Prices the no-hint penalty below. Normalized (numpy 0-d safe).
+    hint_pool_exhausted = extra_info.get("hint_pool_exhausted", 0)
+    if hasattr(hint_pool_exhausted, "item"):
+        hint_pool_exhausted = hint_pool_exhausted.item()
 
     # Selector latency recorded by the agent loop: total seconds spent in the frozen
     # selector this rollout and the number of selector calls. Passed straight through
@@ -297,6 +340,10 @@ def compute_score(
             "called_hint": 1.0 if len(applied_hints) >= 1 else 0.0,
             "hint_call_bonus": 0.0,
             "hint_penalty": 0.0,
+            "no_hint_penalty": 0.0,
+            "finish_from_k_penalty": 0.0,
+            "finalized_incorrect": 0.0,
+            "hint_pool_exhausted": float(hint_pool_exhausted or 0),
             "hint_shape_sum": 0.0,
             "hint_shape_penalty": 0.0,
             "hint_call_failed": float(hint_call_failed or 0),
@@ -322,6 +369,53 @@ def compute_score(
         guidance_difficulty=hint_guidance_difficulty,
         strategy=hint_strategy,
     )
+
+    # --- "no hint available" penalty (pool-exhausted calls) --------------
+    # Each exhausted <hint_call/> (got the no-hint no-op) costs no_hint_penalty_factor
+    # x the MINIMUM major-step penalty in the pool. Added to the hint penalty above so
+    # it is subtracted from the CORRECT reward (and shares the correct_floor) -- a small,
+    # per-call discouragement of asking for help once the pool is empty.
+    no_hint_pen = no_hint_penalty(
+        hint_pool_exhausted,
+        extra_info.get("hint_full"),
+        total_penalty=hint_penalty_total,
+        hard_factor=hint_penalty_hard_factor,
+        factor=no_hint_penalty_factor,
+    )
+
+    # --- "finish from k" penalty (finalize_incorrect option) -------------
+    # For a WRONG rollout the agent loop finalized, charge the hints from where it got
+    # stuck (final_hint_step / final_hint_id) to the last hint, deduped against what it
+    # already used -- so the wrong answer is scored as "correct but consuming those extra
+    # hints" (see the incorrect branch below).
+    #
+    # CRITICAL: only score-as-correct when the final selector call produced a USABLE
+    # outcome -- a stuck-hint k, OR an exhausted pool. If that call FAILED (selector
+    # outage -> no final_hint_step, not exhausted) we have NO signal for how far the
+    # rollout got; defaulting finish_pen=0 there scores a wrong answer as a FULL correct
+    # solve (correct_reward + format = 1.0), which corrupts the GRPO advantages. So a
+    # failed final call falls back to the ordinary incorrect score (use_finalized=False),
+    # exactly as a mid-rollout selector failure is treated (logged via hint_call_failed,
+    # never rewarded).
+    finalized_incorrect = bool(extra_info.get("finalized_incorrect"))
+    final_k = (
+        extra_info.get("final_hint_step")
+        if normalize_strategy(hint_strategy) == STRATEGY_MAJOR_STEP
+        else extra_info.get("final_hint_id")
+    )
+    final_exhausted = bool(extra_info.get("final_hint_exhausted"))
+    use_finalized = bool(finalize_incorrect and finalized_incorrect and (final_k or final_exhausted))
+    finish_pen = 0.0
+    if use_finalized:
+        finish_pen = penalty_from_k(
+            final_k,
+            applied_hints,
+            extra_info.get("hint_full"),
+            strategy=hint_strategy,
+            total_penalty=hint_penalty_total,
+            hard_factor=hint_penalty_hard_factor,
+            guidance_difficulty=hint_guidance_difficulty,
+        )
 
     # --- effort-shaping penalty (order-aware: earlier turns must reason as hard
     # as later ones) -----------------------------------------------------
@@ -362,10 +456,12 @@ def compute_score(
     # hinted failure is never pushed BELOW an unhinted one (that would re-suppress hint
     # use, the very thing this bonus exists to prevent) -- only made no-better. Disabling
     # shaping (hint_shape_coeff <= 0 -> shape_penalty == 0) restores the flat bonus exactly.
+    # The bonus lives on the ORDINARY incorrect branch; it does not apply when the wrong
+    # rollout is scored as correct-with-more-hints (use_finalized), so it stays 0 there.
     called_hint = len(applied_hints) >= 1
     hint_call_bonus = (
         max(0.0, float(hint_call_reward) - shape_penalty)
-        if (not correct and called_hint)
+        if (not correct and called_hint and not use_finalized)
         else 0.0
     )
 
@@ -382,10 +478,19 @@ def compute_score(
     # Wrong answer -> base (incorrect) reward + the one-off hint-call bonus (keeps a
     # positive gradient on hint use that GRPO otherwise suppresses). Correct answer
     # -> base (correct) reward minus the summed hint penalty (each hint used lowers
-    # the reward) and the effort-shaping penalty (shallow calls lower it further),
-    # FLOORED at correct_floor; the bonus does NOT apply when correct.
+    # the reward), the effort-shaping penalty (shallow calls lower it further), and the
+    # no-hint penalty (each pool-exhausted call lowers it a little), FLOORED at
+    # correct_floor; the bonus does NOT apply when correct.
     if correct:
-        score = max(base - penalty - shape_penalty, correct_floor)
+        score = max(base - penalty - shape_penalty - no_hint_pen, correct_floor)
+    elif use_finalized:
+        # Wrong, but viewed as correct-while-consuming-the-remaining-hints: the correct
+        # base (correct_reward, plus format_reward when the answer is well-formed -- same
+        # base a correct rollout gets) minus the hints it used, the hints from where it got
+        # stuck to the end, and the no-hint penalty. acc stays 0 (below) -- the answer is
+        # still wrong. No shape penalty, no floor (bounded by base - total_penalty already).
+        base_correct = correct_reward + (format_reward if (format_reward and has_format) else 0.0)
+        score = base_correct - penalty - finish_pen - no_hint_pen
     else:
         score = base + hint_call_bonus
 
@@ -404,6 +509,10 @@ def compute_score(
         "called_hint": 1.0 if called_hint else 0.0,
         "hint_call_bonus": float(hint_call_bonus),
         "hint_penalty": float(penalty),
+        "no_hint_penalty": float(no_hint_pen),
+        "finish_from_k_penalty": float(finish_pen),
+        "finalized_incorrect": 1.0 if finalized_incorrect else 0.0,
+        "hint_pool_exhausted": float(hint_pool_exhausted or 0),
         "hint_shape_sum": float(shape_sum),
         "hint_shape_penalty": float(shape_penalty),
         "hint_call_failed": float(hint_call_failed or 0),

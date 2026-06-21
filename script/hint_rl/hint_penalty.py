@@ -228,3 +228,128 @@ def applied_step_penalty(
         seen.add(sid)
         total += step_penalties.get(sid, 0.0)
     return total
+
+
+def _int_or_none(value):
+    """Leading-integer value of a (major-)step id ('5' / '5.0' / '2.1' -> 5), else None."""
+    if value is None:
+        return None
+    head = str(value).strip().split(".")[0]
+    try:
+        return int(head)
+    except (TypeError, ValueError):
+        return None
+
+
+def penalty_from_k(
+    final_k,
+    applied_hints: list,
+    hint_full,
+    *,
+    strategy: str = STRATEGY_HINT,
+    total_penalty: float = DEFAULT_TOTAL_PENALTY,
+    hard_factor: float = DEFAULT_HARD_FACTOR,
+    guidance_difficulty: str = DEFAULT_GUIDANCE_DIFFICULTY,
+) -> float:
+    """Penalty for "finishing from hint ``final_k``": every hint/step from ``final_k``
+    through the LAST one in the pool that was NOT already applied.
+
+    Used by the ``finalize_incorrect`` option to score a WRONG rollout as if it were
+    correct but had to consume every remaining hint from where it got stuck (``final_k``,
+    the step/hint the selector identifies on the final trace) to the end of the solution.
+    Dedups against ``applied_hints`` so a hint already shown is never double-charged; the
+    union ``applied ∪ {final_k..last}`` is thus charged once each, so this + the existing
+    ``applied_penalty``/``applied_step_penalty`` together never exceed ``total_penalty``.
+
+      * STRATEGY_MAJOR_STEP -- ``final_k`` is a ``major_step_id``; sum the per-STEP
+        penalties of every step with ``step_id >= final_k`` not already revealed.
+      * STRATEGY_HINT       -- ``final_k`` is a ``hint_id``; sum the per-HINT penalties of
+        every hint at or after ``final_k`` in pool order not already applied.
+
+    Returns 0.0 when ``final_k`` is None/unparseable or no ``hint_full`` is present.
+    """
+    if final_k is None or not hint_full:
+        return 0.0
+
+    if normalize_strategy(strategy) == STRATEGY_MAJOR_STEP:
+        k = _int_or_none(final_k)
+        if k is None:
+            return 0.0
+        step_penalties = compute_step_penalties(
+            hint_full, total_penalty=total_penalty, hard_factor=hard_factor
+        )
+        applied = {
+            str(h.get("major_step_id"))
+            for h in applied_hints or []
+            if isinstance(h, dict) and h.get("major_step_id") is not None
+        }
+        total = 0.0
+        for sid, pen in step_penalties.items():
+            n = _int_or_none(sid)
+            if n is not None and n >= k and sid not in applied:
+                total += pen
+        return total
+
+    # per-hint strategy: order the pool's hints and take from final_k to the end.
+    penalties = compute_hint_penalties(
+        hint_full,
+        total_penalty=total_penalty,
+        hard_factor=hard_factor,
+        guidance_difficulty=guidance_difficulty,
+    )
+    ordered_ids = list(penalties.keys())  # dict preserves pool order
+    target = str(final_k)
+    if target not in ordered_ids:
+        return 0.0
+    start = ordered_ids.index(target)
+    applied = {
+        str(h.get("hint_id"))
+        for h in applied_hints or []
+        if isinstance(h, dict) and h.get("hint_id") is not None
+    }
+    return sum(penalties[hid] for hid in ordered_ids[start:] if hid not in applied)
+
+
+def min_step_penalty(
+    hint_full,
+    *,
+    total_penalty: float = DEFAULT_TOTAL_PENALTY,
+    hard_factor: float = DEFAULT_HARD_FACTOR,
+) -> float:
+    """The SMALLEST per-major-step penalty in the pool (0.0 if it has no steps).
+
+    That is the easiest (lowest-difficulty) step's penalty -- the natural small unit
+    used to price a "no hint available" call in ``no_hint_penalty``.
+    """
+    step_penalties = compute_step_penalties(
+        hint_full, total_penalty=total_penalty, hard_factor=hard_factor
+    )
+    return min(step_penalties.values()) if step_penalties else 0.0
+
+
+def no_hint_penalty(
+    n_no_hint,
+    hint_full,
+    *,
+    total_penalty: float = DEFAULT_TOTAL_PENALTY,
+    hard_factor: float = DEFAULT_HARD_FACTOR,
+    factor: float = 0.1,
+) -> float:
+    """Penalty for "no hint available" (pool-exhausted) hint calls.
+
+    Each such call -- a ``<hint_call/>`` the loop could not serve because every
+    candidate had already been surfaced (the common terminal state of the cumulative
+    step-exclude mode) -- costs ``factor`` times the MINIMUM major-step penalty in the
+    pool. With the default ``factor`` 0.1 and a minimum step penalty of 0.2, each
+    no-hint call costs 0.02. The cost is PER CALL (``n_no_hint`` is the rollout's
+    ``hint_pool_exhausted`` count), so repeatedly asking once the pool is empty is
+    discouraged proportionally.
+
+    Returns 0.0 when there were no such calls or no ``hint_full`` is present.
+    """
+    n = int(n_no_hint or 0)
+    if n <= 0 or not hint_full:
+        return 0.0
+    return n * float(factor) * min_step_penalty(
+        hint_full, total_penalty=total_penalty, hard_factor=hard_factor
+    )
