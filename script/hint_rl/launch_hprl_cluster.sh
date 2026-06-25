@@ -45,7 +45,7 @@ HINT_RL_HOME=${HINT_RL_HOME:-"$(cd "${SCRIPT_DIR}/../.." && pwd)"}
 PROJECT_HOME=${PROJECT_HOME:-"$(cd "${HINT_RL_HOME}/.." && pwd)"}
 BASE_HOME=${BASE_HOME:-"$(cd "${PROJECT_HOME}/.." && pwd)"}
 RAY_LAUNCH=${RAY_LAUNCH:-"${SCRIPT_DIR}/../ray_cluster_launch.sh"}    # script/ray_cluster_launch.sh
-TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_hprl_qwen2.5_7b.sh"}
+TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_auto_hint_qwen2.5_7b.sh"}
 
 # --- conda env (verl holds BOTH training and the vllm used to serve gpt-oss) -
 CONDA_HOME=${CONDA_HOME:-"${BASE_HOME}/miniconda3"}

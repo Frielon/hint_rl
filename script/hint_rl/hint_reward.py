@@ -62,6 +62,7 @@ def hint_penalty(
     hard_factor: float = DEFAULT_HARD_FACTOR,
     guidance_difficulty: str = DEFAULT_GUIDANCE_DIFFICULTY,
     strategy: str = STRATEGY_HINT,
+    guidance_free: bool = False,
 ) -> float:
     """Hint penalty for a rollout, per the selected ``strategy``.
 
@@ -98,6 +99,7 @@ def hint_penalty(
         total_penalty=total_penalty,
         hard_factor=hard_factor,
         guidance_difficulty=guidance_difficulty,
+        guidance_free=guidance_free,
     )
 
 
@@ -182,11 +184,13 @@ def compute_score(
     hint_penalty_total: float = DEFAULT_TOTAL_PENALTY,
     hint_penalty_hard_factor: float = DEFAULT_HARD_FACTOR,
     hint_guidance_difficulty: str = DEFAULT_GUIDANCE_DIFFICULTY,
+    hint_guidance_free: bool = False,
     hint_strategy: str = STRATEGY_HINT,
     hint_shape_coeff: float = 0.0,
     no_hint_penalty_factor: float = 0.1,
     finalize_incorrect: bool = False,
     budget_exceeded_reward: Optional[float] = None,
+    length_truncated_reward: Optional[float] = None,
     **kwargs,
 ) -> dict:
     """HPRL reward: outcome correctness minus the summed hint penalty.
@@ -269,6 +273,8 @@ def compute_score(
     # bool (non-empty "false" is truthy -> would silently ENABLE the option). Coerce.
     if isinstance(finalize_incorrect, str):
         finalize_incorrect = finalize_incorrect.strip().lower() in {"1", "true", "yes", "y", "on"}
+    if isinstance(hint_guidance_free, str):
+        hint_guidance_free = hint_guidance_free.strip().lower() in {"1", "true", "yes", "y", "on"}
 
     # --- per-rollout state recorded by the agent loop --------------------
     applied_hints = extra_info.get("applied_hints") or []
@@ -348,6 +354,44 @@ def compute_score(
             "hint_shape_penalty": 0.0,
             "hint_call_failed": float(hint_call_failed or 0),
             "hint_budget_exceeded": 1.0,
+            "length_truncated": 0.0,
+            "hint_select_time": float(hint_select_time or 0.0),
+            "hint_select_calls": float(hint_select_calls or 0),
+            "hint_calls_total": float(hint_calls_total or 0),
+            "hint_calls_with_box": float(hint_calls_with_box or 0),
+        }
+
+    # --- length truncation: generation hit the response-length cap -> FLOOR score ---
+    # The agent loop sets extra_info["length_truncated"]=1 when an assistant turn ran
+    # into the hard response-length cap (no EOS -- the answer is cut off mid-stream). We
+    # SHORT-CIRCUIT to the floor (minimum) reward and do NOT grade the boxed answer: a
+    # run-on rollout that never properly finished should be the worst outcome, not an
+    # ordinary failure (and never accidentally rewarded for a stray earlier box). acc=0
+    # so it counts as a failure for GRPO group filtering and the budget ratchet; the
+    # hint penalty / shaping / call-bonus are all bypassed.
+    length_truncated = extra_info.get("length_truncated", 0)
+    if hasattr(length_truncated, "item"):
+        length_truncated = length_truncated.item()
+    if length_truncated:
+        floor = incorrect_reward if length_truncated_reward is None else float(length_truncated_reward)
+        return {
+            "score": float(floor),
+            "acc": 0.0,
+            "pred": pred,
+            "has_format": 1.0 if has_format else 0.0,
+            "num_hints": float(len(applied_hints)),
+            "called_hint": 1.0 if len(applied_hints) >= 1 else 0.0,
+            "hint_call_bonus": 0.0,
+            "hint_penalty": 0.0,
+            "no_hint_penalty": 0.0,
+            "finish_from_k_penalty": 0.0,
+            "finalized_incorrect": 0.0,
+            "hint_pool_exhausted": float(hint_pool_exhausted or 0),
+            "hint_shape_sum": 0.0,
+            "hint_shape_penalty": 0.0,
+            "hint_call_failed": float(hint_call_failed or 0),
+            "hint_budget_exceeded": 0.0,
+            "length_truncated": 1.0,
             "hint_select_time": float(hint_select_time or 0.0),
             "hint_select_calls": float(hint_select_calls or 0),
             "hint_calls_total": float(hint_calls_total or 0),
@@ -368,6 +412,7 @@ def compute_score(
         hard_factor=hint_penalty_hard_factor,
         guidance_difficulty=hint_guidance_difficulty,
         strategy=hint_strategy,
+        guidance_free=hint_guidance_free,
     )
 
     # --- "no hint available" penalty (pool-exhausted calls) --------------
@@ -415,6 +460,7 @@ def compute_score(
             total_penalty=hint_penalty_total,
             hard_factor=hint_penalty_hard_factor,
             guidance_difficulty=hint_guidance_difficulty,
+            guidance_free=hint_guidance_free,
         )
 
     # --- effort-shaping penalty (order-aware: earlier turns must reason as hard
@@ -517,6 +563,7 @@ def compute_score(
         "hint_shape_penalty": float(shape_penalty),
         "hint_call_failed": float(hint_call_failed or 0),
         "hint_budget_exceeded": 0.0,
+        "length_truncated": 0.0,
         "hint_select_time": float(hint_select_time or 0.0),
         "hint_select_calls": float(hint_select_calls or 0),
         "hint_calls_total": float(hint_calls_total or 0),

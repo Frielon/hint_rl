@@ -46,6 +46,39 @@ function-tool call (which returned a *tool* message). Budget `B_q` and the
 `applied_hints` state are tracked by the loop, so the reward + budget ratchet are
 unchanged.
 
+## Auto-hint (push-hint) mode — `data.hprl.auto_hint.*`
+
+A second rollout, flag-gated alongside the `<hint_call/>` path. The policy is **not
+told about hints**: it runs the ordinary single-turn math prompt (format of
+`dataset/dapo-3139-single-turn.parquet`), and the **loop decides when to hint**
+(`auto_hint_agent_loop.AutoHintAgentLoop`, routed by the train parquet's
+`agent_name="auto_hint"`). Per turn: generate → grade the boxed answer → **correct →
+stop**; **wrong & injections < `B_q` →** ask the selector (multi-round Template F,
+`selector_multi`; the pool is rendered with per-hint `status` completed|pending) for
+the next hint, inject it as a user message, continue. Hints land in `applied_hints`
+(same penalty/ratchet). Run with the `<hint_call/>`-specific reward terms off
+(`hint_call_reward=0`, `hint_shape_coeff=0`).
+
+**Verified-prefix gradient mask** (`auto_hint_mask.py`, in
+`HPRLRayPPOTrainer._update_actor`, gated on `data.hprl.auto_hint.enable`): for a
+rollout with **advantage ≤ 0** train on **all** model tokens; for **advantage > 0**,
+a turn that was *followed by a hint* trains only **up to its last selector-verified
+sentence** (fuzzy-matched from that round's `completed_hints` quotes), while the
+**ending turn** (correct / budget-reached) is **fully promoted** — so only
+selector-confirmed reasoning is reinforced.
+
+Build the data with `build_auto_hint_data.py` (or `prepare_hint_data.py --mode
+auto_hint`).
+
+**Auto-hint is the DEFAULT mode.** `run_hprl_qwen2.5_7b.sh` runs auto-hint out of the
+box (`HPRL_AUTO_HINT=true`): it pins the auto-hint train/val files, the per-hint
+penalty, the disabled `<hint_call/>`-reward terms, and `data.hprl.auto_hint.enable=true`.
+Each is a default you can still override via env. To run the **legacy `<hint_call/>`
+job**, set `HPRL_AUTO_HINT=false` (restores the `<hint_call/>` train file, `major_step`
+strategy, finalize-incorrect, k-pack, etc.; the mask becomes a pure no-op since those
+rollouts carry no `disable_spans`). `run_auto_hint_qwen2.5_7b.sh` is now just an
+explicit, distinctly-named alias for the default.
+
 ## Per-rollout state
 
 The list of all hints applied in a rollout is kept on

@@ -51,7 +51,7 @@ CONDA_ENV="${CONDA_ENV:-verl}"
 # --- driver knobs (passed through to run_gpt_oss_selection.py) ----------------
 LABEL_RUN="${LABEL_RUN:-run_20260617_224209}"   # which labeled run to score against
 N_SAMPLES="${N_SAMPLES:-16}"
-TEMPERATURE="${TEMPERATURE:-0.7}"
+TEMPERATURE="${TEMPERATURE:-0.3}"
 TOP_P="${TOP_P:-0.95}"
 MAX_TOKENS="${MAX_TOKENS:-16384}"
 ROW_WORKERS="${ROW_WORKERS:-32}"

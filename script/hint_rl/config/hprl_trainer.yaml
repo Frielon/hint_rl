@@ -36,6 +36,15 @@ data:
     decrement: 1
     # fallback B_q when a row carries no baked budget.
     default_budget: 8
+    # single-pack ratchet rule (ignored for k-pack-probed problems):
+    #   "downward" -- strictly monotone-down (compute_downward_budget; the default).
+    #   "adaptive" -- two-sided (compute_adaptive_budget): RAISE B_q by 1 when NO rollout
+    #                 is correct (too hard at this budget), or set B_q to the (N/2)-th
+    #                 smallest correct hint count when OVER HALF are correct; else hold.
+    ratchet_mode: adaptive
+    # ceiling on B_q -- only bounds the adaptive rule's upward (raise) branch so a
+    # persistently-hard problem cannot grow without limit. Defaults to default_budget.
+    max_budget: 8
     # tool name whose create_kwargs.budget is injected/enforced.
     tool_name: request_hint
     # RETIRED (no longer changes behavior): an over-budget <hint_call/> is now
@@ -69,7 +78,7 @@ data:
     # hint_penalty.penalty_from_k). MUST be matched by
     # custom_reward_function.reward_kwargs.finalize_incorrect. Adds a blocking selector
     # call per INCORRECT rollout when on. false -> ordinary incorrect scoring.
-    finalize_incorrect: true
+    finalize_incorrect: false
 
     # ---- k-pack counterfactual-probe ratchet ("double-rollout" / k-pack) ----------
     # Measure (don't infer) whether one fewer hint would still solve a problem: split
@@ -99,3 +108,79 @@ data:
       # byte-for-byte unchanged, only the GRPO grouping/budget split differs. false keeps
       # ppo_mini_batch_size as-is (smaller, more-numerous mini-batches).
       scale_mini_batch: true
+
+    # ---- budget-grouped data sampling -----------------------------------------
+    # Load-balance the generation step by budget. The stock RandomSampler mixes
+    # budget-0 (one unaided turn) and high-budget (many selector rounds) problems in
+    # the same step; async multi-turn rollout ends a step only when its SLOWEST
+    # rollout finishes, so the high-budget problems straggle and the GPUs that already
+    # finished the low-budget ones idle -- the big-budget problems bottleneck the step.
+    #
+    # When enabled, each EPOCH's problems are ordered by their CURRENT budget B_q and
+    # packed into same-budget batches, so a step's rollouts all run ~the same number of
+    # hint rounds and finish together (no straggler, no idle GPUs). The budget read is
+    # the LIVE ratcheted B_q (budget_state_path), falling back to the parquet's baked
+    # budget for not-yet-ratcheted problems, so the grouping tracks the ratchet.
+    #
+    # Each batch stays EXACTLY gen/train_batch_size (PPO mini-batch divisibility is
+    # preserved) and a random remainder (len % batch_size, a different subset each
+    # epoch) is dropped -- exactly like the stock random sampler + drop_last. GRPO
+    # groups by uid, not batch membership, so advantages are unaffected. Independent of
+    # the ratchet flag: with hprl.enable=false the baked budgets are still grouped.
+    # See budget_sampler.BudgetGroupedSampler. enable=false -> stock random sampler.
+    budget_sampling:
+      enable: false
+      # randomize the ORDER the budget-homogeneous batches run within an epoch (each
+      # batch stays homogeneous; only the step sequence is shuffled), so the epoch is
+      # not a fixed easy->hard ramp and every step is still a random budget level
+      # (stationary difficulty, like the stock sampler). false -> ascending-budget order.
+      shuffle_batch_order: true
+
+    # ---- auto-hint (push-hint) mode -------------------------------------------
+    # A different rollout (auto_hint_agent_loop.AutoHintAgentLoop, routed by the data's
+    # agent_name="auto_hint"): the policy runs the ordinary single-turn math prompt and
+    # the LOOP injects a hint whenever the boxed answer is still wrong, up to the budget
+    # B_q -- no <hint_call/>. The selector uses the MULTI-ROUND Template F prompt
+    # (selector_multi), rendering the pool with per-hint status completed|pending.
+    #
+    # enable here turns on ONLY the trainer-side VERIFIED-PREFIX gradient mask
+    # (auto_hint_mask): for a POSITIVE-advantage rollout, the loss mask is zeroed beyond
+    # each hinted turn's last selector-verified sentence (its recorded disable_spans), so
+    # only the selector-confirmed reasoning is reinforced; the ending turn is always fully
+    # promoted. A negative-advantage rollout trains on all tokens. The rollout itself is
+    # selected by the data's agent_name, independently of this flag.
+    #
+    # ON BY DEFAULT (auto-hint is the default mode). The run script passes
+    # data.hprl.auto_hint.enable=${HPRL_AUTO_HINT} (default true) and pins the matching
+    # train/val files + reward terms; set HPRL_AUTO_HINT=false there for the legacy
+    # <hint_call/> job, where the mask is a pure no-op (rollouts carry no disable_spans).
+    auto_hint:
+      enable: true
+      # min in-order loose-char coverage to accept a completed-hint quote as located in a
+      # turn (selector_multi.locate_quote_end); a miss only makes the mask MORE conservative.
+      fuzzy_threshold: 0.8
+      # a rollout counts as positive (-> mask applied) iff its sequence advantage strictly
+      # exceeds this. 0.0 == strictly positive ("if the advantage is negative, all tokens").
+      positive_eps: 0.0
+      # ---- STEP-LEVEL advantage (supersedes the verified-prefix mask) ------------
+      # When enabled, the trainer REPLACES GRPO's single scalar-per-rollout advantage
+      # with a value-based, per-segment one (step_advantage.py): each turn's verified
+      # prefix (a_C) advancing state S_ss -> S_se gets V[se]-V[ss] >= 0, and its failed
+      # tail (a_I, the step the loop then hinted) gets r + V[se+1]-V[se] <= 0, where V is
+      # solved backward from V[S_K]=terminal_value over the problem's N rollouts (one GRPO
+      # group). The loop additionally LABELS the terminal turn of an over-budget incorrect
+      # rollout (one extra selector call, no hint given) so its failed step is known. This
+      # is mutually exclusive with the verified-prefix MASK above (the mask is skipped when
+      # this is on). Default OFF -> the mask runs as before.
+      step_adv:
+        enable: false
+        # V[S_K] -- the value of the fully-solved state (the last hint is the answer).
+        terminal_value: 1.0
+        # a group with NO correct rollout gets zero advantage everywhere (no gradient):
+        # without a solve the V[S_K] anchor is unreached. false -> score it anyway.
+        zero_if_no_correct: true
+        # uniform multiplier on every assigned advantage -- a gradient-magnitude knob.
+        # The raw values are small (per-hint penalties ~ total_penalty/K, e.g. 0.06 for a
+        # 13-hint pool), much smaller than GRPO's ~unit advantages, so raise this (e.g. 5-10)
+        # to match without retuning the LR / total_penalty. 1.0 == the raw TODO formula.
+        adv_scale: 1.0

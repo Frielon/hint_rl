@@ -55,3 +55,10 @@ selector/test_cite/gpt_oss_eval/logs/
 *.pt
 *.ckpt
 *.gguf
+
+# --- offline budget calibration: regenerable per-problem dumps (rollouts dir is
+#     ~100MB+; cache/ + cache.bak.* are the resumable per-problem cache). The small
+#     budget_state*.json outputs and the scripts stay tracked. ---
+script/hint_rl/budget_calibration/*.rollouts/
+script/hint_rl/budget_calibration/*.cache/
+script/hint_rl/budget_calibration/*.cache.bak.*/

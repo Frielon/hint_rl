@@ -93,6 +93,14 @@ class HintBudgetDataset(RLHFDataset):
             return row  # ratchet off -> identical to RLHFDataset
 
         extra_info = row.get("extra_info") or {}
+        # Auto-hint (push-hint) rows carry hprl_auto_hint and a HINT-AGNOSTIC prompt
+        # (the policy is never told about hints). Update ONLY the ratcheted budget
+        # the loop enforces (tools_kwargs.request_hint.create_kwargs.budget) -- never
+        # the prompt -- then return. Checked BEFORE hprl_system_base (auto-hint rows
+        # deliberately do not set it, so no budget sentence is ever rendered).
+        if extra_info.get("hprl_auto_hint"):
+            return self._update_auto_hint_budget(row, extra_info)
+
         # Only HPRL/tool rows carry hprl_system_base (set by prepare_hint_data).
         # Non-tool rows -- notably the unaided single-turn validation set -- are
         # left exactly as-is so the budget sentence is never injected into them.
@@ -126,6 +134,27 @@ class HintBudgetDataset(RLHFDataset):
         if ei_tools is not tools_kwargs:  # keep the two copies consistent
             set_create_budget(ei_tools, budget, self.hprl_tool_name)
 
+        row["tools_kwargs"] = tools_kwargs
+        row["extra_info"] = extra_info
+        return row
+
+    def _update_auto_hint_budget(self, row, extra_info):
+        """Auto-hint rows: inject the ratcheted B_q into tools_kwargs ONLY.
+
+        Unlike the <hint_call/> path, the auto-hint prompt is hint-agnostic (no tool
+        instruction, no budget reminder) -- the LOOP, not the policy, consumes the
+        budget -- so the prompt is left untouched. Only the budget the loop enforces
+        (tools_kwargs.request_hint.create_kwargs.budget) and its extra_info copy (read
+        back by the ratchet as "the budget these rollouts ran under") are updated.
+        """
+        problem_id = extra_info.get("problem_id")
+        tools_kwargs = row.get("tools_kwargs") or {}
+        baked = get_create_budget(tools_kwargs, self.hprl_default_budget, self.hprl_tool_name)
+        budget = self._budget_for(problem_id, baked)
+        set_create_budget(tools_kwargs, budget, self.hprl_tool_name)
+        ei_tools = extra_info.get("tools_kwargs")
+        if ei_tools is not tools_kwargs:  # keep the two copies consistent
+            set_create_budget(ei_tools, budget, self.hprl_tool_name)
         row["tools_kwargs"] = tools_kwargs
         row["extra_info"] = extra_info
         return row

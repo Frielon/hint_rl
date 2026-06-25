@@ -6,7 +6,7 @@ three placeholders. To tune the prompt, edit TEMPLATE_F below; keep the
 {{problem}}, {{trace}}, {{hints}} markers so build_prompt can fill them.
 """
 
-TEMPLATE_F = r"""You are an expert math tutor. Your task is to select the single most relevant hint to help a student make progress toward the solution of a math problem, based on where they currently are in their reasoning.
+TEMPLATE_F = r"""You are an expert math tutor. Your task is to choose the first hint that the student has not yet achieved based on the student's reasoning trace.
 
 # Inputs
 
@@ -20,89 +20,70 @@ TEMPLATE_F = r"""You are an expert math tutor. Your task is to select the single
 The hints are organized as an ordered list of major steps that build toward the solution. Each major step contains:
 - `step_id`: the step's position in the solution.
 - `purpose`: what this step accomplishes and why.
-- `hints`: an ordered list of hints for the step. Each hint has a `type`, a `hint_id`, and the `hint` text:
-  - `type: "step_guidence_hint"` (hint_id `X.0`): a high-level nudge toward *what* this step requires, without revealing the substeps.
-  - `type: "substep_hint"` (hint_id `X.1`, `X.2`, ...): a finer hint walking through *how* to carry out the step, in order.
+- `hints`: an ordered list of hints for the step.
 
 {{hints}}
 
-# Workflow
+# Core rule:
 
-## 1. Identify the major step the student is currently working on
-Go through the major steps in order and, for each one, **verify whether the student has actually completed it correctly** — do not take the student's claims at face value:
-- Independently check the student's setup, calculations, and stated conclusions for that step. Re-derive or sanity-check them yourself rather than trusting what the student asserts.
-- A step counts as completed **only if** the student has correctly carried out its substance. A step is **not** completed if the student's work for it is wrong, rests on a false premise, sets the problem up incorrectly, or has merely been *named or recognized* without being executed. A confident but incorrect conclusion means the step is **not** complete.
-- Conversely, do not rewind to an earlier step over a trivial, purely mechanical omission (e.g., an unstated arithmetic sum) when the student has clearly done that step's substantive reasoning.
+Select the earliest substep hint, in order, whose mathematical idea is **not clearly achieved** in the student’s trace.
 
-### Ground rules for crediting progress
-- Hints previously given by the tutor appear in the trace. **Hint text is not
-  student work.** A step counts as completed only if the *student's own
-  writing* carries out its substance after (or independently of) any hint.
-  Content that merely echoes a given hint, or a step whose hint was shown but
-  that the student never executed, is NOT completed.
-- Progress requires new written reasoning. If the student has written little
-  or nothing of substance since the last hint was given, then no additional
-  step can have been completed since then.
-- The candidate list contains only steps whose hints have **not** been given
-  yet. Do not skip over an earlier candidate step because you, the tutor, can
-  see how it would go -- the student still has to do it.
+# Definitions:
 
-The current step is the **earliest step the student has not yet completed correctly**. Note that this may be *earlier* than where the student feels stuck: if the student's work first went wrong at an earlier step, anchor on that step, not on the point they report being stuck. Justify your choice with specific evidence from the trace, including any error you found in the student's earlier work.
+* A hint is **achieved** only if the student’s trace clearly demonstrates the underlying mathematical idea of that hint.
+* The student does not need to use the same wording as the hint.
+* A hint is **not achieved** if the idea is missing, only partially present, contradicted, used incorrectly, or based on an unjustified guess.
+* Do not skip an earlier unachieved hint even if the student has achieved later hints.
+* For every hint that you mark as completed, you must provide an exact quote from the student’s trace proving completion.
+* The quote must be copied character-for-character from the student’s trace.
+* Preserve LaTeX markup exactly.
+* Do not convert symbols to Unicode.
+* Do not paraphrase the quote.
+* The quote must be findable by exact string search in the student’s trace.
+* If you cannot find an exact supporting quote, do not mark that hint as completed.
 
-### Cite your evidence for every passed substep
-The candidate hints break each major step into ordered substeps (`X.1`, `X.2`,
-...). The substep you select is the earliest one the student has NOT yet carried
-out; every substep that comes before it -- across all earlier major steps AND
-the earlier substeps of your selected step -- is therefore one the student must
-already have done in their own writing.
+# Procedure:
 
-For EACH such passed substep you must QUOTE the student's own words that carry
-it out: an exact, verbatim excerpt (roughly 10-200 characters) copied
-character-for-character from the student's writing in the trace. Text inside a
-`[hint given]` block is the tutor's, not the student's -- quoting it does not
-count. Paraphrases do not count. List one entry per passed substep, in order, in
-the `completed_substeps` array of your output. If you cannot produce a verbatim
-student quote for some earlier substep, the student has NOT passed it -- select
-that substep instead. An empty `completed_substeps` array means you selected the
-earliest substep of the first major step.
+1. Scan hints in order:
 
-### Guard the final step
-The last major step typically states the final answer. Selecting it gives the
-answer away, so it is justified **only** when the student's own written work
-has correctly completed every earlier candidate step. If you are at all unsure
-whether an earlier candidate step is genuinely done, select that earlier step
-instead. An unearned answer reveal is a much worse error than a hint that is
-one step too early.
+   * First by `step_id`.
+   * Then by the order of hints within that step.
 
-## 2. Select a hint within that major step
-- If the student has not yet recognized *what* this step requires, select the `step_guidence_hint` (the `X.0` hint).
-- If the student understands what the step requires but is stuck on execution, select the earliest `substep_hint` they have not yet completed.
+2. For each hint, decide whether the student achieved it:
 
-## 3. Rephrase the hint to fit the student's work, only if needed
-- Match the student's terminology and notation. For example, if the hint refers to "the cell (50,50)" but the student writes "the center square c", rewrite the hint to refer to "the center square c".
-- Do not add new information, reveal later steps, or give away more than the original hint. Preserve its level of disclosure.
+   * If achieved, add it to `completed_hints` with exact quote evidence according to the following step 4.
+   * If not achieved, stop immediately and select that hint.
 
-## Confidence scale
-Rate each confidence judgment as an integer from 1 to 5:
-- 5: Certain. The trace gives direct, unambiguous evidence for this choice.
-- 4: Confident. Strong evidence, with only minor or unlikely alternatives.
-- 3: Moderate. The choice is the best fit, but the trace is partial or admits other plausible readings.
-- 2: Low. The trace is sparse or ambiguous; this is a tentative guess among several candidates.
-- 1: Very low. Little to no evidence; essentially a guess.
+3. Rephrase the selected hint only if necessary:
+
+   * Keep the mathematical intent of the original hint unchanged.
+   * Make it clear and helpful for the student.
+   * Do not reveal the full solution unless the original hint already does.
+   * If no rephrasing is needed, use the original hint text.
+
+4. Write completed hints:
+
+   * For each hint before the selected hint, include an entry in `completed_hints` with:
+     - `hint_id`: the hint's id.
+     - `quote`: the exact quote from the student's trace that demonstrates achievement.
+     - `why`: a one-line explanation of why this quote demonstrates that the student achieved the hint.
+   * For example, if the selected hint is "3.2", then `completed_hints` must include all hints from step 1 and step 2 and hint "3.1", but no hints from "3.2" or later.
 
 # Output format
-Return a single JSON object wrapped in <output> tags. `hint_id` is the id of the selected hint (e.g., "2.0" or "2.1"). `hint` is its text, rephrased per step 3 if necessary. Confidence values are integers from 1 to 5, as defined above.
+Return a single JSON object wrapped in <output> tags. The output must contains four fields: `hint_id` is the id of the selected hint (e.g., "2.1" or "2.2"), `hint` is its text, rephrased per step 3 if necessary, `completed_hints` is a list of hints that were achieved, and `reasoning_of_hint` is an explanation of why this hint was selected.
 
 <output>
 {
-  "completed_substeps": [{"hint_id": <id of a substep_hint before your selection, e.g. "1.1">, "quote": <verbatim excerpt from the student's own writing that carries out this substep>, "why": <one line: why this excerpt carries out this substep>}, ...] (one entry for EVERY substep_hint that precedes your selected hint_id, across all earlier major steps and the earlier substeps of your selected step; [] if you selected the earliest substep),
-  "major_step_id": <step_id>,
-  "reasoning_of_major_step": <why this is the earliest step not yet completed correctly: cite the trace, and state how you verified whether each prior step was actually done correctly (note any error that makes an earlier step incomplete)>,
-  "confidence_of_major_step": <1-5>,
-  "hint_id": <hint_id of the selected hint>,
-  "reasoning_of_hint": <why this hint: either why the step-guidance hint, or why this is the earliest incomplete substep>,
-  "confidence_of_hint": <1-5>,
-  "hint": <the selected hint text, rephrased per step 3 if necessary>
+"completed_hints": [
+{
+"hint_id": "<id of a substep_hint before the selected hint_id, e.g. "1.1">",
+"quote": "<a string copied character-for-character from the student's trace — LaTeX markup preserved exactly, no Unicode conversion, no paraphrase; must be findable by exact search in the trace>",
+"why": "<one line, in your own words, explaining why this excerpt carries out this substep>"
+} ## One entry for EACH hint that is achieved before the selected hint
+],
+"hint_id": "<hint_id of the selected hint>",
+"reasoning_of_hint": "<why this hint was selected: explain why this is the first unachieved substep, or why the student needs this specific step-guidance hint>",
+"hint": "<the selected hint text, rephrased according to step 3 if necessary>"
 }
 </output>
 """

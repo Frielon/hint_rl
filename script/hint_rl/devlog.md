@@ -9,17 +9,237 @@ entry once it lands.
 
 # TODO / Planned (not yet done)
 
-- **Citation-enforcement guard** in `hint_agent_loop._record_major_step`: for a pick that skips earlier
-  unrevealed candidates, substring-validate each `completed_steps` quote against the student-only trace
-  (`analyze_citations.classify_quote` / `student_only`) and clamp the pick to the earliest uncited step.
-  Deterministic, no extra model call — turns the `v4_cite` citations (prompt adopted 2026-06-14) into a
-  contract. Drops unearned final-step reveal **6.4%→3.0%** @T0.7 / **4.2%→0.8%** @T0.1. Optional companion:
-  tighten `utils._as_selection_dict` to a selection-shaped-dict check so the degraded-parse fallback can't
-  return a nested `completed_steps` entry as the selection.
+_(none open — the step-level advantage calculation landed 2026-06-25; see the Done log.)_
 
 ---
 
 # Done log
+
+## 2026-06-25 — STEP-LEVEL advantage calculation (auto-hint): value-based per-segment advantage replacing GRPO's scalar
+
+Implements the TODO. In AUTO-HINT mode the selector already tells us, per turn, how far
+the student got (the contiguous count of completed hints = the STATE reached) and which
+hint it FAILED. This turns each rollout into a walk over **K+1 states** `S_0..S_K`
+(`S_k` = "the first k pool hints are done") and lets us assign a **per-token, value-based
+advantage** instead of broadcasting one GRPO scalar across the whole rollout. Flag-gated
+`data.hprl.auto_hint.step_adv.enable` (env `HPRL_STEP_ADV`, **default off** → the existing
+verified-prefix MASK runs unchanged); the two are **mutually exclusive** (step-adv gives the
+unverified tail a negative advantage instead of masking it away, so the mask is skipped when
+step-adv is on).
+
+**The model (`step_advantage.py`, pure / duck-typed torch+numpy).** Each turn splits over its
+RESPONSE tokens into:
+- `a_C` = the selector-VERIFIED prefix `[turn_start, boundary)` advancing `S_ss → S_se`
+  (`ss` = state at turn start, `se` = verified state end); reward 0.
+- `a_I` = the unverified tail `[boundary, turn_end)` that attempted hint `se` and failed
+  (the loop then injects it); reward `r_se = −penalty(h_se) < 0`.
+The CORRECT rollout's ending turn is all-`a_C` reaching `S_K` (no `a_I`). Over a problem's N
+rollouts (one GRPO group), with `V_i` = verified final state (K if solved) and `H_i` = its
+failed-hint set:
+```
+V[K] = terminal_value (=1)
+V[k] = V[k+1] + F_k·r_k / D_k     (k = K−1 .. 0)
+  F_k = #{i : k ∈ H_i}   (failed hint k)
+  D_k = #{i : V_i ≥ k}    (reached state k = took the S_k→S_{k+1} transition)
+A(a_C) = V[se] − V[ss]            ≥ 0
+A(a_I) = r_se + V[se+1] − V[se] = r_se·(1 − F_se/D_se)  ≤ 0
+```
+So self-achieving a step that OFTEN trips others (`F_k/D_k` high) is rewarded and failing a
+step others clear is penalized — the GRPO-relative intuition, **per step**. The per-segment
+advantages **telescope** exactly to `(rollout return − V[0])`, i.e. it is a proper TD
+decomposition (verified: a 1-hint solve sums to `r_0 + 1 − V[0]`). An **all-incorrect group
+is zeroed** (`zero_if_no_correct`, default true): without a solve the `V[K]=1` anchor is
+unreached and the positive `a_C` pulls would chase a goal nobody hit.
+
+**The `E_i` convention (denominator).** The TODO's `D_k = Σ_i 1_{E_i > k}` uses `E_i` = the
+**post-selector-check** state: an incorrect rollout whose verified state is `m` has `E_i = m+1`
+(with `h_{m+1}` added to `H_i`). Under that convention `1_{E_i > k} = 1_{m ≥ k}`, so the
+denominator counts every rollout that **reached** state k (took the `S_k→S_{k+1}` transition) —
+including the one that failed `k+1` terminally (it's in `H_i`, so it must be in `D_k` too, else
+`A(a_I) > 0` rewards a failed step). The impl carries the verified state `m` directly
+(`final_states[i]`) and computes `D_k = #{m_i ≥ k}` — identical to `Σ_i 1_{E_i > k}`. This makes
+`F_k ≤ D_k` (so `V` non-decreasing, `A(a_I) ≤ 0`) and self-counts the failing rollout; with
+`zero_if_no_correct` a scored group always has a solver crossing every `k<K`, so `D_k ≥ 1`.
+
+**State accounting (`auto_hint_agent_loop.py`).** `state_start = prefix_state(pool_order,
+completed)` = the contiguous-completed-prefix count BEFORE the turn (the multi-round selector
+only ever completes the next pending hints, so `completed` is a contiguous prefix). A failed
+turn's `state_end = pool index of the selector's selected hint` (the first still-pending one)
+— robust without re-deriving from quotes. The given hint advances the state by 1 (next turn's
+`state_start = state_end + 1`), so a re-done given step is never re-credited; the boundary
+(`_verified_boundary`, same fuzzy `completed_hints`-quote locator the mask uses) splits
+`a_C`/`a_I`. Per turn the loop records `step_adv_turns = [ts, boundary, te, state_start,
+state_end, is_fail]` (response-relative token coords). **Terminal labeling** (per the TODO):
+when a wrong rollout's budget is spent, the loop now routes to the selector to LABEL the last
+turn (identify its failed step) but injects **no** hint and charges **no** applied-hint
+penalty (so `num_hints`/the ratchet are unchanged) — one extra selector call per over-budget
+incorrect rollout (incl. budget-0 problems, a real selector-load cost; an all-incorrect group
+is zeroed anyway, so some of those labels are "wasted" — noted). Pool-exhaustion / selector
+failure record a zero-advantage no-fail segment (never guess a boundary on an outage).
+
+**Trainer (`hprl_ray_trainer.py`).** `_update_actor` dispatches: `step_adv.enable` →
+`_hprl_apply_step_advantage` (else the mask). It runs in the SAME hook as the mask — by then
+the batch carries the GRPO `advantages`/`returns` (the SAME tensor; verl GRPO returns
+`scores, scores`) and the assistant-only `response_mask`. It groups rows by `uid` (= the GRPO
+group), reads per-rollout `step_adv_turns` + `acc` (correctness) + `extra_info`, builds the
+per-hint penalty vector in **pool order** from `extra_info.hint_full` with the **same**
+`hint_penalty_total`/`hard_factor`/`guidance` knobs `hint_reward.compute_score` prices hints
+with (so `r` matches the reward's penalty), computes `V`, and **overwrites** the per-token
+`advantages`/`returns` IN PLACE (zeroing each row first, so the stale GRPO scalar and the
+masked injected-hint tokens go to 0). The actor consumes `advantages` as-is (verl whitens
+only inside the per-estimator `compute_advantage`, which this overrides; the policy loss does
+not re-normalize) — verified. `adv_scale` (default 1.0) uniformly scales the small raw values
+(per-hint penalties ~`total_penalty/K` ≈ 0.06 for a 13-hint pool, ≪ GRPO's ~unit advantages)
+to a usable gradient magnitude without retuning the LR.
+
+**Metrics:** `step_adv/{groups_total,groups_scored,groups_zeroed,rows_scored,tokens_assigned,
+adv_pos_mean,adv_neg_mean,value_s0_mean}` (+ the auto-hint `cite_found_rate`, folded in as
+before). `value_s0_mean` is a clean problem-hardness readout (1 = trivial, lower = harder).
+
+**Tests** (`test_auto_hint.py`, **26/26**): `prefix_state` (contiguous + robust to a stray
+out-of-order id); `compute_state_values` on a worked 3-rollout example (`V=[0.7,0.9,0.9,29/30,
+29/30,1]`) and the all-fail telescoping `V[k]=1−Σp[k:]`; `apply_step_level_advantages`
+end-to-end (every segment's exact value, `returns` mirrors `advantages`, stale values
+overwritten, `adv_scale` exact 5×); all-incorrect zeroing and `zero_if_no_correct=false`.
+Also an offline integration run of the REAL `HPRLRayPPOTrainer._hprl_apply_step_advantage`
+against a real dataset `extra_info` (K=13 pool, penalties from `hint_full`) on torch tensors
+with `returns is advantages` — correct a_C/a_I, in-place propagation, uid grouping.
+
+**Run:** `HPRL_STEP_ADV=true bash run_hprl_qwen2.5_7b.sh` (auto-hint only). `HPRL_STEP_ADV_SCALE`
+(default 1.0) tunes the gradient magnitude. Both flow as `data.hprl.auto_hint.step_adv.*`
+hydra overrides. Not yet run live.
+
+**Follow-up — free X.0 guidance hint (`hint_guidance_free`, default false).** New reward kwarg
+(env `HINT_GUIDANCE_FREE`) making every `<step_id>.0` GUIDANCE hint cost 0: in
+`hint_penalty.compute_hint_penalties` the guidance hint gets zero WEIGHT, so the step's penalty is
+borne entirely by its substep hints and `sum(penalties)` STAYS `total_penalty` (the cost is
+redistributed onto the revealing substeps, not dropped). Threaded through `applied_penalty` /
+`penalty_from_k` / `hint_reward.hint_penalty` / `compute_score` (with string coercion), and through
+the step-adv path (`_step_adv_penalty_cfg`/`_vec`) so the value-based `r(h)` matches the reward — a
+guidance step then has `r=0`, so self-achieving or being given it is value-neutral. Only zeroed when
+the step has substeps to absorb it (no guidance-only steps exist in the curated pools: 0/2069).
+Verified on real data: x.0 → 0, total preserved at 0.8, substep `1.1` 0.0436→0.0623.
+
+### Files touched this session
+- `step_advantage.py` *(new)* — `prefix_state`, `compute_state_values` (the backward V
+  recursion), `assign_row_advantages` (per-row a_C/a_I token write), `apply_step_level_advantages`
+  (group-by-uid orchestrator + stats); pure, duck-typed torch/numpy
+- `hint_penalty.py` — `guidance_free` in `compute_hint_penalties` / `applied_penalty` / `penalty_from_k`
+- `hint_reward.py` — `hint_guidance_free` kwarg (coerced) → `hint_penalty` + `penalty_from_k`
+- `auto_hint_agent_loop.py` — `step_adv_enable` flag; per-turn `step_adv_turns` recording
+  (solving / hinted / terminal-label / pool-exhausted / selector-fail segments); budget-spent
+  → terminal selector LABEL (no hint given); `_record_step_adv_turn`; import `prefix_state`
+- `hprl_ray_trainer.py` — `_hprl_apply_step_advantage` + `_step_adv_penalty_cfg` /
+  `_step_adv_penalty_vec` / `_coerce_turns`; `_update_actor` mask-vs-step-adv dispatch;
+  `step_adv_turns` added to the rollout-log columns; `_truthy` helper
+- `config/hprl_trainer.yaml` — `data.hprl.auto_hint.step_adv` block (enable / terminal_value /
+  zero_if_no_correct / adv_scale)
+- `run_hprl_qwen2.5_7b.sh` — `HPRL_STEP_ADV` + `HPRL_STEP_ADV_SCALE` + `HINT_GUIDANCE_FREE` knobs
+- `test_auto_hint.py` — step-adv unit tests (prefix_state, values, advantage assignment, scale,
+  zeroing) + guidance-free (x.0→0, total preserved)
+
+## 2026-06-22 — AUTO-HINT (push-hint) mode + verified-prefix gradient mask
+
+New, flag-gated mechanism alongside the `<hint_call/>` path. The policy is **no longer
+taught to ask for hints**: it runs the ordinary single-turn math prompt (the exact format
+of `dataset/dapo-3139-single-turn.parquet`), and the **loop** decides when to hint.
+
+**Rollout (`auto_hint_agent_loop.AutoHintAgentLoop`, agent_name=`auto_hint`).** Per turn:
+generate → grade the boxed answer (same mathruler grader the reward uses) → **correct →
+stop**; **wrong & injections < budget B_q →** ask the frozen selector for the next hint,
+inject it as a user message (masked 0), continue. Stops on correct, budget spent, or
+pending-hint pool exhausted. Injected hints are recorded into `applied_hints` (the same
+key HintAgentLoop uses), so the reward penalty + budget ratchet are unchanged. No
+`<hint_call/>`, so no over-budget protocol violation, no box-then-call, no front-loading.
+
+**Selector → multi-round Template F** (`selector_multi.py`, vendored from
+`selector/test_cite/.../multi-cite-gpt-eval/prompt_template_multiF.py`). The WHOLE pool is
+rendered with a per-hint `status` (`completed` | `pending`): hints already given/verified
+are `completed` (never re-selected); the selector picks the next `pending` hint and reports
+in `completed_hints` any pending hint the student newly achieved that round, each with a
+verbatim `quote`. `HintSelector.select_multi(problem, trace, pool, completed)` added (shares
+the round-robin/failover `_complete` with the single-pick `select`). A rollout tracks its
+`completed` set across rounds = given hints ∪ self-achieved cited hints.
+
+**Reward** = the existing `hint_reward.compute_score`, run with the `<hint_call/>`-specific
+terms OFF (`hint_call_reward=0`, `hint_shape_coeff=0`, `no_hint_penalty_factor=0`,
+`finalize_incorrect=false`), so it reduces to `correct ? max(correct+format−penalty, floor)
+: incorrect`. Per-hint penalty (`strategy=hint`), since the multi-round selector gives one
+substep hint per round.
+
+**Verified-prefix gradient mask** (the novel part; `auto_hint_mask.py`, applied in
+`HPRLRayPPOTrainer._update_actor` before the actor update, gated on
+`data.hprl.auto_hint.enable`):
+- **advantage ≤ 0 → train on ALL model tokens** (a worse-than-average rollout is pushed
+  away in full);
+- **advantage > 0 → per the user's split:** a turn that was **followed by a hint injection**
+  is trained only up to its **last selector-verified sentence** (fuzzy-locate each
+  `completed_hints` quote in that turn via `locate_quote_end`, keep tokens up to the furthest
+  match, **disable the unverified tail**); the **ending turn** (correct answer, or budget
+  reached — never followed by a hint) is **always fully promoted**. So a first-try-correct
+  rollout *is* the ending turn → full promotion (no empty-prefix degenerate case), and no
+  extra "verify-on-correct" selector call is needed.
+
+Mechanics: the rollout records compact `disable_spans` = `[start,end)` response-token ranges
+(only the unverified tails). These flatten to `non_tensor_batch` (agent_loop.py:1000-1006);
+the trainer zeroes them out of `batch.batch["response_mask"]` (the assistant-only loss mask,
+agent_loop.py:484) for positive-advantage rows only — verified against the verl flow
+(`_update_actor` receives the batch with `advantages` + `response_mask` already computed;
+modifying `response_mask` propagates into every micro-batch loss). `use_kl_in_reward=False`,
+so the per-sequence advantage sign read (masked mean) is exact.
+
+**Metrics:** `auto_hint/{rows_with_spans, rows_pos_masked, mask_tokens_dropped}` (mask effect)
+and **`auto_hint/cite_found_rate`** (+ `cite_quotes_found`/`_total`) — of the selector's
+`completed_hints` quotes, the fraction that fuzzy-locate in the trace it was shown (selector-
+citation honesty; a low rate means the mask anchors on fabricated/paraphrased quotes). Counted
+per rollout in the loop (against the full `build_trace`), aggregated in
+`HPRLRayPPOTrainer._auto_hint_cite_stats`, surfaced to wandb via `_update_actor`.
+
+**Data.** `dataset/dapo-3139-auto-hint.parquet` (`build_auto_hint_data.py`): the plain
+single-turn prompts joined by `problem_id` with the hint pool / `hint_full` / budget from
+`dapo-3139-hint-verl-mt-clean` (same 3139 set, 3139/3139 overlap). `extra_info.hprl_auto_hint`
+makes `HintBudgetDataset` update only the loop's budget, never the (hint-agnostic) prompt.
+`prepare_hint_data.py --mode auto_hint` builds the same from a fresh pre-upgrade source.
+
+**Adaptive ratchet option** (`data.hprl.ratchet_mode`, default `downward`; env
+`HPRL_RATCHET_MODE`). The existing downward ratchet is strictly monotone-down and, in
+auto-hint, very aggressive (a single 0-hint first-try solve snaps B_q→0). `ratchet_mode=adaptive`
+(`budget_manager.compute_adaptive_budget`) is two-sided: **no correct rollout → RAISE B_q by 1**
+(clamped to `data.hprl.max_budget`, default = turn cap), **over half correct (2C>N) → set B_q
+to the (N/2)-th smallest correct hint count** (no decrement), else hold. Applies to the
+single-pack path (k-pack-probed problems still use the k-pack rule). Self-tests in
+`test_auto_hint.py`.
+
+**Run:** auto-hint is now the **DEFAULT** — `bash run_hprl_qwen2.5_7b.sh` runs it
+(`HPRL_AUTO_HINT=true`, set in the Paths section, which pins the auto-hint train/val files
++ per-hint penalty + disabled `<hint_call/>`-reward terms + `data.hprl.auto_hint.enable=true`
+via `:=` defaults you can still override). `run_auto_hint_qwen2.5_7b.sh` is now just a
+distinctly-named alias. **To run the legacy `<hint_call/>` job: `HPRL_AUTO_HINT=false`**
+(restores the `<hint_call/>` train file, `major_step`, finalize-incorrect, k-pack; the mask
+no-ops since those rollouts carry no `disable_spans`). k-pack defaulted OFF under auto-hint.
+
+**Tests:** `test_auto_hint.py` — 11/11 (mask transform sign-gating/clamping, the fuzzy
+locator across exact/whitespace/unicode-LaTeX/no-match, status rendering, pool exhaustion).
+Verified the run-script var resolution: default → auto-hint, `HPRL_AUTO_HINT=false` → the
+exact legacy `<hint_call/>` settings, user env overrides win.
+
+### Files touched this session
+- `selector_multi.py` *(new)* — vendored multi-round Template F prompt + `render_hints_with_status` / `pending_hint_ids` + fuzzy `locate_quote_end`
+- `auto_hint_mask.py` *(new)* — pure positive-advantage span-zeroing transform (duck-typed torch/numpy)
+- `auto_hint_agent_loop.py` *(new)* — `AutoHintAgentLoop` push-hint rollout
+- `build_auto_hint_data.py` *(new)* — join plain prompts + hint payload → auto-hint parquet
+- `run_auto_hint_qwen2.5_7b.sh` *(new)* — auto-hint run wrapper
+- `test_auto_hint.py` *(new)* — mask + locator unit tests
+- `hint_selector.py` — `select_multi` + shared `_complete`
+- `hprl_ray_trainer.py` — `_hprl_apply_auto_hint_mask` in `_update_actor`; `disable_spans` in the rollout dump
+- `hint_dataset.py` — `_update_auto_hint_budget` (budget-only, no prompt re-render)
+- `budget_manager.py` — `compute_adaptive_budget` (two-sided rule) + `BudgetManager` `ratchet_mode`/`max_budget`
+- `prepare_hint_data.py` — `--mode auto_hint` (plain prompt)
+- `hint_agent_config.yaml` — register `auto_hint`
+- `config/hprl_trainer.yaml` — `data.hprl.auto_hint` block
+- `run_hprl_qwen2.5_7b.sh` — `HPRL_AUTO_HINT` flags (default off), overridable run name
+
+---
 
 ## 2026-06-14 — `v4_cite` selector prompt adopted; selector dump made self-contained; reward reconfigured (~2× compression) for the next run
 
@@ -1255,4 +1475,71 @@ actually assembles. No method-side work is blocked on the cluster — only valid
 - `budget_manager.py` — new downward rule + self-tests
 - `run_hprl_qwen2.5_7b.sh` — HINT_SHAPE_COEFF
 - `downward_budget_plan.md`, `README.md` — docs
+
+---
+
+## 2026-06-22 — budget-grouped data sampling (generation-step load balancing)
+
+**The problem.** The data is sampled uniformly at random, so each step's batch mixes
+problems with very different hint-call budgets B_q — a budget-0 problem (one unaided
+turn) sits next to a budget-6 problem (up to six selector rounds, each adding a tool
+round-trip + extra generation turns). Async multi-turn rollout ends a step only when
+its SLOWEST rollout finishes, so the budget-0 rollouts complete early and their GPUs
+idle while the high-budget stragglers run on. The big-budget problems bottleneck the
+whole generation step. On the live train file the budgets span 0..6 (baked dist:
+{0:802, 2:6, 3:111, 4:1557, 5:641, 6:22}).
+
+**The fix.** A budget-grouped train sampler (`budget_sampler.BudgetGroupedSampler`). At
+the START OF EACH EPOCH it orders the epoch's problems by their CURRENT budget B_q and
+packs same-budget problems into the same step's batch, so a step's rollouts all run
+~the same number of hint rounds and finish together — no straggler, no idle GPUs. The
+budget read is the LIVE ratcheted B_q from `budget_state_path` (the same file the
+trainer ratchet writes and `HintBudgetDataset` reads), falling back to the parquet's
+baked budget for not-yet-ratcheted problems, so the grouping tracks the ratchet as the
+run progresses.
+
+**Measured (real `dapo-3139-auto-hint`, batch 128):** mean per-batch budget span
+**5.58 → 0.25** (20/24 batches perfectly homogeneous; the few mixed ones are at level
+boundaries, e.g. the 6-problem budget-2 level absorbed into one boundary batch).
+
+**Invariants kept identical to the stock sampler.**
+- Every emitted batch is EXACTLY `train_batch_size` (PPO mini-batch divisibility holds —
+  the verl train path doesn't auto-pad). A random `len % batch_size` remainder is dropped
+  each epoch, a DIFFERENT subset every epoch (random-permute → drop the tail → stable-sort
+  by budget), so no fixed high-budget problem is ever starved — same expected behavior as
+  the stock RandomSampler + drop_last.
+- Per-epoch problem multiset otherwise unchanged; only the problem→step assignment and
+  intra-batch budget spread change. GRPO groups by uid, not batch membership, so advantages
+  are unaffected. Composes with k-pack (packs cluster around the grouped base budget) and
+  auto-hint.
+- STATEFUL: mirrors torchdata's `_StatefulRandomSamplerIterator` (snapshot + checkpoint the
+  torch Generator state + yielded count) → exact mid-epoch resume through StatefulDataLoader
+  (verified end-to-end). Train sampler only; validation untouched.
+
+**Wiring (flag-gated override, no verl core edit).** `main_hprl.HPRLTaskRunner.run` rebinds
+`main_ppo.create_rl_sampler` to `budget_sampler.wrap_create_rl_sampler(...)` — the same trick
+as the existing `RayPPOTrainer` rebind. With `data.hprl.budget_sampling.enable=false` the
+wrapper delegates to the stock function (byte-identical). New config block
+`data.hprl.budget_sampling.{enable, shuffle_batch_order}`. `shuffle_batch_order=true`
+randomizes the order the homogeneous batches run within an epoch (each batch stays
+homogeneous; only the step sequence is shuffled), so every step is still a random budget
+level (stationary difficulty) rather than a fixed easy→hard ramp.
+
+**Default.** Config default `enable: false` (conservative framework default, like k-pack),
+but the run scripts default `HPRL_BUDGET_SAMPLING=true` so `bash run_auto_hint_*.sh` /
+`run_hprl_*.sh` use it out of the box. Disable for an apples-to-apples baseline with
+`HPRL_BUDGET_SAMPLING=false bash run_...sh`.
+
+**Validation.** `python budget_sampler.py --selftest` (length/divisibility, homogeneity,
+epoch-to-epoch variety, remainder rotation, ascending order when shuffle off, exact stateful
+resume, live-table override) + a real-parquet integration test through the actual
+StatefulDataLoader (homogeneity @ bs=128, the 5.58→0.25 span, exact 3-batch→resume,
+num_workers=8). All pass.
+
+### Files touched
+- `budget_sampler.py` — NEW: `BudgetGroupedSampler` (stateful) + `wrap_create_rl_sampler` + self-test
+- `main_hprl.py` — rebind `create_rl_sampler` to the budget wrapper
+- `config/hprl_trainer.yaml` — `data.hprl.budget_sampling` block
+- `run_hprl_qwen2.5_7b.sh` — `HPRL_BUDGET_SAMPLING` / `HPRL_BUDGET_SAMPLING_SHUFFLE_ORDER` env + job args
+- `run_auto_hint_qwen2.5_7b.sh` — re-affirm the same defaults for the auto-hint wrapper
 

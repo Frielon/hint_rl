@@ -19,12 +19,16 @@ problems. This needs every step's problem set, so the run is indexed once into a
 `<exp>/.<sub>_problem_steps.json` sidecar (built in the background with live progress,
 updated incrementally as new steps land); see `api_problem_steps`.
 
-Multi-turn HPRL rollouts are rendered turn-by-turn: the model emits the
-`<hint_call/>` sentinel, and the system injects a curated hint as the next user
-turn. The chat template strips `<|im_start|>` / `<|im_end|>`, leaving bare
-`system` / `user` / `assistant` role lines, which this viewer parses back into
-turns. The new per-rollout HPRL fields (num_hints, hint_budget, hint_penalty,
-hint_call_failed, applied_hints) are surfaced in the rollout header.
+Multi-turn HPRL rollouts are rendered turn-by-turn. Two on-disk forms are parsed
+(see `split_turns`): (1) the stripped bare-role form, where the chat template
+removes `<|im_start|>` / `<|im_end|>` leaving bare `system` / `user` / `assistant`
+role lines and the model emits the `<hint_call/>` sentinel that pulls in a curated
+hint as the next user turn; and (2) the raw-token form, where the dump RETAINS the
+`<|im_start|>` / `<|im_end|>` tokens and turns are delimited purely by them, with NO
+`<hint_call/>` sentinel (e.g. the auto-hint push-hint runs, which inject a hint as a
+user turn whenever an answer is wrong). The new per-rollout HPRL fields (num_hints,
+hint_budget, hint_penalty, hint_call_failed, applied_hints) are surfaced in the
+rollout header.
 
 Selector responses: each injected hint carries a "🔍 selector response" button that
 reveals the ORIGINAL frozen-selector call that produced it -- the student trace and
@@ -88,6 +92,16 @@ HINT_CALL = "<hint_call/>"
 # bare role lines left after the chat template strips <|im_start|>/<|im_end|>
 _LEAD_MARKERS = ("system\n", "user\n", "assistant\n")
 _ROLE_MARKERS = (("\nassistant\n", "assistant"), ("\nuser\n", "user"), ("\nsystem\n", "system"))
+
+# Some runs keep the raw chat special tokens in the dumped input/output instead of
+# the stripped bare-role form (e.g. the auto-hint push-hint runs, where turns are
+# delimited only by these tokens and there is NO <hint_call/> sentinel). When a
+# rollout text still carries <|im_start|>, we parse turns off the tokens directly.
+IM_START = "<|im_start|>"
+IM_END = "<|im_end|>"
+_CHAT_ROLES = ("system", "user", "assistant", "tool")
+# "<|im_start|>role\n" opening a turn; the role line runs to the first newline.
+_IM_ROLE_RE = re.compile(r"<\|im_start\|>(" + "|".join(_CHAT_ROLES) + r")\n")
 
 # ---- selector-call linking ------------------------------------------------- #
 # Each injected hint can be traced back to the ORIGINAL frozen-selector call that
@@ -153,9 +167,14 @@ def problem_group_key(rollout_input: str) -> str:
 def _input_problem_core(rollout_input: str) -> str:
     """Recover a rollout prompt's bare, budget-invariant problem statement -- the
     last user turn with the dataset suffix + hint-budget line stripped. Shared by
-    the group key and the selector-call match key so both see the same statement."""
-    user = rollout_input.rsplit("\nuser\n", 1)[-1].rsplit("\nassistant", 1)[0]
-    return _problem_core(user)
+    the group key and the selector-call match key so both see the same statement.
+
+    Goes through `split_turns` so it works whether the prompt is in the stripped
+    bare-role form or still carries `<|im_start|>` tokens (the manual `\\nuser\\n`
+    split matched neither boundary in the token form)."""
+    turns = split_turns(rollout_input, start_role="system")
+    users = [t["text"] for t in turns if t["role"] == "user"]
+    return _problem_core(users[-1] if users else rollout_input)
 
 
 def _system_base(system_text: str, hprl_base) -> str:
@@ -269,16 +288,47 @@ def match_dataset_problem(rollout_input: str):
     return None
 
 
+def _split_turns_special(text: str, start_role: str):
+    """Split a chat string that RETAINS the `<|im_start|>`/`<|im_end|>` special
+    tokens into [{role, text, hint_call, injected}] turns.
+
+    Turns are delimited purely by the tokens: each `<|im_start|>role\\n` opens a
+    turn whose body runs to the next `<|im_end|>`. The leading slice before the
+    first `<|im_start|>` belongs to ``start_role`` -- this is the model's own
+    continuation in an `output` dump (the prompt ended on `<|im_start|>assistant\\n`,
+    so the assistant text starts bare). In this form there is no `<hint_call/>`
+    sentinel and a stray literal `user\\n` inside the model's text is NOT a real
+    role marker, so every parsed `user` turn is a genuine injected hint (tagged
+    ``injected``)."""
+    turns = []
+    head = text.split(IM_START, 1)[0]
+    if head.strip():  # bare continuation of start_role (assistant text in `output`)
+        seg = head.split(IM_END, 1)[0]
+        turns.append({"role": start_role, "text": seg.strip("\n"),
+                      "hint_call": HINT_CALL in seg, "injected": False})
+    for m in _IM_ROLE_RE.finditer(text):
+        role = m.group(1)
+        body = text[m.end():].split(IM_START, 1)[0].split(IM_END, 1)[0]
+        turns.append({"role": role, "text": body.strip("\n"),
+                      "hint_call": HINT_CALL in body, "injected": role == "user"})
+    return [t for t in turns if t["text"].strip()]
+
+
 def split_turns(text: str, start_role: str = "assistant"):
     """Split a flattened chat string into [{role, text, hint_call}] turns.
 
-    A `<hint_call/>` immediately followed by a `user\\n` marker ends an assistant
-    turn (the sentinel is kept visible) and starts the injected-hint user turn.
-    Plain `\\nrole\\n` markers switch turns too; a leading bare role line (as in
+    Two on-disk forms are handled. If the text still carries the raw chat special
+    tokens (`<|im_start|>`/`<|im_end|>`), turns are delimited by those tokens
+    (`_split_turns_special`). Otherwise it is the stripped bare-role form: a
+    `<hint_call/>` immediately followed by a `user\\n` marker ends an assistant
+    turn (the sentinel is kept visible) and starts the injected-hint user turn;
+    plain `\\nrole\\n` markers switch turns too; a leading bare role line (as in
     the `input` prompt, which begins with `system\\n`) sets the first role.
     """
     if not text:
         return []
+    if IM_START in text:
+        return _split_turns_special(text, start_role)
     role = start_role
     i = 0
     n = len(text)
@@ -408,7 +458,11 @@ def annotate_selector_keys(problem_core: str, turns):
     injected hint (a served hint, or the "no hint available" message after a
     selector failure -- both produce a dumped selector call). A user turn split out
     of the model's OWN text by a stray literal ``user\\n`` (an early-training
-    artifact, ``hint_call`` False) is not a real call and gets no button."""
+    artifact, ``hint_call`` False) is not a real call and gets no button.
+
+    A user turn carrying ``injected`` (parsed off `<|im_start|>` tokens, the
+    auto-hint push-hint form which has no `<hint_call/>` sentinel) is always a
+    genuine injected hint, so it is tagged on the assistant trace so far too."""
     acc = []
     prev_hint_call = False
     for t in turns:
@@ -417,7 +471,7 @@ def annotate_selector_keys(problem_core: str, turns):
             acc.append(t.get("text", ""))
             prev_hint_call = bool(t.get("hint_call"))
         elif role == "user":
-            if prev_hint_call:
+            if prev_hint_call or t.get("injected"):
                 t["sel_key"] = selector_match_key(problem_core, acc)
             prev_hint_call = False
         else:
@@ -816,8 +870,16 @@ PAGE = r"""
   .prompt { margin-bottom: 16px; }
   .roll { background: #fff; border: 1px solid #e0e4ea; border-radius: 8px;
           margin-bottom: 12px; }
-  .roll-head { display: flex; gap: 14px; align-items: center; padding: 8px 12px;
-               border-bottom: 1px solid #eef0f4; font-size: 12px; flex-wrap: wrap; }
+  details.roll > summary.roll-head { display: flex; gap: 14px; align-items: center;
+               padding: 8px 12px; font-size: 12px; flex-wrap: wrap; cursor: pointer;
+               list-style: none; user-select: none; border-radius: 8px; }
+  details.roll[open] > summary.roll-head { border-bottom: 1px solid #eef0f4;
+               border-radius: 8px 8px 0 0; }
+  details.roll > summary.roll-head:hover { background: #f6f8fc; }
+  details.roll > summary.roll-head::-webkit-details-marker { display: none; }
+  details.roll > summary.roll-head::before { content: '▸'; color: #9fb2e6;
+               font-size: 11px; flex: 0 0 auto; }
+  details.roll[open] > summary.roll-head::before { content: '▾'; }
   .roll-head .k { color: #66708a; }
   .roll-body { padding: 12px; }
   details.pack { margin: 16px 0 0; }
@@ -1277,13 +1339,13 @@ async function loadRollouts(pid) {
         `<span class="hchip">#${esc(h.call_index)} · step ${esc(h.major_step_id)} · conf ${esc(h.confidence_of_major_step)} · [${esc((h.hint_ids||[]).join(', '))}]</span>`
       ).join('') + '</div>';
     }
-    html += `<div class="roll">
-      <div class="roll-head">
+    html += `<details class="roll">
+      <summary class="roll-head">
         ${head}
-      </div>
+      </summary>
       ${hintsMeta}
       <div class="roll-body">${renderTurns(r.turns)}</div>
-    </div>`;
+    </details>`;
   });
   if (multiPack && lastB !== undefined) html += `</details>`;  // close the last pack
   $('main').innerHTML = html;

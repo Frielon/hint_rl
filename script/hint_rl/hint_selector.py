@@ -23,6 +23,10 @@ from typing import Any, Optional
 # utils.py (same as hint_tool.py) so there is no cross-folder import dependency.
 from utils import selector_prompt, hint_id_of, parse_output
 
+# Multi-round Template F prompt + status renderer (auto-hint rollout). Defined
+# LOCALLY in selector_multi.py (a self-contained copy; no cross-folder import).
+from selector_multi import build_prompt_multi, render_hints_with_status
+
 
 # Major-step exclusion mode for the selector prompt -- i.e. which already-revealed
 # major steps are dropped from the candidate pool before the NEXT selector call.
@@ -320,14 +324,43 @@ class HintSelector:
     async def select(
         self, problem: str, trace: str, hints_str: str
     ) -> tuple[Optional[dict], Optional[str], Optional[str]]:
-        """Pick a hint. Returns (selection_dict, raw_text, err). selection is None on failure.
+        """Pick a hint with the single-pick v4_cite prompt (utils.selector_prompt).
+
+        Returns (selection_dict, raw_text, err). selection is None on failure.
+        Used by the ``<hint_call/>`` rollout (hint_agent_loop).
+        """
+        return await self._complete(selector_prompt(problem, trace, hints_str))
+
+    async def select_multi(
+        self, problem: str, trace: str, pool, completed
+    ) -> tuple[Optional[dict], Optional[str], Optional[str]]:
+        """Pick the next hint with the MULTI-ROUND Template F prompt (selector_multi).
+
+        Renders the WHOLE pool with per-hint ``status`` (completed | pending) -- the
+        auto-hint rollout's status-marking mechanism -- so the selector picks the
+        next pending hint and also reports, in ``completed_hints``, any pending hint
+        the student newly achieved this round (each with a verbatim ``quote``). Used
+        by the auto-hint rollout (auto_hint_agent_loop). ``pool`` is the FULL hint
+        pool (JSON str or dict); ``completed`` the ids already given/verified.
+
+        Returns (selection_dict, raw_text, err); selection is None on failure. The
+        parsed dict carries at least ``hint_id`` / ``hint`` / ``completed_hints``.
+        """
+        hints_rendered = render_hints_with_status(pool, completed)
+        return await self._complete(build_prompt_multi(problem, trace, hints_rendered))
+
+    async def _complete(
+        self, prompt: str
+    ) -> tuple[Optional[dict], Optional[str], Optional[str]]:
+        """Send one selector prompt and return (selection_dict, raw_text, err).
 
         Spreads load across the independent selector servers (random start per
         call) and fails over to a different server on each retry -- so a slow or
         down server is skipped rather than failing the call. With >1 server keep
-        ``max_retries`` >= 2 so a failover attempt is actually made.
+        ``max_retries`` >= 2 so a failover attempt is actually made. Shared by
+        ``select`` (single-pick prompt) and ``select_multi`` (multi-round prompt);
+        the only difference between the two is which prompt template is sent.
         """
-        prompt = selector_prompt(problem, trace, hints_str)
         n = len(self.base_urls)
         start = random.randrange(n)
         last_err = None

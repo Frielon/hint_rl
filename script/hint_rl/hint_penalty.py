@@ -133,11 +133,19 @@ def compute_hint_penalties(
     total_penalty: float = DEFAULT_TOTAL_PENALTY,
     hard_factor: float = DEFAULT_HARD_FACTOR,
     guidance_difficulty: str = DEFAULT_GUIDANCE_DIFFICULTY,
+    guidance_free: bool = False,
 ) -> dict[str, float]:
     """Map every ``hint_id`` in the pool to its penalty weight.
 
     ``sum(result.values()) == total_penalty`` (up to float error), regardless of
     ``hard_factor``.
+
+    ``guidance_free`` (default False): make every ``<step_id>.0`` GUIDANCE hint cost
+    0. It is given zero WEIGHT in the within-step split, so the step's penalty is
+    borne entirely by its substep hints and ``sum(result.values())`` STAYS
+    ``total_penalty`` (the cost is redistributed onto the revealing substeps, not
+    dropped). Only applied when the step has substeps to absorb it; a guidance-only
+    step keeps its penalty so it does not vanish (no such steps in the curated pools).
     """
     steps = _as_steps(hint_full)
     if not steps:
@@ -155,11 +163,16 @@ def compute_hint_penalties(
 
         # second level: split this step's penalty across its hints --
         # guidance "<step_id>.0" + one per substep.
+        substeps = step.get("substeps") or []
         hint_diffs = [(f"{step_id}.0", guidance_difficulty)]
-        for ss in step.get("substeps") or []:
+        for ss in substeps:
             hint_diffs.append((str(ss.get("substep_id")), ss.get("difficulty")))
 
         hint_weights = [difficulty_weight(d, hard_factor) for _, d in hint_diffs]
+        # guidance_free: zero the guidance hint's WEIGHT so the substeps split the
+        # whole step penalty (total preserved). Skipped for a guidance-only step.
+        if guidance_free and substeps:
+            hint_weights[0] = 0.0
         total_hint_w = sum(hint_weights) or 1.0
         for (hid, _), w_hint in zip(hint_diffs, hint_weights):
             penalties[str(hid)] = step_penalty * w_hint / total_hint_w
@@ -174,6 +187,7 @@ def applied_penalty(
     total_penalty: float = DEFAULT_TOTAL_PENALTY,
     hard_factor: float = DEFAULT_HARD_FACTOR,
     guidance_difficulty: str = DEFAULT_GUIDANCE_DIFFICULTY,
+    guidance_free: bool = False,
 ) -> float:
     """Sum of penalties for the hints applied in a rollout (``sum_k w_{j_k}``)."""
     if not applied_hints or not hint_full:
@@ -183,6 +197,7 @@ def applied_penalty(
         total_penalty=total_penalty,
         hard_factor=hard_factor,
         guidance_difficulty=guidance_difficulty,
+        guidance_free=guidance_free,
     )
     total = 0.0
     for h in applied_hints:
@@ -250,6 +265,7 @@ def penalty_from_k(
     total_penalty: float = DEFAULT_TOTAL_PENALTY,
     hard_factor: float = DEFAULT_HARD_FACTOR,
     guidance_difficulty: str = DEFAULT_GUIDANCE_DIFFICULTY,
+    guidance_free: bool = False,
 ) -> float:
     """Penalty for "finishing from hint ``final_k``": every hint/step from ``final_k``
     through the LAST one in the pool that was NOT already applied.
@@ -296,6 +312,7 @@ def penalty_from_k(
         total_penalty=total_penalty,
         hard_factor=hard_factor,
         guidance_difficulty=guidance_difficulty,
+        guidance_free=guidance_free,
     )
     ordered_ids = list(penalties.keys())  # dict preserves pool order
     target = str(final_k)

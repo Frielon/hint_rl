@@ -52,8 +52,10 @@ if [ -f "${HINT_RL_HOME}/.envrc" ]; then
 fi
 export WANDB_API_KEY="${WANDB_API_KEY:-${wandb_key:-}}"
 
-project_name='HPRL-Qwen2.5-7B-Instruct'
-exp_name="HPRL-Qwen2.5-7B-Instruct-dapo-4k-v3-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
+# project_name / exp_name overridable via env so the auto-hint wrapper
+# (run_auto_hint_qwen2.5_7b.sh) can label its runs distinctly.
+project_name=${project_name:-'HPRL-Qwen2.5-7B-Instruct'}
+exp_name=${exp_name:-"HPRL-Qwen2.5-7B-Instruct-dapo-4k-v3-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
 wandb_project=${wandb_project:-"hint_rl"}
 
 # ---- GRPO algorithm (identical to the plain GRPO run) ---------------------
@@ -70,11 +72,11 @@ loss_agg_mode="token-mean"
 # ---- lengths: multi-turn trajectories accumulate tokens across turns ------
 max_prompt_length=2048
 # bumped from 8192: prompt + N*(assistant turn + hint tool result).
-max_response_length=8192
+max_response_length=16384
 
 # ---- multi-turn / hint knobs ----------------------------------------------
 # Cap on assistant turns; must be >= the largest per-problem hint budget B_q.
-max_turns=${max_turns:-8}
+max_turns=${max_turns:-10}
 # Hint mechanism: the policy emits the sentinel <hint_call/> and the custom agent
 # loop (hint_agent_loop.HintAgentLoop) detects it, calls the selector, and injects
 # the hint as the next USER message. Registered via this agent-loop config; the
@@ -117,6 +119,47 @@ WORKING_DIR=${WORKING_DIR:-"${VERL_HOME}"}
 # Paths
 MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Qwen2.5-7B-Instruct"}
 CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
+
+# ---- AUTO-HINT (push-hint) mode -- ON BY DEFAULT --------------------------------
+# HPRL_AUTO_HINT=true (default) makes this an auto-hint run: the policy runs the plain
+# single-turn prompt and the LOOP injects a selector hint on a wrong answer
+# (auto_hint_agent_loop.AutoHintAgentLoop, routed by the train parquet's
+# agent_name="auto_hint"), with the trainer-side verified-prefix gradient mask
+# (data.hprl.auto_hint.enable, passed to the job below). This block pins the matching
+# train + (bare, prompt-matched) val files, the per-hint penalty, and DISABLES the
+# <hint_call/>-specific reward terms (this mode emits no <hint_call/>). Each `:=` is a
+# DEFAULT -- any value you export still wins. Set HPRL_AUTO_HINT=false to run the
+# legacy <hint_call/> job instead (the hint_call defaults further below then apply).
+# MUST precede the TRAIN_FILE / HINT_* / HPRL_KPACK_* defaults so these win.
+HPRL_AUTO_HINT=${HPRL_AUTO_HINT:-true}
+HPRL_AUTO_HINT_FUZZY=${HPRL_AUTO_HINT_FUZZY:-0.8}
+# STEP-LEVEL advantage (auto-hint only): replace GRPO's scalar advantage with the
+# value-based per-segment one (step_advantage.py) and SKIP the verified-prefix mask.
+# Default off (the mask runs). Set HPRL_STEP_ADV=true to switch the auto-hint job to it.
+HPRL_STEP_ADV=${HPRL_STEP_ADV:-false}
+# Uniform multiplier on the (small) value-based advantages -- raise to ~5-10 to match
+# GRPO's gradient magnitude without retuning the LR. 1.0 == the raw step-adv formula.
+HPRL_STEP_ADV_SCALE=${HPRL_STEP_ADV_SCALE:-1.0}
+case "${HPRL_AUTO_HINT}" in
+  true | True | 1 | yes | on)
+    # hint-wise re-seeded initial budgets (budget_calibration/apply_budget_state.py from
+    # budget_calibration/budget_state_hint_wise.json;
+    # problems absent there keep their original baked budget). Override to dapo-3139-auto-hint.parquet
+    # for the original (#major-steps) budgets.
+    : "${TRAIN_FILE:=${HINT_RL_HOME}/dataset/dapo-3139-auto-hint-hintwise.parquet}"
+    # bare (plain-prompt, no agent_name) eval sets -> prompt-matched unaided eval.
+    : "${TEST_FILE:=${HINT_RL_HOME}/dataset/aime2024.parquet}"
+    : "${HARD_TEST_FILE:=${HINT_RL_HOME}/dataset/dapo_sample_hard_100.parquet}"
+    : "${AIME2025_FILE:=${HINT_RL_HOME}/dataset/aime2025.parquet}"
+    : "${HINT_STRATEGY:=hint}"           # per-hint penalty (selector gives one substep hint/round)
+    : "${HINT_CALL_REWARD:=0.0}"         # no <hint_call/> emission -> no anti-suppression bonus
+    : "${HINT_SHAPE_COEFF:=0.0}"         # no front-loading for the shape term to act on
+    : "${NO_HINT_PENALTY_FACTOR:=0.0}"   # the LOOP, not the policy, decides hint availability
+    : "${HINT_FINALIZE_INCORRECT:=false}"
+    : "${HPRL_KPACK_ENABLE:=false}"      # k-pack off for auto-hint by default (set true to combine)
+    ;;
+esac
+
 TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dapo-3139-hint-verl-mt-clean.parquet"}
 # Templated eval sets: aime2024-hint-mt / dapo_sample_hard_100-hint-mt carry the
 # SAME hint-tool template as training (agent_name="hint_agent", full <hint_call/>
@@ -134,9 +177,13 @@ TEST_FILE=${TEST_FILE:-"${HINT_RL_HOME}/dataset/aime2024-hint-mt.parquet"}
 # reports it separately as val-core/math_dapo/* (aime2024 stays val-core/aime2024/*).
 # verl evaluates each val file independently.
 HARD_TEST_FILE=${HARD_TEST_FILE:-"${HINT_RL_HOME}/dataset/dapo_sample_hard_100-hint-mt.parquet"}
+# Third held-out eval: AIME 2025 (data_source "aime2025", reported separately as
+# val-core/aime2025/*). Templated (-hint-mt) here for the <hint_call/> job; the
+# auto-hint block above pins the bare dataset/aime2025.parquet instead.
+AIME2025_FILE=${AIME2025_FILE:-"${HINT_RL_HOME}/dataset/aime2025-hint-mt.parquet"}
 # All validation files as a hydra list (RLHFDataset concatenates them, each row
 # keeping its own data_source for per-set metrics). Override VAL_FILES to change.
-VAL_FILES=${VAL_FILES:-"['${TEST_FILE}','${HARD_TEST_FILE}']"}
+VAL_FILES=${VAL_FILES:-"['${TEST_FILE}','${HARD_TEST_FILE}','${AIME2025_FILE}']"}
 
 # HPRL reward function (outcome reward minus the summed hint penalty).
 REWARD_FN_PATH=${REWARD_FN_PATH:-"${SCRIPT_DIR}/hint_reward.py"}
@@ -148,9 +195,14 @@ REWARD_MGR_CLASS=${REWARD_MGR_CLASS:-"HintRewardManager"}
 # WITHOUT regenerating the dataset: total penalty across all hints of a problem,
 # the per-difficulty-level multiplier (harder = HARD_FACTOR x), and the difficulty
 # assigned to the X.0 guidance hint.
-HINT_PENALTY_TOTAL=${HINT_PENALTY_TOTAL:-0.9}
+HINT_PENALTY_TOTAL=${HINT_PENALTY_TOTAL:-1.0}
 HINT_PENALTY_HARD_FACTOR=${HINT_PENALTY_HARD_FACTOR:-1.5}
-HINT_GUIDANCE_DIFFICULTY=${HINT_GUIDANCE_DIFFICULTY:-moderate}
+HINT_GUIDANCE_DIFFICULTY=${HINT_GUIDANCE_DIFFICULTY:-easy}
+# Make every X.0 GUIDANCE hint free (penalty 0): its weight is dropped and the step's
+# penalty is borne entirely by the substep hints (the pool total stays HINT_PENALTY_TOTAL).
+# Applies to the per-hint reward AND the step-adv r(h). false = the X.0 hint is priced
+# normally (HINT_GUIDANCE_DIFFICULTY). (reward_kwargs.hint_guidance_free.)
+HINT_GUIDANCE_FREE=${HINT_GUIDANCE_FREE:-false}
 
 # "No hint available" penalty: each pool-exhausted <hint_call/> (the loop had no
 # candidate left to serve -- common terminal state of cumulative step-exclude) costs
@@ -235,7 +287,13 @@ HPRL_ENABLE=${HPRL_ENABLE:-True}
 BUDGET_STATE_PATH=${BUDGET_STATE_PATH:-"${EXP_LOG_DIR}/budget_state.json"}
 HPRL_MIN_BUDGET=${HPRL_MIN_BUDGET:-0}
 HPRL_DECREMENT=${HPRL_DECREMENT:-1}
-HPRL_DEFAULT_BUDGET=${HPRL_DEFAULT_BUDGET:-${max_turns}}
+HPRL_DEFAULT_BUDGET=${HPRL_DEFAULT_BUDGET:-6}
+# Single-pack ratchet rule: "downward" (strictly down; default) or "adaptive" (raise B_q
+# by 1 when NO rollout is correct; set B_q to the N/2-th smallest correct hint count when
+# OVER HALF are correct; else hold). See budget_manager.compute_adaptive_budget.
+HPRL_RATCHET_MODE=${HPRL_RATCHET_MODE:-downward}
+# Ceiling on B_q (bounds the adaptive rule's upward branch). Defaults to the turn cap.
+HPRL_MAX_BUDGET=${HPRL_MAX_BUDGET:-6}
 
 # k-pack counterfactual-probe ratchet ("double-rollout" / k-pack). OFF by default ->
 # the single-pack downward ratchet runs unchanged. When on, EVERY problem's rollout.n
@@ -244,11 +302,30 @@ HPRL_DEFAULT_BUDGET=${HPRL_DEFAULT_BUDGET:-${max_turns}}
 # B to the smallest B' with >= require_successes correct rollouts at <= B' hints. The
 # per-step rollout TOTAL is unchanged (rollout.n is divided by k internally). REQUIRES
 # rollout.n divisible by k. See config/hprl_trainer.yaml.
-HPRL_KPACK_ENABLE=${HPRL_KPACK_ENABLE:-true}
+HPRL_KPACK_ENABLE=${HPRL_KPACK_ENABLE:-false}
 HPRL_KPACK_K=${HPRL_KPACK_K:-2}
 HPRL_KPACK_REQUIRE_SUCCESSES=${HPRL_KPACK_REQUIRE_SUCCESSES:-2}
 # scale ppo_mini_batch_size by k so the PPO mini-batch sample count is unchanged.
 HPRL_KPACK_SCALE_MINI_BATCH=${HPRL_KPACK_SCALE_MINI_BATCH:-true}
+
+# ---- budget-grouped data sampling (load-balance the generation step) ----------
+# The stock uniform sampler mixes budget-0 (one unaided turn) and high-budget (many
+# selector rounds) problems in one step; async multi-turn rollout ends a step on its
+# SLOWEST rollout, so the high-budget problems straggle and the finished GPUs idle.
+# When ON, each epoch orders problems by their CURRENT (ratcheted) budget B_q and packs
+# same-budget problems into the same step -> a step's rollouts run ~equal hint rounds
+# and finish together. Each batch stays exactly train_batch_size and the per-epoch
+# problem set is unchanged (a random remainder < batch_size is dropped, as with the
+# stock sampler + drop_last). ON by default for HPRL runs; set HPRL_BUDGET_SAMPLING=false
+# for the stock uniform random sampler. See budget_sampler.BudgetGroupedSampler.
+HPRL_BUDGET_SAMPLING=${HPRL_BUDGET_SAMPLING:-true}
+# randomize the order the homogeneous batches run within an epoch (each batch stays
+# homogeneous; only the step sequence is shuffled) so every step is still a random
+# budget level. false -> ascending-budget order (a fixed easy->hard ramp per epoch).
+HPRL_BUDGET_SAMPLING_SHUFFLE_ORDER=${HPRL_BUDGET_SAMPLING_SHUFFLE_ORDER:-true}
+# NOTE: HPRL_AUTO_HINT (the push-hint mode, ON by default) + its coordinated
+# train/val/reward defaults are set EARLY, in the "Paths" section above (they must
+# precede the TRAIN_FILE / HINT_* / HPRL_KPACK_* defaults so they can win).
 
 # Archive a verbatim snapshot of the WHOLE hint_rl script folder alongside the
 # run's logs -- not just this launcher, but every HPRL source it pulls in (agent
@@ -346,6 +423,8 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     data.hprl.min_budget=${HPRL_MIN_BUDGET} \
     data.hprl.decrement=${HPRL_DECREMENT} \
     data.hprl.default_budget=${HPRL_DEFAULT_BUDGET} \
+    data.hprl.ratchet_mode=${HPRL_RATCHET_MODE} \
+    data.hprl.max_budget=${HPRL_MAX_BUDGET} \
     data.hprl.strategy=${HINT_STRATEGY} \
     data.hprl.step_exclude_mode=${HINT_STEP_EXCLUDE_MODE} \
     data.hprl.finalize_incorrect=${HINT_FINALIZE_INCORRECT} \
@@ -353,6 +432,12 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     data.hprl.kpack.k=${HPRL_KPACK_K} \
     data.hprl.kpack.require_successes=${HPRL_KPACK_REQUIRE_SUCCESSES} \
     data.hprl.kpack.scale_mini_batch=${HPRL_KPACK_SCALE_MINI_BATCH} \
+    data.hprl.budget_sampling.enable=${HPRL_BUDGET_SAMPLING} \
+    data.hprl.budget_sampling.shuffle_batch_order=${HPRL_BUDGET_SAMPLING_SHUFFLE_ORDER} \
+    data.hprl.auto_hint.enable=${HPRL_AUTO_HINT} \
+    data.hprl.auto_hint.fuzzy_threshold=${HPRL_AUTO_HINT_FUZZY} \
+    data.hprl.auto_hint.step_adv.enable=${HPRL_STEP_ADV} \
+    data.hprl.auto_hint.step_adv.adv_scale=${HPRL_STEP_ADV_SCALE} \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
@@ -421,13 +506,14 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     reward_model.reward_loop_class_name="${REWARD_MGR_CLASS}" \
     custom_reward_function.path="${REWARD_FN_PATH}" \
     custom_reward_function.name="${REWARD_FN_NAME}" \
-    +custom_reward_function.reward_kwargs.correct_reward=0.9 \
+    +custom_reward_function.reward_kwargs.correct_reward=1.0 \
     +custom_reward_function.reward_kwargs.incorrect_reward=0.0 \
-    +custom_reward_function.reward_kwargs.format_reward=0.1 \
+    +custom_reward_function.reward_kwargs.format_reward=0.0 \
     +custom_reward_function.reward_kwargs.hint_call_reward=${HINT_CALL_REWARD} \
     +custom_reward_function.reward_kwargs.hint_penalty_total=${HINT_PENALTY_TOTAL} \
     +custom_reward_function.reward_kwargs.hint_penalty_hard_factor=${HINT_PENALTY_HARD_FACTOR} \
     +custom_reward_function.reward_kwargs.hint_guidance_difficulty=${HINT_GUIDANCE_DIFFICULTY} \
+    +custom_reward_function.reward_kwargs.hint_guidance_free=${HINT_GUIDANCE_FREE} \
     +custom_reward_function.reward_kwargs.hint_strategy=${HINT_STRATEGY} \
     +custom_reward_function.reward_kwargs.hint_shape_coeff=${HINT_SHAPE_COEFF} \
     +custom_reward_function.reward_kwargs.no_hint_penalty_factor=${NO_HINT_PENALTY_FACTOR} \
@@ -438,9 +524,9 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=True \
-    trainer.test_freq=10 \
-    trainer.save_freq=50 \
-    trainer.max_actor_ckpt_to_keep=1 \
+    trainer.test_freq=5 \
+    trainer.save_freq=20 \
+    trainer.max_actor_ckpt_to_keep=10 \
     trainer.total_epochs=100 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.rollout_data_dir="${LOG_DIR}/${exp_name}/rollouts" \

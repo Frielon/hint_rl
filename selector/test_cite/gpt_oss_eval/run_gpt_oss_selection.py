@@ -65,6 +65,12 @@ from run_hint_selection_model import (  # noqa: E402
 # with --prompt-source local (default) those edits drive every model call.
 import prompt_template_F                           # noqa: E402
 from prompt_template_F import build_prompt         # noqa: E402
+# citation-scoring primitives (same dir) -- reused so _summary.json carries the
+# verbatim-quote stats without a separate check_citations.py pass.
+from check_citations import (  # noqa: E402
+    norm as _cite_norm, loose as _cite_loose,
+    classify as _cite_classify, quotes_of as _cite_quotes_of,
+)
 
 RESULTS_ROOT = TEST_CITE / "results"              # debug/ and runs/ live here
 
@@ -110,21 +116,98 @@ def discover_records(label_dir: Path, steps: Optional[set[int]],
     return out
 
 
+def prune_hint_pool(pool: Any) -> Any:
+    """Drop step-guidance (``X.0``) hints and the per-hint ``type`` field.
+
+    Leaves only substep hints, each shown as ``{"hint_id", "hint"}``. Accepts the
+    Template F hint-pool dict (``{"steps": [{"hints": [...]}, ...]}``); a JSON
+    string is parsed first, and anything unrecognized is returned unchanged.
+    """
+    if isinstance(pool, str):
+        try:
+            pool = json.loads(pool)
+        except Exception:  # noqa: BLE001
+            return pool
+    if not isinstance(pool, dict):
+        return pool
+    steps = []
+    for st in pool.get("steps", []):
+        hints = [{k: v for k, v in h.items() if k != "type"}
+                 for h in st.get("hints", [])
+                 if h.get("type") != "step_guidence_hint"
+                 and not str(h.get("hint_id", "")).endswith(".0")]
+        steps.append({**st, "hints": hints})
+    return {**pool, "steps": steps}
+
+
+_M_PROBLEM = "## Math problem"
+_M_TRACE = "## Student's current reasoning trace"
+_M_HINTS = "## Candidate hints"
+
+
+def recover_problem_trace(prompt: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Pull ``(problem, trace)`` out of a previously rendered Template F prompt.
+
+    Some label rows store only the rendered ``prompt`` (no structured
+    ``problem`` / ``reasoning_trace`` fields). Every Template F prompt lays the
+    inputs out under the same section headers, so we slice between them. Without
+    this, such rows can't be rebuilt and would silently fall back to the stored
+    OLD prompt (old output schema, un-pruned hints). Returns ``(None, None)`` if
+    the markers aren't found.
+    """
+    if not isinstance(prompt, str):
+        return None, None
+    i_p, i_t, i_h = prompt.find(_M_PROBLEM), prompt.find(_M_TRACE), prompt.find(_M_HINTS)
+    if not (0 <= i_p < i_t < i_h):
+        return None, None
+    problem = prompt[i_p + len(_M_PROBLEM):i_t].strip("\n").strip()
+    trace = prompt[i_t + len(_M_TRACE):i_h].strip("\n").strip()
+    return (problem or None), (trace or None)
+
+
 def rebuild_prompt(rec: dict[str, Any]) -> Optional[str]:
-    """Build the prompt from the LOCAL editable Template F + this row's inputs."""
+    """Build the prompt from the LOCAL editable Template F + this row's inputs.
+
+    The hint pool is pruned first (``prune_hint_pool``): the model is shown only
+    substep hints, with the ``type`` field and every ``X.0`` step-guidance hint
+    removed. If the row lacks structured ``problem`` / ``reasoning_trace`` (some
+    label rows store only the rendered prompt), they are recovered from the
+    stored prompt so the LOCAL template still drives the run.
+    """
     problem, trace, pool = rec.get("problem"), rec.get("reasoning_trace"), rec.get("hint_pool")
-    if problem is None or trace is None or pool is None:
+    if pool is None:
         return None
+    if problem is None or trace is None:
+        rp, rt = recover_problem_trace(rec.get("prompt"))
+        problem = problem if problem is not None else rp
+        trace = trace if trace is not None else rt
+    if problem is None or trace is None:
+        return None
+    pool = prune_hint_pool(pool)
     hints_str = pool if isinstance(pool, str) else json.dumps(pool, indent=2, ensure_ascii=False)
     return build_prompt(problem, trace, hints_str)
+
+
+def trace_for(rec: dict[str, Any]) -> str:
+    """The student trace actually shown to the model for this row (matching
+    rebuild_prompt): the structured ``reasoning_trace`` field, else recovered
+    from the stored prompt. Used to score the cited quotes against the right
+    trace -- including the rows whose label lacks a structured trace."""
+    trace = rec.get("reasoning_trace")
+    if trace is None:
+        _, trace = recover_problem_trace(rec.get("prompt"))
+    return trace or ""
 
 
 def prompt_for(rec: dict[str, Any], source: str) -> Optional[str]:
     """Resolve the prompt for a row.
 
     source="local"  -> rebuild from the editable prompt_template_F.py here, so
-                       your prompt edits drive the run (default). Falls back to
-                       the stored prompt only if the row lacks the inputs.
+                       your prompt edits drive the run (default). Does NOT fall
+                       back to the stored prompt: the stored prompt is the OLD
+                       template, so falling back would silently mix old-schema
+                       rows into the run. Rows that can't be rebuilt return None
+                       (recorded as a visible "no prompt" error instead).
     source="stored" -> reuse the exact prompt Codex was shown (apples-to-apples,
                        ignores any local prompt edits). Falls back to a rebuild.
     """
@@ -132,12 +215,30 @@ def prompt_for(rec: dict[str, Any], source: str) -> Optional[str]:
     stored = stored if isinstance(stored, str) and stored.strip() else None
     if source == "stored":
         return stored or rebuild_prompt(rec)
-    return rebuild_prompt(rec) or stored
+    return rebuild_prompt(rec)
 
 
 # --------------------------------------------------------------------------- #
 # scoring
 # --------------------------------------------------------------------------- #
+def major_step_of(sel: Optional[dict], hint_id: Optional[str]) -> Optional[int]:
+    """Major-step id for a parsed selection.
+
+    Template F's newer output schema no longer emits a separate ``major_step_id``;
+    the selected ``hint_id`` ("X.Y") already encodes the major step as its integer
+    part. Use an explicit ``major_step_id`` when one is present (e.g. an older
+    Codex reference), else derive it from the hint_id.
+    """
+    if isinstance(sel, dict) and isinstance(sel.get("major_step_id"), int):
+        return sel["major_step_id"]
+    if hint_id is None:
+        return None
+    try:
+        return int(str(hint_id).split(".")[0])
+    except (ValueError, IndexError):
+        return None
+
+
 def summarize(samples: list[dict], ref_hint_id, ref_major_step) -> dict[str, Any]:
     hids = [s["hint_id"] for s in samples if s["hint_id"] is not None]
     msids = [s["major_step_id"] for s in samples if s.get("major_step_id") is not None]
@@ -173,6 +274,7 @@ def snapshot_scripts(out_dir: Path) -> None:
         HERE / "run_gpt_oss_eval.sh",                   # the entry bash script
         Path(prompt_template_F.__file__).resolve(),     # the prompt actually used
         SELECTOR / "run_hint_selection_model.py",       # shared parser + OpenAI client
+        HERE / "check_citations.py",                    # citation scorer (folded into summary)
     ]
     manifest: list[str] = []
     for src in sources:
@@ -204,7 +306,7 @@ def process_record(rec: dict[str, Any], client, args) -> Optional[dict[str, Any]
     prompt = prompt_for(rec, args.prompt_source)
     ref = rec.get("parsed_answer") or {}
     ref_hint_id = hint_id_of(ref)
-    ref_major_step = ref.get("major_step_id")
+    ref_major_step = major_step_of(ref, ref_hint_id)
 
     base = {
         "uid": rec.get("uid"),
@@ -242,10 +344,11 @@ def process_record(rec: dict[str, Any], client, args) -> Optional[dict[str, Any]
             sel, perr = parse_output(raw)
             if perr and fin == "length":
                 perr = f"truncated (finish_reason=length); {perr}"
+            hid = hint_id_of(sel)
             samples[i] = {
                 "index": i,
-                "hint_id": hint_id_of(sel),
-                "major_step_id": (sel or {}).get("major_step_id") if sel else None,
+                "hint_id": hid,
+                "major_step_id": major_step_of(sel, hid),
                 "selection": sel,
                 "parse_error": perr,
                 "finish_reason": fin,
@@ -332,6 +435,79 @@ def corpus_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+# --------------------------------------------------------------------------- #
+# citation stats (verbatim-quote check) folded into the corpus summary
+# --------------------------------------------------------------------------- #
+_CITE_FOUND = ("exact", "normalized", "loose", "fuzzy")
+_CITE_FUZZY = 0.85
+
+
+def _cite_rate(c: Counter) -> dict[str, Any]:
+    tot = sum(c.values()) or 1
+    found = sum(c[k] for k in _CITE_FOUND)
+    return {
+        "n_quotes": sum(c.values()),
+        "exact": c["exact"], "normalized": c["normalized"], "loose": c["loose"],
+        "fuzzy": c["fuzzy"], "not_found": c["not_found"], "empty": c["empty"],
+        "exact_rate": round(c["exact"] / tot, 4),
+        "verbatim_rate": round((c["exact"] + c["normalized"] + c["loose"]) / tot, 4),
+        "found_rate": round(found / tot, 4),
+        "not_found_rate": round(c["not_found"] / tot, 4),
+    }
+
+
+def corpus_citation(records: list[dict[str, Any]],
+                    rid_to_trace: dict[str, str]) -> dict[str, Any]:
+    """Verbatim-quote check over every sample's cited quotes, folded into the
+    summary. Each quote is classified against the trace the model actually saw
+    (``rid_to_trace``, recovered for rows whose label lacks a structured trace),
+    mirroring check_citations.py's tiers (word_overlap disabled)."""
+    overall: Counter = Counter()
+    by_step: dict[str, Counter] = {}
+    ref_total = ref_found = 0
+    n_swq = n_all_found = 0
+    tr_cache: dict[str, dict] = {}
+    for r in records:
+        rid = str(r.get("request_id"))
+        trace = rid_to_trace.get(rid, "")
+        tr = tr_cache.get(rid)
+        if tr is None:
+            tr = {"raw": trace, "norm": _cite_norm(trace), "loose": _cite_loose(trace)}
+            tr_cache[rid] = tr
+        step = str(r.get("step"))
+        bs = by_step.setdefault(step, Counter())
+        for q in _cite_quotes_of(r.get("ref_selection")):
+            ref_total += 1
+            if _cite_classify(q, tr, _CITE_FUZZY, 0.0) in _CITE_FOUND:
+                ref_found += 1
+        for s in r.get("samples", []):
+            qs = _cite_quotes_of(s.get("selection"))
+            if not qs:
+                continue
+            n_swq += 1
+            n_found = 0
+            for q in qs:
+                cls = _cite_classify(q, tr, _CITE_FUZZY, 0.0)
+                overall[cls] += 1
+                bs[cls] += 1
+                if cls in _CITE_FOUND:
+                    n_found += 1
+            if n_found == len(qs):
+                n_all_found += 1
+    return {
+        "fuzzy_threshold": _CITE_FUZZY,
+        "n_samples_with_quotes": n_swq,
+        "n_samples_all_found": n_all_found,
+        "all_quotes_found_rate": round(n_all_found / (n_swq or 1), 4),
+        "model_quotes": _cite_rate(overall),
+        "reference_baseline": {
+            "n_quotes": ref_total,
+            "found_rate": round(ref_found / (ref_total or 1), 4),
+        },
+        "by_step": {k: _cite_rate(v) for k, v in sorted(by_step.items())},
+    }
+
+
 def main() -> int:
     args = parse_args()
     label_dir = resolve_label_dir(args.label_run)
@@ -341,7 +517,8 @@ def main() -> int:
         args.out_dir = Path(args.out_dir).resolve()
     else:
         tag = args.model.replace("/", "_")
-        args.out_dir = HERE / "results" / f"{label_dir.name}__{tag}"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")    # current run timestamp
+        args.out_dir = HERE / "results" / f"{label_dir.name}__{tag}__{ts}"
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     records_in = discover_records(label_dir, steps, args.limit)
@@ -388,6 +565,8 @@ def main() -> int:
         bar.close()
 
     summary = corpus_summary(out_records)
+    rid_to_trace = {str(rec.get("request_id")): trace_for(rec) for rec in records_in}
+    summary["citation"] = corpus_citation(out_records, rid_to_trace)
     (args.out_dir / "_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(f"\ndone in {time.time()-t0:.0f}s  ->  {args.out_dir}")
     print(json.dumps({k: v for k, v in summary.items() if k != "by_step"}, indent=2))

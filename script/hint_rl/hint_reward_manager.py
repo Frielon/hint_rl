@@ -90,6 +90,11 @@ class HintRewardManager(RewardManagerBase):
         if "hint_budget_exceeded" not in extra_info and "hint_budget_exceeded" in ntb:
             extra_info["hint_budget_exceeded"] = _to_py(ntb.get("hint_budget_exceeded"))
 
+        # Same for the length-truncation flag (generation hit the response-length cap):
+        # drives the reward's floor-score short-circuit in hint_reward.compute_score.
+        if "length_truncated" not in extra_info and "length_truncated" in ntb:
+            extra_info["length_truncated"] = _to_py(ntb.get("length_truncated"))
+
         # Same for the per-rollout selector latency (total seconds / #calls) and the
         # box-then-call counters; passed through so hint_budget_callback can log
         # hprl/hint_select_time_* and hprl/hint_call_with_box_*.

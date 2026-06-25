@@ -31,12 +31,19 @@ class HPRLTaskRunner(TaskRunner):
     def run(self, config):
         import verl.trainer.main_ppo as main_ppo
 
+        from budget_sampler import wrap_create_rl_sampler
         from hprl_ray_trainer import HPRLRayPPOTrainer
 
         print(f"HPRLTaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         # The base run() instantiates the module-global `RayPPOTrainer`; rebind it
         # so the (unmodified) base flow constructs our flag-gated subclass.
         main_ppo.RayPPOTrainer = HPRLRayPPOTrainer
+        # Same flag-gated override for the train sampler: wrap the module-global
+        # create_rl_sampler (resolved by the base run() at call time) so that with
+        # data.hprl.budget_sampling.enable=true it returns the BudgetGroupedSampler
+        # (budget-homogeneous batches -> no high-budget straggler bottlenecking the
+        # generation step) and is byte-identical to stock when off.
+        main_ppo.create_rl_sampler = wrap_create_rl_sampler(main_ppo.create_rl_sampler)
         return super().run(config)
 
 

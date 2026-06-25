@@ -127,6 +127,10 @@ class BudgetUpdate:
     #                   snapped to that minimum (the primary, ungated rule).
     #   "pivot"      -- fallback fired: new = (N/2-th smallest correct count) - decrement.
     #   "unchanged"  -- no correct rollout, or fewer than N/2 correct at the full budget.
+    #   "raise"      -- ADAPTIVE mode, no correct rollout: budget RAISED by 1 (clamped to
+    #                   max_budget). The only rule that increases B_q.
+    #   "pivot_set"  -- ADAPTIVE mode, over half correct: new = the (N/2)-th smallest correct
+    #                   hint count (NO decrement). See compute_adaptive_budget.
     #   "kpack"      -- the k-pack counterfactual-probe rule fired: new = the smallest
     #                   B' at which >= ``require_successes`` correct rollouts (pooled over
     #                   all probe packs) used <= B' hints (== the require_successes-th
@@ -254,6 +258,88 @@ def compute_downward_budget(
     )
 
 
+def compute_adaptive_budget(
+    current_budget: int,
+    results: Sequence[Result],
+    *,
+    min_budget: int = 0,
+    max_budget: int = 8,
+) -> BudgetUpdate:
+    """Two-sided budget rule (selected by ``ratchet_mode="adaptive"``).
+
+    Unlike compute_downward_budget (strictly monotone-down), this can RAISE the budget
+    when a problem has become unsolvable at its current budget:
+
+      * NO correct rollout (C == 0)   -> RAISE by 1 (grant one more hint), clamped to
+                                         ``max_budget``. The only branch that increases B_q.
+      * OVER HALF correct (2*C > N)   -> set B_q to the (N/2)-th SMALLEST correct hint
+                                         count -- the median-frugal success, with NO
+                                         decrement -- clamped to [min_budget, max_budget].
+      * otherwise (0 < C, 2*C <= N)   -> unchanged.
+
+    Args:
+        current_budget: the budget B_q the rollouts ran under this step.
+        results: one ``(correct, num_hints)`` per rollout for THIS problem this step.
+        min_budget: floor on the budget.
+        max_budget: ceiling on the budget -- bounds the upward (raise) direction so a
+            persistently-hard problem cannot grow without limit.
+
+    Because a correct rollout's ``num_hints`` is capped at ``current_budget``, the
+    ``pivot_set`` branch never exceeds the current budget (it lowers or holds); only the
+    ``raise`` branch increases it.
+    """
+    n_total = len(results)
+    correct_hint_counts = sorted(int(h) for ok, h in results if ok)
+    n_correct = len(correct_hint_counts)
+    min_correct = correct_hint_counts[0] if n_correct else None
+
+    def _clamp(b: int) -> int:
+        return max(min_budget, min(b, max_budget))
+
+    # No correct rollout -> too hard at this budget: raise by 1.
+    if n_correct == 0:
+        new_budget = _clamp(current_budget + 1)
+        return BudgetUpdate(
+            old_budget=current_budget,
+            new_budget=new_budget,
+            n_total=n_total,
+            n_correct=0,
+            changed=(new_budget != current_budget),
+            rule="raise",
+            pivot_hint_count=None,
+            min_correct_hint_count=None,
+        )
+
+    # Over half correct -> the (N/2)-th smallest correct hint count becomes the budget.
+    # 1-based rank N//2 -> 0-based index N//2 - 1; 2*C > N guarantees it is in range.
+    if n_total > 0 and 2 * n_correct > n_total:
+        rank = max(1, n_total // 2)
+        pivot = correct_hint_counts[rank - 1]
+        new_budget = _clamp(pivot)
+        return BudgetUpdate(
+            old_budget=current_budget,
+            new_budget=new_budget,
+            n_total=n_total,
+            n_correct=n_correct,
+            changed=(new_budget != current_budget),
+            rule="pivot_set",
+            pivot_hint_count=pivot,
+            min_correct_hint_count=min_correct,
+        )
+
+    # Some correct, but not over half -> hold.
+    return BudgetUpdate(
+        old_budget=current_budget,
+        new_budget=current_budget,
+        n_total=n_total,
+        n_correct=n_correct,
+        changed=False,
+        rule="unchanged",
+        pivot_hint_count=None,
+        min_correct_hint_count=min_correct,
+    )
+
+
 def compute_kpack_budget(
     current_budget: int,
     results: Sequence[Result],
@@ -357,6 +443,8 @@ class BudgetManager:
         min_budget: int = 0,
         decrement: int = 1,
         kpack_require_successes: int = 2,
+        max_budget: Optional[int] = None,
+        ratchet_mode: str = "downward",
     ):
         self.path = path
         self.default_budget = int(default_budget)
@@ -364,6 +452,12 @@ class BudgetManager:
         self.decrement = int(decrement)
         # k-pack rule: corroborating frugal successes needed to ratchet (compute_kpack_budget).
         self.kpack_require_successes = int(kpack_require_successes)
+        # Ceiling on B_q -- only used by the adaptive rule's upward (raise) branch so a
+        # hard problem cannot grow without bound. Defaults to default_budget.
+        self.max_budget = int(max_budget) if max_budget is not None else int(default_budget)
+        # Single-pack ratchet rule: "downward" (compute_downward_budget, strictly down) or
+        # "adaptive" (compute_adaptive_budget: raise on zero-correct, N/2-set on majority).
+        self.ratchet_mode = str(ratchet_mode or "downward").strip().lower()
         # problem_id -> current budget B_q
         self._budgets: dict[str, int] = {}
         if path and os.path.exists(path):
@@ -406,12 +500,20 @@ class BudgetManager:
         """
         if current_budget is None:
             current_budget = self.get(problem_id)
-        upd = compute_downward_budget(
-            current_budget,
-            results,
-            min_budget=self.min_budget,
-            decrement=self.decrement,
-        )
+        if self.ratchet_mode == "adaptive":
+            upd = compute_adaptive_budget(
+                current_budget,
+                results,
+                min_budget=self.min_budget,
+                max_budget=self.max_budget,
+            )
+        else:
+            upd = compute_downward_budget(
+                current_budget,
+                results,
+                min_budget=self.min_budget,
+                decrement=self.decrement,
+            )
         self._budgets[problem_id] = upd.new_budget
         return upd
 

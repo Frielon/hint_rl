@@ -27,9 +27,25 @@ from omegaconf import OmegaConf
 from verl.protocol import DataProto
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
+from auto_hint_mask import apply_positive_adv_masking
 from budget_manager import BudgetManager, get_create_budget
 from hint_budget_callback import _gen_budget_from_extra, _to_py, hprl_update_budgets
+from hint_penalty import (
+    DEFAULT_GUIDANCE_DIFFICULTY,
+    DEFAULT_HARD_FACTOR,
+    DEFAULT_TOTAL_PENALTY,
+    compute_hint_penalties,
+)
 from kpack_expand import render_variant_rows
+from selector_multi import pending_hint_ids
+from step_advantage import apply_step_level_advantages
+
+
+def _truthy(v) -> bool:
+    """Coerce a yaml bool / hydra-string flag (``"true"``/``"false"``) to a bool."""
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in {"1", "true", "yes", "on"}
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -43,6 +59,11 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
         # keep a single source of truth both sides can read).
         return self.config.data.get("hprl", {}) or {}
 
+    def _auto_hint_cfg(self):
+        # data.hprl.auto_hint.* -- the push-hint mode's knobs (enable +
+        # verified-prefix mask). Independent of the ratchet flag (data.hprl.enable).
+        return self._hprl_cfg().get("auto_hint", {}) or {}
+
     def _hprl_budget_mgr(self) -> BudgetManager:
         """Lazily build the driver-side BudgetManager (loads existing state on
         construction, so it resumes across restarts)."""
@@ -50,18 +71,25 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
             cfg = self._hprl_cfg()
             path = cfg.get("budget_state_path", None)
             kcfg = cfg.get("kpack", {}) or {}
+            default_budget = int(cfg.get("default_budget", 8))
             self._budget_mgr = BudgetManager(
                 path=path,
-                default_budget=int(cfg.get("default_budget", 8)),
+                default_budget=default_budget,
                 min_budget=int(cfg.get("min_budget", 0)),
                 decrement=int(cfg.get("decrement", 1)),
                 kpack_require_successes=int(kcfg.get("require_successes", 2)),
+                # adaptive ratchet (raise on zero-correct, N/2-set on majority) + its ceiling.
+                ratchet_mode=str(cfg.get("ratchet_mode", "downward")),
+                max_budget=int(cfg.get("max_budget", default_budget)),
             )
             logger.warning(
-                "HPRL ratchet enabled: budget_state=%s default=%d min=%d dec=%d (loaded %d problems)",
+                "HPRL ratchet enabled: budget_state=%s mode=%s default=%d min=%d max=%d dec=%d "
+                "(loaded %d problems)",
                 path,
+                self._budget_mgr.ratchet_mode,
                 self._budget_mgr.default_budget,
                 self._budget_mgr.min_budget,
+                self._budget_mgr.max_budget,
                 self._budget_mgr.decrement,
                 len(self._budget_mgr),
             )
@@ -244,7 +272,31 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
         )
 
     def _update_actor(self, batch):
+        # AUTO-HINT verified-prefix mask: BEFORE the actor update, zero the loss mask
+        # (response_mask) over each rollout's recorded disable_spans -- but only for
+        # POSITIVE-advantage rollouts (auto_hint_mask). Done here because by now the
+        # batch carries both the GRPO advantages and the assistant-only response_mask
+        # the policy loss aggregates over; modifying response_mask propagates into
+        # every micro-batch. No-op (returns {}) unless data.hprl.auto_hint.enable.
+        auto_hint_stats = {}
+        ac = self._auto_hint_cfg()
+        if ac.get("enable", False):
+            # STEP-LEVEL value-based advantages (step_advantage) SUPERSEDE the
+            # verified-prefix loss MASK (auto_hint_mask) when enabled -- they handle the
+            # unverified tail by giving it a negative advantage instead of dropping it,
+            # so the two are mutually exclusive. Default: mask (step_adv off).
+            step_adv_on = _truthy((ac.get("step_adv", {}) or {}).get("enable", False))
+            try:
+                if step_adv_on:
+                    auto_hint_stats = self._hprl_apply_step_advantage(batch)
+                else:
+                    auto_hint_stats = self._hprl_apply_auto_hint_mask(batch)
+            except Exception as e:  # adv/mask edits must never crash training
+                logger.warning("HPRL auto-hint adv/mask failed at step %s: %s", self.global_steps, e)
+
         actor_output = super()._update_actor(batch)
+
+        metrics = {}
         if self._hprl_cfg().get("enable", False):
             try:
                 metrics = hprl_update_budgets(
@@ -255,12 +307,212 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
                 )
                 # fold in the generation-side probe summary (set by _hprl_expand_kpacks).
                 metrics = {**metrics, **getattr(self, "_hprl_probe_stats", {})}
-                if metrics:
-                    md = actor_output.meta_info.setdefault("metrics", {})
-                    md.update(metrics)  # scalars survive reduce_metrics
             except Exception as e:  # never let budget bookkeeping crash training
                 logger.warning("HPRL budget ratchet failed at step %s: %s", self.global_steps, e)
+        # surface the auto-hint mask stats alongside the ratchet metrics (independent
+        # of the ratchet flag) so the masking effect is visible in wandb.
+        metrics = {**metrics, **auto_hint_stats}
+        if metrics:
+            try:
+                md = actor_output.meta_info.setdefault("metrics", {})
+                md.update(metrics)  # scalars survive reduce_metrics
+            except Exception as e:  # noqa: BLE001
+                logger.warning("HPRL metric folding failed at step %s: %s", self.global_steps, e)
         return actor_output
+
+    def _hprl_apply_auto_hint_mask(self, batch) -> dict:
+        """Zero response_mask over the auto-hint disable_spans for positive-advantage
+        rollouts (the verified-prefix gradient mask). Returns scalar stats for wandb.
+
+        Reads the per-rollout ``disable_spans`` recorded by AutoHintAgentLoop from
+        non_tensor_batch (extra_fields flatten there), the GRPO ``advantages`` and the
+        assistant-only ``response_mask`` from batch.batch. Each disable span is an
+        ``[start, end)`` response-token range; it is dropped from the loss mask ONLY
+        when the rollout's (masked-mean) advantage is positive -- a negative-advantage
+        rollout trains on all of its tokens. Also folds in the CITATION FOUND RATE
+        (selector completed_hints quotes that fuzzy-located in the trace). Returns the
+        cite stats alone (no mask) if the tensors/spans are absent (e.g. a val batch).
+        """
+        ntb = getattr(batch, "non_tensor_batch", None)
+        # citation found rate first -- it is independent of the mask tensors, so it
+        # is still logged even on a batch that carries no disable_spans.
+        stats = self._auto_hint_cite_stats(ntb)
+
+        bb = batch.batch
+        if bb is None or "response_mask" not in bb.keys() or "advantages" not in bb.keys():
+            return stats
+        spans_arr = ntb.get("disable_spans") if isinstance(ntb, dict) else None
+        if spans_arr is None:
+            return stats
+        n = int(bb["response_mask"].shape[0])
+        disable_spans = [(_to_py(spans_arr[i]) or []) for i in range(n)]
+        eps = float(self._auto_hint_cfg().get("positive_eps", 0.0))
+        masked, mask_stats = apply_positive_adv_masking(
+            bb["response_mask"], bb["advantages"], disable_spans, positive_eps=eps
+        )
+        bb["response_mask"] = masked  # same tensor (modified in place); reassign to be safe
+        stats.update(mask_stats)
+        logger.warning(
+            "[HPRL step=%s] auto-hint mask: rows_with_spans=%d pos_masked=%d tokens_dropped=%d "
+            "cite_found_rate=%.3f (%d/%d)",
+            self.global_steps,
+            int(mask_stats["auto_hint/rows_with_spans"]),
+            int(mask_stats["auto_hint/rows_pos_masked"]),
+            int(mask_stats["auto_hint/mask_tokens_dropped"]),
+            stats.get("auto_hint/cite_found_rate", 0.0),
+            int(stats.get("auto_hint/cite_quotes_found", 0)),
+            int(stats.get("auto_hint/cite_quotes_total", 0)),
+        )
+        return stats
+
+    def _hprl_apply_step_advantage(self, batch) -> dict:
+        """Replace the GRPO advantages with the STEP-LEVEL value-based advantages
+        (step_advantage.apply_step_level_advantages). Returns scalar stats for wandb.
+
+        For each GRPO group (a problem's N rollouts) this reconstructs the per-rollout
+        turn segments (``step_adv_turns``, recorded by AutoHintAgentLoop), the verified
+        final state and failed-hint set, computes the per-problem state values V[0..K]
+        and writes per-token advantages: a_C verified-progress tokens get V[se]-V[ss]>=0,
+        a_I failed-tail tokens get r_se + V[se+1]-V[se] <=0. An all-incorrect group is
+        zeroed. The per-hint penalty weights come from extra_info.hint_full with the
+        SAME knobs hint_reward.compute_score uses, so r matches the reward's penalty.
+
+        Also folds in the auto-hint CITATION FOUND RATE. No-op (cite stats only) when the
+        tensors / step_adv_turns are absent (e.g. a val batch).
+        """
+        ntb = getattr(batch, "non_tensor_batch", None)
+        stats = self._auto_hint_cite_stats(ntb)
+
+        bb = batch.batch
+        if bb is None or "advantages" not in bb.keys() or "response_mask" not in bb.keys():
+            return stats
+        if not isinstance(ntb, dict):
+            return stats
+        turns_arr = ntb.get("step_adv_turns")
+        uids = ntb.get("uid")
+        if turns_arr is None or uids is None:
+            return stats
+
+        n = int(bb["advantages"].shape[0])
+        acc_arr = ntb.get("acc")
+        extra_arr = ntb.get("extra_info")
+        total_penalty, hard_factor, guidance, guidance_free = self._step_adv_penalty_cfg()
+
+        turns_per_row = [self._coerce_turns(_to_py(turns_arr[i])) for i in range(n)]
+        correct_per_row = [
+            (float(_to_py(acc_arr[i]) or 0.0) >= 0.5) if acc_arr is not None else False
+            for i in range(n)
+        ]
+        penalty_per_row: list = []
+        K_per_row: list = []
+        cache: dict = {}
+        for i in range(n):
+            ei = extra_arr[i] if extra_arr is not None else None
+            pid = ei.get("problem_id") if isinstance(ei, dict) else None
+            key = pid if pid is not None else i
+            if key in cache:
+                pv, K = cache[key]
+            else:
+                pv, K = self._step_adv_penalty_vec(ei, total_penalty, hard_factor, guidance, guidance_free)
+                cache[key] = (pv, K)
+            penalty_per_row.append(pv)
+            K_per_row.append(K)
+
+        sa = self._auto_hint_cfg().get("step_adv", {}) or {}
+        tv = float(sa.get("terminal_value", 1.0))
+        zinc = _truthy(sa.get("zero_if_no_correct", True))
+        scale = float(sa.get("adv_scale", 1.0))
+        # GRPO sets returns == advantages (same tensor); fall back to advantages if absent.
+        returns_t = bb["returns"] if "returns" in bb.keys() else bb["advantages"]
+        _, _, mstats = apply_step_level_advantages(
+            bb["advantages"], returns_t, bb["response_mask"], list(uids),
+            turns_per_row, correct_per_row, penalty_per_row, K_per_row,
+            terminal_value=tv, zero_if_no_correct=zinc, adv_scale=scale,
+        )
+        stats.update(mstats)
+        logger.warning(
+            "[HPRL step=%s] step-adv: groups=%d scored=%d zeroed=%d rows=%d tokens=%d "
+            "pos=%.4f neg=%.4f V0=%.4f cite=%.3f",
+            self.global_steps,
+            int(mstats["step_adv/groups_total"]), int(mstats["step_adv/groups_scored"]),
+            int(mstats["step_adv/groups_zeroed"]), int(mstats["step_adv/rows_scored"]),
+            int(mstats["step_adv/tokens_assigned"]),
+            mstats["step_adv/adv_pos_mean"], mstats["step_adv/adv_neg_mean"],
+            mstats["step_adv/value_s0_mean"], stats.get("auto_hint/cite_found_rate", 0.0),
+        )
+        return stats
+
+    def _step_adv_penalty_cfg(self):
+        """(total_penalty, hard_factor, guidance_difficulty, guidance_free) from the
+        reward kwargs -- the SAME knobs hint_reward.compute_score prices hints with, so
+        the step-adv r(h) equals the reward's per-hint penalty (incl. a free X.0 hint)."""
+        crf = self.config.get("custom_reward_function", None)
+        rkw = crf.get("reward_kwargs", None) if crf is not None else None
+        rkw = rkw or {}
+        return (
+            float(rkw.get("hint_penalty_total", DEFAULT_TOTAL_PENALTY)),
+            float(rkw.get("hint_penalty_hard_factor", DEFAULT_HARD_FACTOR)),
+            str(rkw.get("hint_guidance_difficulty", DEFAULT_GUIDANCE_DIFFICULTY)),
+            _truthy(rkw.get("hint_guidance_free", False)),
+        )
+
+    @staticmethod
+    def _step_adv_penalty_vec(extra_info, total_penalty, hard_factor, guidance, guidance_free=False):
+        """Per-hint penalty weights in POOL ORDER (p[0..K-1]) for a rollout, from its
+        extra_info: the selector pool gives the canonical hint order (= the step
+        indexing the loop used), hint_full gives the difficulty-weighted penalties.
+        Returns ([], 0) when either is absent."""
+        if not isinstance(extra_info, dict):
+            return [], 0
+        tk = extra_info.get("tools_kwargs") or {}
+        tool = tk.get("request_hint") or {}
+        ck = tool.get("create_kwargs") or {}
+        pool = ck.get("hints")
+        order = pending_hint_ids(pool, []) if pool is not None else []
+        hint_full = extra_info.get("hint_full")
+        pens = (
+            compute_hint_penalties(
+                hint_full, total_penalty=total_penalty, hard_factor=hard_factor,
+                guidance_difficulty=guidance, guidance_free=guidance_free,
+            )
+            if hint_full
+            else {}
+        )
+        pv = [float(pens.get(str(h), 0.0)) for h in order]
+        return pv, len(order)
+
+    @staticmethod
+    def _coerce_turns(turns):
+        """Normalize a rollout's step_adv_turns to a list of 6-int rows; drop malformed."""
+        out = []
+        if not turns:
+            return out
+        for t in turns:
+            try:
+                out.append([int(t[0]), int(t[1]), int(t[2]), int(t[3]), int(t[4]), int(t[5])])
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
+    @staticmethod
+    def _auto_hint_cite_stats(ntb) -> dict:
+        """Citation found rate from the per-rollout completed_hints-quote counters
+        recorded by AutoHintAgentLoop (cite_quotes_total / cite_quotes_found): of the
+        selector's cited sentences, the fraction that fuzzy-located in the student's
+        trace. Returns {} when the counters are absent (a non-auto-hint batch)."""
+        if not isinstance(ntb, dict):
+            return {}
+        ct, cf = ntb.get("cite_quotes_total"), ntb.get("cite_quotes_found")
+        if ct is None or cf is None:
+            return {}
+        n = len(ct)
+        tot = sum(int(round(float(_to_py(ct[i]) or 0))) for i in range(n))
+        fnd = sum(int(round(float(_to_py(cf[i]) or 0))) for i in range(n))
+        return {
+            "auto_hint/cite_quotes_total": float(tot),
+            "auto_hint/cite_quotes_found": float(fnd),
+            "auto_hint/cite_found_rate": float(fnd / tot) if tot else 0.0,
+        }
 
     # ------------------------------------------------------------------ #
     # rollout-log augmentation: add the per-rollout hint state to the dump
@@ -282,19 +534,65 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
         except Exception as e:  # logging must never crash training
             print(f"[HPRL step={self.global_steps}] rollout-log augmentation failed: {e}", flush=True)
 
-        # The dump's actual write runs in a background thread; its failure surfaces (via
-        # f.result()) inside _dump_generations (guarded below) AND the _write_generations
-        # override below makes the write itself never IndexError + names the short column.
-        # Guard this call anyway.
+        # Dump the rollout JSONL ourselves (NOT super()._log_rollout_data) so the
+        # input/output are decoded WITH special tokens kept (skip_special_tokens=False) --
+        # preserving the RAW chat-template structure (turn markers <|im_start|>/<|im_end|>,
+        # EOS, and the injected hint user-turns) for inspecting auto-hint trajectories. verl's
+        # own _log_rollout_data strips them. Padding is trimmed per row via the attention mask
+        # so only real tokens show (no trailing/leading pad noise). Everything else mirrors
+        # verl's _log_rollout_data; the write still goes through our robust _dump_generations
+        # / _write_generations overrides (non-fatal background write).
         try:
-            super()._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
-        except Exception as e:  # noqa: BLE001
+            inputs, outputs = self._decode_raw_with_special(batch)
+            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+            sample_gts = [
+                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
+                for item in batch
+            ]
+            reward_extra_infos_to_dump = {
+                k: (v.tolist() if hasattr(v, "tolist") else v)
+                for k, v in reward_extra_infos_dict.items()
+            }
+            if "request_id" in batch.non_tensor_batch:
+                reward_extra_infos_to_dump.setdefault(
+                    "request_id", batch.non_tensor_batch["request_id"].tolist()
+                )
+            self._dump_generations(
+                inputs=inputs,
+                outputs=outputs,
+                gts=sample_gts,
+                scores=scores,
+                reward_extra_infos_dict=reward_extra_infos_to_dump,
+                dump_path=rollout_data_dir,
+            )
+        except Exception as e:  # noqa: BLE001 -- logging must never crash training
             print(
                 f"[HPRL step={self.global_steps}] rollout dump skipped (failed): "
                 f"{type(e).__name__}: {e}",
                 flush=True,
             )
         return None
+
+    def _decode_raw_with_special(self, batch):
+        """Decode the batch's prompts/responses WITH special tokens kept, trimming pad.
+
+        skip_special_tokens=False preserves the raw chat-template structure (turn markers,
+        EOS, injected hint user-turns); the attention mask drops the left-pad (prompts) and
+        right-pad (responses) so the dump shows only real tokens, not a long pad run. Returns
+        ``(inputs, outputs)`` -- length-N lists of decoded strings, one per rollout.
+        """
+        prompts = batch.batch["prompts"]
+        responses = batch.batch["responses"]
+        attn = batch.batch["attention_mask"]
+        prompt_len = prompts.size(1)
+        resp_len = responses.size(1)
+        inputs, outputs = [], []
+        for i in range(len(batch)):
+            p_keep = attn[i, :prompt_len].bool()
+            r_keep = attn[i, prompt_len:prompt_len + resp_len].bool()
+            inputs.append(self.tokenizer.decode(prompts[i][p_keep], skip_special_tokens=False))
+            outputs.append(self.tokenizer.decode(responses[i][r_keep], skip_special_tokens=False))
+        return inputs, outputs
 
     @staticmethod
     def _write_generations(inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps):
@@ -415,4 +713,14 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
                 "hint_budget",
                 [_gen_budget_from_extra(_to_py(ntb["extra_info"][i]) or {}, default_budget) for i in range(n)],
             )
+
+        # auto-hint: the per-rollout verified-prefix spans (response-token ranges
+        # dropped from the loss under positive advantage), so the mask is inspectable
+        # in the rollout dump alongside applied_hints.
+        if "disable_spans" in ntb:
+            out.setdefault("disable_spans", [_to_py(ntb["disable_spans"][i]) for i in range(n)])
+        # step-adv: the per-rollout [ts, boundary, te, state_start, state_end, is_fail]
+        # turn segments, so the value-based advantage assignment is inspectable.
+        if "step_adv_turns" in ntb:
+            out.setdefault("step_adv_turns", [_to_py(ntb["step_adv_turns"][i]) for i in range(n)])
         return out

@@ -94,6 +94,22 @@ def _as_bool(value) -> bool:
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
+
+def _strip_lone_surrogates(text: str) -> str:
+    """Replace unpaired UTF-16 surrogate code points so the text can be tokenized.
+
+    The frozen selector is served over the OpenAI API and can return a hint whose JSON
+    holds an unpaired ``\\udXXX`` -- e.g. a multi-byte char or emoji truncated at a token
+    boundary, which ``json.loads`` decodes into a lone-surrogate ``str``. Feeding that to
+    the Qwen chat template makes the Rust ``tokenizers.encode_batch`` raise ``TextEncodeInput
+    must be Union[...]``; verl's ``apply_chat_template`` then falls into its Qwen3.5-only
+    list-content fallback and dies with ``can only concatenate str (not "list") to str``,
+    killing the whole run on a single poisoned row (~1 in tens of thousands of hint calls).
+    A UTF-8 round-trip with ``errors="replace"`` maps each lone surrogate to ``?`` and is an
+    exact no-op on all valid text.
+    """
+    return text.encode("utf-8", "replace").decode("utf-8")
+
 # --- DEBUG: per-selector-call dump ------------------------------------------ #
 # Set HPRL_SELECTOR_DUMP_DIR to a writable dir to record EVERY hint-selection
 # call -- the exact `trace` build_trace produced (the selector's whole view of
@@ -249,6 +265,10 @@ class HintAgentLoop(ToolAgentLoop):
         # applied_hints -- it must be present on every rollout, including those that
         # never go over budget.
         agent_data.extra_fields.setdefault("hint_budget_exceeded", 0)
+        # Per-rollout flag: set to 1 when the assistant generation hit the hard
+        # response-length cap (truncated mid-answer, no EOS). The reward short-circuits
+        # to the floor (minimum) score on this flag, same as hint_budget_exceeded.
+        agent_data.extra_fields.setdefault("length_truncated", 0)
         # Per-rollout selector latency: total seconds spent in the frozen selector
         # (sum over this rollout's hint calls) and the number of those calls. The
         # verl-native hint_select timer is dropped before aggregation (AgentLoopMetrics
@@ -302,6 +322,9 @@ class HintAgentLoop(ToolAgentLoop):
 
         # --- hard caps (same as base) -------------------------------------
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
+            # Generation hit the response-length cap (truncated, no EOS): flag it so the
+            # reward floors this rollout to the minimum (see hint_reward.compute_score).
+            agent_data.extra_fields["length_truncated"] = 1
             return AgentState.TERMINATED
         if self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns:
             return AgentState.TERMINATED
@@ -621,6 +644,22 @@ class HintAgentLoop(ToolAgentLoop):
             agent_data.response_logprobs += [0.0] * len(response_ids)
         agent_data.user_turns += 1
         return AgentState.GENERATING
+
+    async def apply_chat_template(self, messages, **kwargs):
+        """Scrub lone UTF-16 surrogates from string message contents before tokenizing.
+
+        Every injected hint turn flows through here, and selector output can carry a lone
+        surrogate that crashes the tokenizer (see ``_strip_lone_surrogates``). Cleaning is a
+        no-op on valid text, so it is safe for all messages and leaves non-str (multimodal)
+        content untouched. Inherited by ``AutoHintAgentLoop`` -- both rollout loops covered.
+        """
+        safe = [
+            {**m, "content": _strip_lone_surrogates(m["content"])}
+            if isinstance(m.get("content"), str)
+            else m
+            for m in messages
+        ]
+        return await super().apply_chat_template(safe, **kwargs)
 
     # ------------------------------------------------------------------ #
     # per-strategy recording (mutates `applied` + metrics, returns the

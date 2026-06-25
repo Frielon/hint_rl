@@ -73,14 +73,19 @@ def _extract_last_json_object(text: str):
 
 
 def _repair_json_escapes(s: str) -> str:
-    """Double any backslash that isn't a valid JSON escape introducer.
+    r"""Double any backslash that isn't a valid JSON escape introducer.
 
     Local math models routinely emit LaTeX inside JSON string values, e.g.
-    "side \\(6\\sqrt{2}\\)". Sequences like \\( or \\s are invalid JSON escapes
-    and make json.loads raise "Invalid \\escape". Doubling stray backslashes
-    turns them into literal backslashes so the JSON parses (and the LaTeX is
-    preserved verbatim in the decoded string)."""
-    return re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', s)
+    "side \(6\sqrt{2}\)". Sequences like \( or \s are invalid JSON escapes and
+    make json.loads raise "Invalid \escape". Doubling stray backslashes turns
+    them into literal backslashes so the JSON parses (LaTeX preserved verbatim).
+
+    The alternation consumes a *valid* escape pair (\\, \", \n, ...) whole and
+    leaves it untouched, only doubling genuinely-stray backslashes. A bare
+    `\(?!...)` would otherwise land on the SECOND backslash of a model-correct
+    `\\cdot` and corrupt it into `\\\cdot`, breaking the parse."""
+    return re.sub(r'\\(["\\/bfnrtu])|\\',
+                  lambda m: m.group(0) if m.group(1) else r'\\\\', s)
 
 
 def _loads_lenient(block: str):

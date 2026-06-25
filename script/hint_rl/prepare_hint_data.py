@@ -83,6 +83,14 @@ def strip_cot_trigger(base_system: str) -> str:
     text = re.sub(r"\s+([,.])", r"\1", text)
     return text.strip() or DEFAULT_BASE_SYSTEM
 
+# Plain single-turn solver system prompt for AUTO-HINT mode -- byte-identical to
+# dataset/dapo-3139-single-turn.parquet, so the policy sees the ORDINARY math prompt
+# (no tool instruction, no budget) and the loop, not the model, decides when to hint.
+PLAIN_SYSTEM = (
+    "You are a helpful assistant. Solve the math problem given by the user, "
+    "reasoning step by step, and put your final answer within \\boxed{}."
+)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 HINT_RL_HOME = os.path.abspath(os.path.join(HERE, "..", ".."))
 DEFAULT_IN = os.path.join(HINT_RL_HOME, "dataset", "dapo-3164-hint-verl.parquet")
@@ -115,7 +123,7 @@ def user_problem(prompt) -> str:
 
 
 def upgrade_row(row: dict, max_budget: int, agent_name: str = "hint_agent", hint_full=None,
-                zero_budget_ids: set | None = None) -> dict:
+                zero_budget_ids: set | None = None, mode: str = "hint_call") -> dict:
     prompt = list(row["prompt"])  # list of {role, content}
     extra_info = dict(row["extra_info"])
     hint_str = extra_info.get("hint", "") or ""
@@ -135,32 +143,50 @@ def upgrade_row(row: dict, max_budget: int, agent_name: str = "hint_agent", hint
     if zero_budget_ids and pid in zero_budget_ids:
         budget = 0
 
-    # --- nudge the system prompt to advertise the tool + budget ----------
-    # Keep the budget-free preamble (hprl_system_base) so the dynamic-budget
-    # dataset can re-render the sentence for a ratcheted budget; bake the static
-    # initial budget into the prompt here so the parquet also works ratchet-off.
-    if prompt and prompt[0].get("role") == "system":
-        base_system = strip_cot_trigger(prompt[0].get("content", "") or DEFAULT_BASE_SYSTEM)
-        prompt[0] = {"role": "system", "content": render_system(base_system, budget)}
+    if mode == "auto_hint":
+        # AUTO-HINT: hint-AGNOSTIC single-turn prompt. The policy is never told about
+        # hints (the loop, auto_hint_agent_loop, injects them on a wrong answer), so the
+        # system prompt is the plain step-by-step solver and the user problem is left
+        # untouched -- no tool instruction, no budget reminder. hprl_auto_hint flags the
+        # row so the dynamic-budget dataset updates the loop's budget WITHOUT re-rendering
+        # the prompt; hprl_system_base / hprl_user_base are deliberately NOT set.
+        if prompt and prompt[0].get("role") == "system":
+            prompt[0] = {"role": "system", "content": PLAIN_SYSTEM}
+        else:
+            prompt = [{"role": "system", "content": PLAIN_SYSTEM}, *prompt]
+        extra_info["hprl_auto_hint"] = True
     else:
-        base_system = DEFAULT_BASE_SYSTEM
-        prompt = [{"role": "system", "content": render_system(base_system, budget)}, *prompt]
+        # --- nudge the system prompt to advertise the tool + budget ----------
+        # Keep the budget-free preamble (hprl_system_base) so the dynamic-budget
+        # dataset can re-render the sentence for a ratcheted budget; bake the static
+        # initial budget into the prompt here so the parquet also works ratchet-off.
+        if prompt and prompt[0].get("role") == "system":
+            base_system = strip_cot_trigger(prompt[0].get("content", "") or DEFAULT_BASE_SYSTEM)
+            prompt[0] = {"role": "system", "content": render_system(base_system, budget)}
+        else:
+            base_system = DEFAULT_BASE_SYSTEM
+            prompt = [{"role": "system", "content": render_system(base_system, budget)}, *prompt]
 
-    # --- budget reminder as the LAST line of the user message ------------
-    # Placement matters: as the final user-turn sentence this ~doubles emission
-    # and ~triples multi-hint-call vs. the same fact in the system prompt
-    # (hint_call_test Round 10). Strip the DAPO "think step by step" CoT tail
-    # first (it would sit right before the reminder and blunt it), and store the
-    # budget-free, stripped user text as hprl_user_base so the dynamic-budget
-    # ratchet (hint_dataset) can re-append the current budget byte-identically.
-    for i in range(len(prompt) - 1, -1, -1):
-        if prompt[i].get("role") == "user":
-            user_base = strip_user_cot_tail(prompt[i].get("content", "") or "")
-            extra_info["hprl_user_base"] = user_base
-            prompt[i] = {"role": "user", "content": render_user(user_base, budget)}
-            break
+        # --- budget reminder as the LAST line of the user message ------------
+        # Placement matters: as the final user-turn sentence this ~doubles emission
+        # and ~triples multi-hint-call vs. the same fact in the system prompt
+        # (hint_call_test Round 10). Strip the DAPO "think step by step" CoT tail
+        # first (it would sit right before the reminder and blunt it), and store the
+        # budget-free, stripped user text as hprl_user_base so the dynamic-budget
+        # ratchet (hint_dataset) can re-append the current budget byte-identically.
+        for i in range(len(prompt) - 1, -1, -1):
+            if prompt[i].get("role") == "user":
+                user_base = strip_user_cot_tail(prompt[i].get("content", "") or "")
+                extra_info["hprl_user_base"] = user_base
+                prompt[i] = {"role": "user", "content": render_user(user_base, budget)}
+                break
+        # data for the dynamic-budget ratchet (hint_dataset.HintBudgetDataset).
+        extra_info["hprl_system_base"] = base_system
 
-    # --- per-sample stateful-tool data -----------------------------------
+    # --- per-sample stateful-tool data (BOTH modes) ----------------------
+    # The rollout reads the hint pool / problem / budget from here regardless of
+    # whether the prompt advertises the tool. In auto-hint mode the budget is the
+    # max number of hint INJECTIONS the loop may make.
     ground_truth = row["reward_model"].get("ground_truth", "")
     extra_info["need_tools_kwargs"] = True
     extra_info["tools_kwargs"] = {
@@ -173,8 +199,6 @@ def upgrade_row(row: dict, max_budget: int, agent_name: str = "hint_agent", hint
             }
         }
     }
-    # data for the dynamic-budget ratchet (hint_dataset.HintBudgetDataset).
-    extra_info["hprl_system_base"] = base_system
     extra_info["hprl_init_budget"] = int(budget)
     # the ORIGINAL difficulty-annotated hint pool, for the reward's hint penalty
     # (hint_penalty.py reads extra_info["hint_full"]). Stored verbatim as a JSON
@@ -184,8 +208,8 @@ def upgrade_row(row: dict, max_budget: int, agent_name: str = "hint_agent", hint
 
     row["prompt"] = prompt
     row["extra_info"] = extra_info
-    # "hint_agent" -> the <hint_call/> rollout (hint_agent_loop.HintAgentLoop);
-    # "tool_agent" -> the legacy hermes request_hint tool path.
+    # "hint_agent" -> <hint_call/> rollout; "auto_hint" -> push-hint rollout
+    # (auto_hint_agent_loop); "tool_agent" -> legacy hermes request_hint tool path.
     row["agent_name"] = agent_name
     return row
 
@@ -199,15 +223,27 @@ def main():
                          "problem_id into extra_info.hint_full for the reward penalty")
     ap.add_argument("--max-budget", type=int, default=8,
                     help="cap on the per-problem hint budget B_q (<= max_assistant_turns)")
-    ap.add_argument("--agent-name", default="hint_agent",
-                    choices=["hint_agent", "tool_agent"],
-                    help="rollout to route rows through: 'hint_agent' (<hint_call/> "
-                         "sentinel) or legacy 'tool_agent' (hermes request_hint tool)")
+    ap.add_argument("--mode", default="hint_call", choices=["hint_call", "auto_hint"],
+                    help="'hint_call' (default): the policy emits <hint_call/> and the "
+                         "system prompt advertises the tool+budget. 'auto_hint': a plain "
+                         "single-turn solver prompt; the loop injects a hint on a wrong "
+                         "answer (auto_hint_agent_loop). auto_hint defaults --agent-name "
+                         "to 'auto_hint'.")
+    ap.add_argument("--agent-name", default=None,
+                    choices=["hint_agent", "auto_hint", "tool_agent"],
+                    help="rollout to route rows through. Default: 'auto_hint' when "
+                         "--mode auto_hint, else 'hint_agent' (<hint_call/> sentinel); "
+                         "'tool_agent' is the legacy hermes request_hint tool.")
     ap.add_argument("--zero-budget-ids", default=None,
                     help="file of problem_ids (one per line) to force to budget 0 (no hints) "
                          "-- the hard-problem curriculum's 'easy' bucket from "
                          "extract_unaided_solved.py")
     args = ap.parse_args()
+
+    # auto_hint mode routes through the AutoHintAgentLoop by default.
+    if args.agent_name is None:
+        args.agent_name = "auto_hint" if args.mode == "auto_hint" else "hint_agent"
+    print(f"mode={args.mode}  agent_name={args.agent_name}")
 
     # Problems to give 0 hint budget (already solvable unaided -> hints there only
     # suppress <hint_call/> under GRPO; see extract_unaided_solved.py).
@@ -240,7 +276,7 @@ def main():
         if hint_full is None and pid_to_full:
             n_missing += 1
         rows.append(upgrade_row(r, args.max_budget, args.agent_name, hint_full=hint_full,
-                                zero_budget_ids=zero_budget_ids))
+                                zero_budget_ids=zero_budget_ids, mode=args.mode))
     out = pd.DataFrame(rows)
     if n_missing:
         print(f"WARNING: {n_missing} rows had no matching original hint pool (hint_full absent)")
