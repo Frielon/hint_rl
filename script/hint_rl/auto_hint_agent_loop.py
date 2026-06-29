@@ -53,7 +53,7 @@ from verl.workers.rollout.replica import TokenOutput
 
 from hint_agent_loop import HintAgentLoop, _dump_selector_call
 from hint_selector import build_trace, hint_id_of
-from selector_multi import locate_quote_end, pending_hint_ids
+from selector_multi import locate_quote_end, pending_hint_ids, prune_hint_pool
 from step_advantage import prefix_state as _prefix_state
 
 # Same boxed-answer grader the reward uses, so the loop's "is it correct yet?"
@@ -102,15 +102,26 @@ class AutoHintAgentLoop(HintAgentLoop):
         self.step_adv_enable = str(
             sa.get("enable", os.environ.get("HPRL_STEP_ADV", "false"))
         ).strip().lower() in {"1", "true", "yes", "on"}
+        # Prune the X.0 step-guidance hints from the pool before it ever reaches the
+        # selector (prune_hint_pool), so the rollout presents the SAME substep-only
+        # pools the offline selector eval (multi-cite-gpt-eval) was built and scored
+        # on. Applied at the single read point (_pool), so the selector prompt, the
+        # pending/exhaustion check, and the step-adv hint order all see one pruned
+        # pool consistently. Default off -> the full pool (with X.0) is used as before.
+        self.prune_guidance = str(
+            ah.get("prune_guidance", os.environ.get("HPRL_PRUNE_GUIDANCE", "false"))
+        ).strip().lower() in {"1", "true", "yes", "on"}
         if not _GRADER_OK:
             logger.warning(
                 "AutoHintAgentLoop: mathruler grader UNAVAILABLE -- every answer will be "
                 "treated as wrong and hints injected up to budget. Install mathruler."
             )
         logger.warning(
-            "AutoHintAgentLoop: auto-hint rollout active (fuzzy_threshold=%.2f, step_adv=%s)",
+            "AutoHintAgentLoop: auto-hint rollout active (fuzzy_threshold=%.2f, step_adv=%s, "
+            "prune_guidance=%s)",
             self.auto_hint_fuzzy_threshold,
             self.step_adv_enable,
+            self.prune_guidance,
         )
 
     # ------------------------------------------------------------------ #
@@ -119,6 +130,14 @@ class AutoHintAgentLoop(HintAgentLoop):
     def _create_kwargs(self, agent_data) -> dict:
         tk = agent_data.tools_kwargs.get(self.hint_kwargs_key) if agent_data.tools_kwargs else None
         return (tk.get("create_kwargs", {}) or {}) if isinstance(tk, dict) else {}
+
+    def _pool(self, agent_data) -> Any:
+        """This problem's hint pool, with X.0 step-guidance hints pruned when
+        ``prune_guidance`` is set. The single chokepoint for reading ``hints`` so the
+        selector prompt, pending/exhaustion check, and step-adv hint order all operate
+        on one consistently-(un)pruned pool."""
+        pool = self._create_kwargs(agent_data).get("hints", "")
+        return prune_hint_pool(pool) if self.prune_guidance else pool
 
     def _is_correct(self, agent_data) -> bool:
         """Grade the rollout's boxed answer so far (all assistant turns joined),
@@ -220,12 +239,25 @@ class AutoHintAgentLoop(HintAgentLoop):
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
 
-        # --- hard caps (same as base) -- a capped turn is the ending turn (no span,
-        #     full promote); nothing more to inject. ------------------------------
+        # --- hard caps (same as base). A capped turn is the ending turn; nothing more
+        #     to inject. In the legacy mask path it carries no disable_span (full
+        #     promote); in step-adv a FIRST-turn cap is scored as a failed step (below). -
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
             # Generation hit the response-length cap (truncated, no EOS): flag it so the
             # reward floors this rollout to the minimum (see hint_reward.compute_score).
             agent_data.extra_fields["length_truncated"] = 1
+            if self.step_adv_enable and agent_data.assistant_turns == 1:
+                # STEP-ADV, FIRST turn ONLY: a turn that ran past the length cap before
+                # ever reaching a hint earns NO verified-prefix credit -- boundary ==
+                # turn_start makes its WHOLE span the a_I tail -- and is charged with
+                # FAILING h_0 at state S_0 (ss == se == 0, so h_0 joins H): we treat it
+                # as not even reaching the first step. A LATER-turn cap records no
+                # segment, so its tail keeps advantage 0 (earlier turns already scored).
+                turn_end = len(agent_data.response_mask)
+                turn_start = turn_end - len(agent_data.response_ids)
+                self._record_step_adv_turn(
+                    agent_data, turn_start, turn_start, turn_end, 0, 0, is_fail=1
+                )
             return AgentState.TERMINATED
         if self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns:
             return AgentState.TERMINATED
@@ -244,7 +276,7 @@ class AutoHintAgentLoop(HintAgentLoop):
                 # S_K (no failed-tail a_I). state_start = how far the rollout already was.
                 turn_end = len(agent_data.response_mask)
                 turn_start = turn_end - len(agent_data.response_ids)
-                order = pending_hint_ids(self._create_kwargs(agent_data).get("hints", ""), [])
+                order = pending_hint_ids(self._pool(agent_data), [])
                 ss = _prefix_state(order, agent_data.extra_fields.get("auto_hint_completed", []))
                 self._record_step_adv_turn(
                     agent_data, turn_start, turn_end, turn_end, ss, len(order), is_fail=0
@@ -279,7 +311,7 @@ class AutoHintAgentLoop(HintAgentLoop):
         ck = self._create_kwargs(agent_data)
         budget = int(ck.get("budget", self.default_budget))
         problem = ck.get("problem", "")
-        pool = ck.get("hints", "")
+        pool = self._pool(agent_data)
         applied = agent_data.extra_fields.setdefault("applied_hints", [])
         completed = agent_data.extra_fields.setdefault("auto_hint_completed", [])
 
@@ -315,7 +347,7 @@ class AutoHintAgentLoop(HintAgentLoop):
         trace = build_trace(agent_data.messages)
         _t0 = time.perf_counter()
         with simple_timer("hint_select", agent_data.metrics):
-            selection, _raw, err = await self._selector.select_multi(problem, trace, pool, completed)
+            selection, _raw, err, _prompt = await self._selector.select_multi(problem, trace, pool, completed)
         select_latency_s = time.perf_counter() - _t0
         agent_data.extra_fields["hint_select_time"] = (
             agent_data.extra_fields.get("hint_select_time", 0.0) + select_latency_s
@@ -333,7 +365,8 @@ class AutoHintAgentLoop(HintAgentLoop):
             )
             agent_data.metrics["hint_call_failed"] = agent_data.metrics.get("hint_call_failed", 0) + 1
             logger.warning("auto-hint selection failed (request=%s): %s", agent_data.request_id, err)
-            self._dump(agent_data, turn_start, turn_end, problem, trace, completed, None, err)
+            self._dump(agent_data, turn_start, turn_end, problem, trace, completed, None, err,
+                       selector_raw=_raw, selector_prompt=_prompt)
             if self.step_adv_enable:
                 # no trustworthy boundary -> a zero-advantage no-fail segment (don't
                 # guess a failed step on a selector outage).
@@ -392,7 +425,8 @@ class AutoHintAgentLoop(HintAgentLoop):
         # recorded above; do NOT give the hint (no applied-hint penalty, no injection).
         if terminal:
             self._dump(agent_data, turn_start, turn_end, problem, trace, completed, selection, err,
-                       boundary=boundary, completed_hints=completed_hints)
+                       boundary=boundary, completed_hints=completed_hints,
+                       selector_raw=_raw, selector_prompt=_prompt)
             return AgentState.TERMINATED
 
         # Record the GIVEN hint for the per-hint penalty (strategy="hint").
@@ -419,7 +453,8 @@ class AutoHintAgentLoop(HintAgentLoop):
                 completed.append(cid)
 
         self._dump(agent_data, turn_start, turn_end, problem, trace, completed, selection, err,
-                   boundary=boundary, completed_hints=completed_hints)
+                   boundary=boundary, completed_hints=completed_hints,
+                   selector_raw=_raw, selector_prompt=_prompt)
 
         # Inject the hint as a user turn (masked 0 -- never trained).
         hint_message = {"role": "user", "content": self._format_hint(hint_text)}
@@ -488,9 +523,17 @@ class AutoHintAgentLoop(HintAgentLoop):
         )
 
     def _dump(self, agent_data, turn_start, turn_end, problem, trace, completed,
-              selection, err, *, boundary=None, completed_hints=None) -> None:
+              selection, err, *, boundary=None, completed_hints=None,
+              selector_raw=None, selector_prompt=None) -> None:
         """Reuse the HintAgentLoop per-selector-call debug dump (no-op unless
-        HPRL_SELECTOR_DUMP_DIR is set), with the auto-hint-specific extras."""
+        HPRL_SELECTOR_DUMP_DIR is set), with the auto-hint-specific extras.
+
+        ``selector_prompt`` is the EXACT prompt sent to the selector and
+        ``selector_raw`` its raw text output, so the rollout viewer can show both
+        for an injected-hint turn. ``messages`` is dumped (assistant turns through
+        the calling turn, system content elided) so build_selector_index.py can
+        content-key auto-hint records the same way it keys the <hint_call/> ones --
+        without it the indexer sees no assistant trace and can't join the call."""
         _dump_selector_call(
             {
                 "mode": "auto_hint",
@@ -502,10 +545,25 @@ class AutoHintAgentLoop(HintAgentLoop):
                 "n_assistant_in_messages": sum(
                     1 for m in agent_data.messages if m.get("role") == "assistant"
                 ),
+                "messages": [
+                    {
+                        "role": m.get("role"),
+                        "content": (
+                            f"<system prompt: {len(m.get('content') or '')} chars omitted>"
+                            if m.get("role") == "system"
+                            else m.get("content")
+                        ),
+                    }
+                    for m in agent_data.messages
+                ],
                 "problem": problem,
                 "trace": trace,
+                # problem + trace + the rendered pool make up selector_prompt; it is
+                # dumped whole so the viewer shows the verbatim prompt that was sent.
+                "selector_prompt": selector_prompt,
                 "selection": selection if isinstance(selection, dict) else None,
                 "completed_hints": completed_hints,
+                "selector_raw": selector_raw,
                 "selector_err": err,
             }
         )

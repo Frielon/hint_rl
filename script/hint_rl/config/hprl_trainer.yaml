@@ -162,6 +162,13 @@ data:
       # a rollout counts as positive (-> mask applied) iff its sequence advantage strictly
       # exceeds this. 0.0 == strictly positive ("if the advantage is negative, all tokens").
       positive_eps: 0.0
+      # prune the X.0 step-guidance hints from each pool before it reaches the selector
+      # (selector_multi.prune_hint_pool), so the rollout presents the SAME substep-only
+      # pools the offline selector eval (multi-cite-gpt-eval) was built and scored on.
+      # Applied at one read point in the loop, so the selector prompt, the pending/
+      # exhaustion check, and the step-adv hint order all see one pruned pool. Default
+      # off -> the full pool (X.0 included) is used as before.
+      prune_guidance: false
       # ---- STEP-LEVEL advantage (supersedes the verified-prefix mask) ------------
       # When enabled, the trainer REPLACES GRPO's single scalar-per-rollout advantage
       # with a value-based, per-segment one (step_advantage.py): each turn's verified
@@ -183,4 +190,11 @@ data:
         # The raw values are small (per-hint penalties ~ total_penalty/K, e.g. 0.06 for a
         # 13-hint pool), much smaller than GRPO's ~unit advantages, so raise this (e.g. 5-10)
         # to match without retuning the LR / total_penalty. 1.0 == the raw TODO formula.
+        # When normalize=true, adv_scale is instead the TARGET std (1.0 -> unit).
         adv_scale: 1.0
+        # GRPO-style per-group scale normalization: divide each group's advantages by the
+        # group's advantage std (over trained tokens) -> ~unit scale, ADAPTIVELY per group.
+        # This is the principled fix for "the gradient is too small" (the raw value-based
+        # advantages are ~penalty/K). No mean-centering (V already baselines them; centering
+        # would distort the a_C>=0 / a_I<=0 sign). false -> the plain adv_scale multiply.
+        normalize: false

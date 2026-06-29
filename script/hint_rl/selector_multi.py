@@ -40,10 +40,14 @@ TEMPLATE_MULTI_F = r"""You are an expert math tutor helping a student over multi
 # Inputs
 
 ## Math problem
+<problem>
 {{problem}}
+</problem>
 
 ## Student's current reasoning trace
+<Student_reasoning_trace>
 {{trace}}
+</Student_reasoning_trace>
 
 ## Candidate hints
 The hints are organized as an ordered list of major steps that build toward the solution. Each major step contains:
@@ -181,6 +185,34 @@ def pending_hint_ids(pool: Any, completed: Iterable[str]) -> list[str]:
     return out
 
 
+def prune_hint_pool(pool: Any) -> Any:
+    """Drop step-guidance (``X.0``) hints and the per-hint ``type`` field, leaving
+    only substep hints (each ``{"hint_id", "hint"}``).
+
+    Mirrors ``run_gpt_oss_selection.prune_hint_pool`` -- the pruning the offline
+    selector eval (``multi-cite-gpt-eval``) applied at benchmark-build time -- so the
+    auto-hint rollout can present the selector the SAME x.0-free pools it was scored
+    on (eval/train parity). Accepts the Template F pool dict (``{"steps": [{"hints":
+    [...]}, ...]}``) or its JSON string; anything unrecognized is returned unchanged.
+    A pruned dict is returned (the downstream render/pending helpers accept a dict).
+    """
+    if isinstance(pool, str):
+        try:
+            pool = json.loads(pool)
+        except Exception:  # noqa: BLE001 -- malformed pool: pass it through unfiltered
+            return pool
+    if not isinstance(pool, dict):
+        return pool
+    steps = []
+    for st in pool.get("steps", []):
+        hints = [{k: v for k, v in h.items() if k != "type"}
+                 for h in st.get("hints", [])
+                 if h.get("type") != "step_guidence_hint"
+                 and not str(h.get("hint_id", "")).endswith(".0")]
+        steps.append({**st, "hints": hints})
+    return {**pool, "steps": steps}
+
+
 # --------------------------------------------------------------------------- #
 # Fuzzy quote locator (notation-insensitive, from check_citations.py)
 # --------------------------------------------------------------------------- #
@@ -236,7 +268,8 @@ def locate_quote_end(quote: str, text: str, fuzzy_threshold: float = 0.8) -> Opt
       * exact substring         -> end = find + len(quote)
       * whitespace-normalized   -> end via a collapsed-space alignment (handles a
                                    quote that only differs in spacing/newlines)
-      * loose/fuzzy >= threshold -> end = end of the last raw matching block
+      * loose/fuzzy >= threshold -> end of the FIRST raw occurrence (anchored on
+                                   the earliest longest common run)
 
     Returns None when coverage is below ``fuzzy_threshold`` (no trustworthy match)
     -- the caller then treats the turn as having nothing verified.
@@ -268,11 +301,20 @@ def locate_quote_end(quote: str, text: str, fuzzy_threshold: float = 0.8) -> Opt
 
 
 def _raw_match_end(quote: str, text: str) -> Optional[int]:
-    """End offset (in ``text``) of the last non-empty matching block between the
-    lowercased quote and lowercased text. None if nothing aligns."""
-    sm = difflib.SequenceMatcher(None, quote.lower(), text.lower(), autojunk=False)
-    blocks = [b for b in sm.get_matching_blocks() if b.size > 0]
-    if not blocks:
+    """End offset (in ``text``) of the FIRST occurrence of ``quote``. None if
+    nothing aligns.
+
+    Anchored on the longest common run between the lowercased quote and text --
+    ``difflib.find_longest_match`` returns the run that starts EARLIEST in ``text``
+    (ties broken to the earliest position), so when the quote matches several
+    sentences the end lands in the FIRST matched sentence. The end is that run's
+    text position extended by the quote chars trailing the run, so a quote whose
+    tail paraphrases slightly still bounds at roughly its true end rather than
+    being dragged forward by a stray late-matching token (the failure mode of the
+    old ``max``-over-all-blocks behaviour)."""
+    ql, tl = quote.lower(), text.lower()
+    m = difflib.SequenceMatcher(None, ql, tl, autojunk=False).find_longest_match(
+        0, len(ql), 0, len(tl))
+    if m.size == 0:
         return None
-    last = max(blocks, key=lambda b: b.b + b.size)
-    return last.b + last.size
+    return min(len(text), m.b + (len(quote) - m.a))

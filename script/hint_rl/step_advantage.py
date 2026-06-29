@@ -185,6 +185,34 @@ def _zero_rows(advantages, returns, idxs) -> None:
         returns[i][:] = 0.0
 
 
+# A group whose advantage std is below this is treated as having NO spread (degenerate)
+# and left unnormalized -- dividing by ~0 would blow it up (the GRPO std->0 failure mode).
+_NORM_EPS = 1e-6
+
+
+def _group_token_std(advantages, response_mask, idxs) -> float:
+    """Population std of the per-token advantages over the group's TRAINED tokens
+    (``response_mask == 1``). Duck-typed over torch/numpy via element-wise ``*`` +
+    ``.sum()`` (``adv * mask`` zeroes the untrained tokens; a trained token with a
+    genuinely-0 advantage is still counted). 0.0 if the group has no trained token.
+    """
+    total = 0.0
+    sq = 0.0
+    cnt = 0
+    for i in idxs:
+        a = advantages[i]
+        m = response_mask[i]
+        am = a * m  # untrained tokens -> 0; trained keep their (possibly 0) advantage
+        total += float(am.sum())
+        sq += float((am * am).sum())
+        cnt += int(float(m.sum()))
+    if cnt <= 0:
+        return 0.0
+    mean = total / cnt
+    var = sq / cnt - mean * mean
+    return float(var ** 0.5) if var > 0.0 else 0.0
+
+
 def apply_step_level_advantages(
     advantages,
     returns,
@@ -198,6 +226,7 @@ def apply_step_level_advantages(
     terminal_value: float = 1.0,
     zero_if_no_correct: bool = True,
     adv_scale: float = 1.0,
+    normalize: bool = False,
 ) -> tuple[Any, Any, dict]:
     """Replace GRPO advantages with the step-level value-based advantages.
 
@@ -209,6 +238,15 @@ def apply_step_level_advantages(
     Per-row inputs are length B (the batch); ``turns_per_row[i]`` is the rollout's
     list of ``(ts, b, te, ss, se, is_fail)`` segments, ``penalty_per_row[i]`` its
     pool's per-hint penalty weights, ``K_per_row[i]`` its pool size.
+
+    ``normalize`` (GRPO-style, per group): divide each group's per-token advantages by
+    the group's advantage std (over its trained tokens), bringing the raw value-based
+    advantages (which are small, ~penalty/K) to ~unit scale -- the fix for "the gradient
+    is too small", adaptively per group. ``adv_scale`` then sets the TARGET std (1.0 ->
+    unit). NO mean-centering: the value function V already baselines the advantages
+    (their token-mean is ~0), and centering again would distort the a_C>=0 / a_I<=0 sign.
+    A near-zero-std (degenerate) group is left unnormalized (the divide-by-~0 blow-up
+    guard). With ``normalize=False`` it is the plain ``adv_scale`` multiply.
     """
     n_rows = int(advantages.shape[0])
     groups: dict[Any, list] = {}
@@ -225,6 +263,8 @@ def apply_step_level_advantages(
     n_pos = 0
     n_neg = 0
     v0_sum = 0.0
+    group_std_sum = 0.0
+    norm_factor_sum = 0.0
 
     for _uid, idxs in groups.items():
         # pool size / penalty vector are the same across a group; take the row with
@@ -263,17 +303,47 @@ def apply_step_level_advantages(
         )
         v0_sum += V[0]
         n_scored_groups += 1
+
+        # pass 1: assign the RAW value-based advantages (scale handled below so the
+        # group std for normalization is read off the raw values).
+        g_tokens = 0
+        g_pos = 0.0
+        g_neg = 0.0
+        g_np = 0
+        g_nn = 0
         for i in idxs:
             tally = assign_row_advantages(
                 advantages[i], returns[i], (turns_per_row[i] or []), V, pvec, K,
-                adv_scale=adv_scale,
+                adv_scale=1.0,
             )
-            tokens_assigned += tally["tokens"]
-            pos_sum += tally["pos_sum"]
-            neg_sum += tally["neg_sum"]
-            n_pos += tally["n_pos"]
-            n_neg += tally["n_neg"]
+            g_tokens += tally["tokens"]
+            g_pos += tally["pos_sum"]
+            g_neg += tally["neg_sum"]
+            g_np += tally["n_pos"]
+            g_nn += tally["n_neg"]
             n_scored_rows += 1
+
+        # group scale factor: normalize to unit std (then x adv_scale = target std), or
+        # the plain adv_scale multiply. A degenerate (near-0-std) group keeps adv_scale.
+        factor = float(adv_scale)
+        if normalize:
+            gstd = _group_token_std(advantages, response_mask, idxs)
+            group_std_sum += gstd
+            if gstd > _NORM_EPS:
+                factor = float(adv_scale) / gstd
+        norm_factor_sum += factor
+        if factor != 1.0:
+            for i in idxs:
+                advantages[i] *= factor
+                returns[i][:] = advantages[i]  # re-mirror (no-op when same tensor)
+            g_pos *= factor  # factor > 0 -> signs preserved
+            g_neg *= factor
+
+        tokens_assigned += g_tokens
+        pos_sum += g_pos
+        neg_sum += g_neg
+        n_pos += g_np
+        n_neg += g_nn
 
     stats = {
         "step_adv/groups_total": float(n_groups),
@@ -284,5 +354,7 @@ def apply_step_level_advantages(
         "step_adv/adv_pos_mean": float(pos_sum / n_pos) if n_pos else 0.0,
         "step_adv/adv_neg_mean": float(neg_sum / n_neg) if n_neg else 0.0,
         "step_adv/value_s0_mean": float(v0_sum / n_scored_groups) if n_scored_groups else 0.0,
+        "step_adv/group_std_mean": float(group_std_sum / n_scored_groups) if n_scored_groups else 0.0,
+        "step_adv/norm_factor_mean": float(norm_factor_sum / n_scored_groups) if n_scored_groups else 0.0,
     }
     return advantages, returns, stats

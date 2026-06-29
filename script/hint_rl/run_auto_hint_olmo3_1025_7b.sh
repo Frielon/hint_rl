@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 #
-# AUTO-HINT (push-hint) HPRL run.
+# AUTO-HINT (push-hint) HPRL run for Olmo-3-1025-7B.
 #
-# NOTE: auto-hint is now the DEFAULT of run_hprl_qwen2.5_7b.sh (HPRL_AUTO_HINT=true),
-# so this wrapper is just an EXPLICIT, distinctly-named alias (distinct wandb
-# project/exp name) -- the exports below mostly re-affirm the main script's defaults.
-# Run the main script directly for the same auto-hint job; use HPRL_AUTO_HINT=false
-# there for the legacy <hint_call/> job.
+# Copy of run_auto_hint_qwen2.5_7b.sh with the base model swapped to
+# Olmo-3-1025-7B (${BASE_HOME}/model/Olmo-3-1025-7B, exported as
+# MODEL_PATH so the main run_hprl script picks it up) and distinct wandb
+# project/exp names. Every auto-hint knob below is identical to the Qwen run.
+#
+# NOTE: the main script (run_hprl_qwen2.5_7b.sh) hardcodes
+#   +actor_rollout_ref.model.override_config.{embd_pdrop,resid_pdrop}=0.
+# which Olmo3's HF config does not define. These are harmless (verl just sets
+# them as ignored extra attributes on the config); only attention_dropout=0. is
+# actually consumed. So no fork of the main script is needed.
 #
 # In this mode the policy runs the ORDINARY single-turn math prompt (it is never
 # told about hints); the rollout loop (auto_hint_agent_loop.AutoHintAgentLoop,
@@ -21,11 +26,15 @@
 #       --in   dataset/dapo-3164-hint-verl.parquet \
 #       --out  dataset/dapo-3139-auto-hint.parquet
 #
-# Then:  bash run_auto_hint_qwen2.5_7b.sh
+# Then:  bash run_auto_hint_olmo3_1025_7b.sh
 # Override any knob via env, e.g.  HPRL_KPACK_ENABLE=true bash run_auto_hint_...sh
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HINT_RL_HOME=${HINT_RL_HOME:-"$(cd "${SCRIPT_DIR}/../.." && pwd)"}
+BASE_HOME=${BASE_HOME:-"$(cd "${HINT_RL_HOME}/../.." && pwd)"}
+
+# --- base model: Olmo-3-1025-7B ------------------------------------------
+export MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Olmo-3-1025-7B"}
 
 # --- turn on the auto-hint mechanism + its verified-prefix gradient mask -----
 export HPRL_AUTO_HINT=${HPRL_AUTO_HINT:-true}
@@ -50,6 +59,10 @@ export TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dapo-512-auto-hint.parq
 export TEST_FILE=${TEST_FILE:-"${HINT_RL_HOME}/dataset/aime2024.parquet"}
 export HARD_TEST_FILE=${HARD_TEST_FILE:-"${HINT_RL_HOME}/dataset/dapo_sample_hard_100.parquet"}
 export AIME2025_FILE=${AIME2025_FILE:-"${HINT_RL_HOME}/dataset/aime2025.parquet"}
+export HMMT_FILE=${HMMT_FILE:-"${HINT_RL_HOME}/dataset/hmmt_nov_2025.parquet"}
+# add hmmt_nov_2025 (data_source=hmmt_nov_2025, reported as val-core/hmmt_nov_2025/*)
+# as a 4th bare val set; override VAL_FILES to change.
+export VAL_FILES=${VAL_FILES:-"['${TEST_FILE}','${HARD_TEST_FILE}','${AIME2025_FILE}','${HMMT_FILE}']"}
 
 # --- reward: per-hint penalty; DISABLE the <hint_call/>-specific terms --------
 # This mode emits no <hint_call/>, so the anti-suppression hint-call bonus and the
@@ -104,10 +117,10 @@ export HPRL_BUDGET_SAMPLING_SHUFFLE_ORDER=${HPRL_BUDGET_SAMPLING_SHUFFLE_ORDER:-
 export HPRL_RATCHET_MODE=${HPRL_RATCHET_MODE:-adaptive}
 
 # --- distinct run labels in wandb --------------------------------------------
-export project_name=${project_name:-'HPRL-AutoHint-Qwen2.5-7B-Instruct'}
-export exp_name=${exp_name:-"HPRL-AutoHint-Qwen2.5-7B-dapo-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
+export project_name=${project_name:-'HPRL-AutoHint-Olmo-3-1025-7B'}
+export exp_name=${exp_name:-"HPRL-AutoHint-Olmo-3-1025-7B-dapo-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
 
-echo "[run_auto_hint] auto-hint mode ON"
+echo "[run_auto_hint] auto-hint mode ON  (model=${MODEL_PATH})"
 echo "[run_auto_hint]   TRAIN_FILE=${TRAIN_FILE}"
 echo "[run_auto_hint]   strategy=${HINT_STRATEGY} call_reward=${HINT_CALL_REWARD} shape=${HINT_SHAPE_COEFF} kpack=${HPRL_KPACK_ENABLE}"
 echo "[run_auto_hint]   step_adv=${HPRL_STEP_ADV} step_adv_scale=${HPRL_STEP_ADV_SCALE} step_adv_norm=${HPRL_STEP_ADV_NORM} guidance_free=${HINT_GUIDANCE_FREE} prune_guidance=${HPRL_PRUNE_GUIDANCE}"

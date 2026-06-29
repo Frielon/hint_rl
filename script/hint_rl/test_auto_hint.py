@@ -20,6 +20,7 @@ from hint_penalty import compute_hint_penalties
 from selector_multi import (
     locate_quote_end,
     pending_hint_ids,
+    prune_hint_pool,
     render_hints_with_status,
 )
 from step_advantage import (
@@ -160,6 +161,25 @@ def test_pending_hint_ids():
     assert pending_hint_ids(json.dumps(_POOL), ["1.1"]) == ["1.2", "2.1"]  # JSON str ok
 
 
+def test_prune_hint_pool_drops_x0_and_type():
+    # X.0 step-guidance hints (by id OR by type) are dropped; substeps kept; the
+    # per-hint `type` field is stripped. Accepts a dict or a JSON string.
+    pool = {"steps": [
+        {"step_id": 1, "purpose": "p1", "hints": [
+            {"hint_id": "1.0", "hint": "guide", "type": "step_guidence_hint"},
+            {"hint_id": "1.1", "hint": "a", "type": "substep_hint"}]},
+        {"step_id": 2, "purpose": "p2", "hints": [
+            {"hint_id": "2.0", "hint": "guide2"},          # dropped by the .0 id alone
+            {"hint_id": "2.1", "hint": "c", "type": "substep_hint"}]},
+    ]}
+    pruned = prune_hint_pool(pool)
+    assert pending_hint_ids(pruned, []) == ["1.1", "2.1"]
+    assert all("type" not in h for st in pruned["steps"] for h in st["hints"])
+    # JSON-string input prunes identically; an unparseable value passes through.
+    assert pending_hint_ids(prune_hint_pool(json.dumps(pool)), []) == ["1.1", "2.1"]
+    assert prune_hint_pool("not json") == "not json"
+
+
 # --------------------------------------------------------------------------- #
 # adaptive ratchet rule (budget_manager.compute_adaptive_budget)
 # --------------------------------------------------------------------------- #
@@ -294,6 +314,36 @@ def test_apply_step_level_advantages_adv_scale():
     a5 = np.zeros((3, L)); apply_step_level_advantages(a5, a5.copy(), np.ones((3, L)), ["p"]*3, turns, correct, [_P5]*3, [5]*3, adv_scale=5.0)
     assert np.allclose(a1[0, 0:6], 0.3), a1[0, 0:6]
     assert np.allclose(a5[0, 0:6], 1.5), a5[0, 0:6]  # exactly 5x
+
+
+def test_normalize_brings_group_to_unit_std():
+    # a group with spread; tokens tile each row (mask all-1) so np.std over the tensor ==
+    # the group's trained-token std. normalize -> that std becomes adv_scale (1.0 default).
+    L = 12
+    turns = [
+        [[0, 12, 12, 0, 5, 0]],                          # A correct: a_C 0.3
+        [[0, 0, 6, 0, 0, 1], [6, 12, 12, 1, 5, 0]],      # B: a_I -0.1 ; a_C 0.1
+        [[0, 0, 6, 0, 0, 1], [6, 6, 12, 1, 2, 1]],       # C: a_I -0.1 ; a_I -0.1333
+    ]
+    correct = [True, True, False]
+    mask = np.ones((3, L))
+    a_raw = np.zeros((3, L))
+    apply_step_level_advantages(a_raw, a_raw.copy(), mask, ["p"] * 3, turns, correct, [_P5] * 3, [5] * 3)
+    a_norm = np.zeros((3, L))
+    _, _, st = apply_step_level_advantages(
+        a_norm, a_norm.copy(), mask, ["p"] * 3, turns, correct, [_P5] * 3, [5] * 3, normalize=True
+    )
+    assert abs(float(a_norm.std()) - 1.0) < 1e-6, a_norm.std()   # unit std after norm
+    assert float(a_raw.std()) < 0.3                              # raw was much smaller
+    # signs preserved (no mean-centering): A's progress > 0, C's failed tail < 0.
+    assert a_norm[0, 0] > 0.0 and a_norm[2, 0] < 0.0
+    assert st["step_adv/group_std_mean"] > 0.0 and st["step_adv/norm_factor_mean"] > 1.0
+    # adv_scale is the TARGET std under normalize.
+    a3 = np.zeros((3, L))
+    apply_step_level_advantages(
+        a3, a3.copy(), mask, ["p"] * 3, turns, correct, [_P5] * 3, [5] * 3, normalize=True, adv_scale=3.0
+    )
+    assert abs(float(a3.std()) - 3.0) < 1e-6, a3.std()
 
 
 def test_apply_step_level_advantages_all_incorrect_zeroed():

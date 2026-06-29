@@ -422,23 +422,25 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
         tv = float(sa.get("terminal_value", 1.0))
         zinc = _truthy(sa.get("zero_if_no_correct", True))
         scale = float(sa.get("adv_scale", 1.0))
+        normalize = _truthy(sa.get("normalize", False))
         # GRPO sets returns == advantages (same tensor); fall back to advantages if absent.
         returns_t = bb["returns"] if "returns" in bb.keys() else bb["advantages"]
         _, _, mstats = apply_step_level_advantages(
             bb["advantages"], returns_t, bb["response_mask"], list(uids),
             turns_per_row, correct_per_row, penalty_per_row, K_per_row,
-            terminal_value=tv, zero_if_no_correct=zinc, adv_scale=scale,
+            terminal_value=tv, zero_if_no_correct=zinc, adv_scale=scale, normalize=normalize,
         )
         stats.update(mstats)
         logger.warning(
             "[HPRL step=%s] step-adv: groups=%d scored=%d zeroed=%d rows=%d tokens=%d "
-            "pos=%.4f neg=%.4f V0=%.4f cite=%.3f",
+            "pos=%.4f neg=%.4f V0=%.4f gstd=%.4f nfac=%.2f cite=%.3f",
             self.global_steps,
             int(mstats["step_adv/groups_total"]), int(mstats["step_adv/groups_scored"]),
             int(mstats["step_adv/groups_zeroed"]), int(mstats["step_adv/rows_scored"]),
             int(mstats["step_adv/tokens_assigned"]),
             mstats["step_adv/adv_pos_mean"], mstats["step_adv/adv_neg_mean"],
-            mstats["step_adv/value_s0_mean"], stats.get("auto_hint/cite_found_rate", 0.0),
+            mstats["step_adv/value_s0_mean"], mstats["step_adv/group_std_mean"],
+            mstats["step_adv/norm_factor_mean"], stats.get("auto_hint/cite_found_rate", 0.0),
         )
         return stats
 

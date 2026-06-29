@@ -15,6 +15,135 @@ _(none open — the step-level advantage calculation landed 2026-06-25; see the 
 
 # Done log
 
+## 2026-06-27 — selector citation locator: ambiguous quote now anchors on the FIRST matched sentence
+
+A correctness fix to where a selector citation is located in the student trace. The
+auto-hint loop uses `selector_multi.locate_quote_end(quote, text)` to find the char
+offset where a completed-hint's verbatim `quote` ENDS, and that offset bounds the
+verified-prefix gradient mask / step-adv segment (`auto_hint_agent_loop._verified_boundary`,
+also the `cite_found_rate` metric). The quote is matched against the WHOLE turn text (no
+sentence segmentation), so a quote can align to more than one sentence.
+
+**The bug.** When a quote matched several places, the result depended on the match tier:
+the exact-substring tier (`text.find`) returned the FIRST occurrence, but the
+whitespace-normalized and loose/fuzzy tiers both went through `_raw_match_end`, which
+scanned ALL of difflib's matching blocks and returned `max(..., key=lambda b: b.b + b.size)`
+— the FURTHEST-into-text block end. So a stray late-matching token (e.g. the quote's last
+word reappearing in a later sentence) could drag the verified-prefix boundary forward into
+a sentence the student hadn't actually reached, over-extending the positively-masked prefix.
+
+**The fix.** `_raw_match_end` now anchors on `difflib.SequenceMatcher.find_longest_match`,
+which returns the EARLIEST longest common run (ties broken to the earliest text position),
+and computes the end as that run's text position extended by the quote chars trailing the
+run (`m.b + (len(quote) - m.a)`, clamped to `len(text)`). When a quote matches multiple
+sentences the end now lands in the FIRST one, consistent with the exact tier, and a stray
+late token can no longer pull it forward. All three tiers of `locate_quote_end` are now
+uniformly first-occurrence.
+
+**Trade-off.** In the fuzzy tier the end is now `run_start + remaining-quote-len` rather
+than the last literally-matched char, so a quote whose TAIL paraphrases heavily can
+overshoot by a few chars. Harmless directionally — this only bounds the verified prefix and
+the mask is meant to err conservative (`auto_hint_agent_loop.py:90-91`).
+
+**Unchanged on purpose.** `_verified_boundary` still takes the MAX end across *different*
+completed hints — that's the furthest prefix verified by distinct hints (each legitimately
+completing a different part of the turn), not multiple matches of one citation.
+
+**Validation.** Spot-checked first-occurrence semantics across exact-repeat (tier 1),
+whitespace-diff repeat (tier 2), and fuzzy-with-stray-late-token (tier 3): all three now
+bound at the first matched sentence.
+
+### Files touched
+- `selector_multi.py` — `_raw_match_end` rewritten to first-occurrence (`find_longest_match`); `locate_quote_end` docstring tier bullet updated
+
+## 2026-06-26 — auto-hint step-adv: a FIRST-turn length-cap truncation is now scored as a failed first step (whole-span `a_I`)
+
+Closes a step-adv gap on the response-length cap. In AUTO-HINT step-adv mode (`HPRL_STEP_ADV`,
+the 2026-06-25 step-level advantage work) the length cap in
+`auto_hint_agent_loop._handle_assistant_response` terminated the rollout **without recording
+any `step_adv_turns` segment** ("a capped turn is the ending turn, nothing more to inject").
+When that cap fires on the **first** turn the rollout is left with an EMPTY turns list → in
+`step_advantage.py` the whole row is zeroed (`final_state = 0`, no fails) → **zero gradient,
+and the over-long first turn escapes penalty entirely** (`h_0` never enters any `H_i`, so it
+doesn't even depress `V[0]`). A run-on first turn was free.
+
+**Fix (`auto_hint_agent_loop.py`).** When step-adv is on AND this is the first turn
+(`agent_data.assistant_turns == 1`, already incremented at the top of the handler), the cap
+branch records one whole-span failed segment `[turn_start, turn_start, turn_end, 0, 0,
+is_fail=1]`:
+- `boundary == turn_start` → the WHOLE response is the `a_I` tail, no verified-prefix `a_C`
+  credit (nothing is ever selector-verified on a first turn).
+- `state_start == state_end == 0` with `is_fail` → charged with FAILING `h_0` at `S_0`:
+  end-state `S_0` (not even reaching the first step) and `h_0 ∈ H_i`.
+So every response token of the truncated first turn gets `a_I = r_0 + V[1] − V[0] ≤ 0`, and
+the rollout now counts in `F_0` (depresses `V[0]`) — aligned with the intent that **one turn's
+generation should fit within the length**.
+
+**Scope: first turn ONLY.** A non-first-turn length cap is unchanged — it records no segment,
+so its truncated tail keeps **advantage 0** as before (the earlier turns' `a_C`/`a_I` segments
+already scored the rollout). Rationale: a first turn that overruns made no selector-verified
+progress, so "failed the first step" is unambiguous; a later turn may have made real—but
+unverified—progress before overrunning, so we leave it at 0 rather than relabel the whole turn
+a failure. `length_truncated = 1` (the reward floor + metrics) is still set in both cases; this
+only ADDS the step-adv label, and step-adv off → the branch is skipped (legacy mask path intact).
+
+**Verified.** 29/29 `test_auto_hint.py`. Simulated the emitted segment through the real
+`apply_step_level_advantages` (a first-turn-truncated rollout + one correct sibling, K=3,
+penalty 0.6 → `V=[0.7,1,1,1]`): the truncated row gets a uniform `a_I = −0.3` on every token
+(no zero-grad tokens), end-state `S_0`, and `h_0` counted in `H` pulls `V[0]=0.7 < V[1]=1.0`.
+
+Files: `auto_hint_agent_loop.py`.
+
+## 2026-06-25 (b) — auto-hint selector: X.0-guidance pruning (eval/train parity) + viewer shows the selector prompt & raw output
+
+Two small, related changes to the AUTO-HINT selector path.
+
+**1. Prune the X.0 step-guidance hints before the selector sees the pool (flag-gated).**
+The offline selector eval (`selector/test_cite/gpt_oss_eval/multi-cite-gpt-eval`) was built
+and scored on **substep-only** pools: `build_benchmark.py` runs every pool through
+`run_gpt_oss_selection.prune_hint_pool`, which drops each hint whose `type` is
+`step_guidence_hint` **or** whose `hint_id` ends in `.0`, and strips the per-hint `type`
+field (the benchmark stores the pruned pool, commented `# pruned (no x.0, no type)`). But the
+TRAIN/rollout path (`selector_multi.render_hints_with_status`) rendered the **full** pool —
+X.0 guidance hints included — so the selector was trained on pools it was never evaluated on.
+- Ported `prune_hint_pool` into `selector_multi.py` (verbatim logic, stdlib-only) so the two
+  can't drift.
+- `auto_hint_agent_loop.py`: added one chokepoint `self._pool(agent_data)` that reads `hints`
+  and prunes when enabled, and routed **both** pool reads (the step-adv solving-turn order +
+  the selector call) through it — so the selector prompt, the pending/exhaustion check, and the
+  step-adv hint **order/state indices** all see ONE consistently-pruned pool (pruning only the
+  prompt would desync the step-adv states and exhaustion logic).
+- Hyperparameter: `data.hprl.auto_hint.prune_guidance` (env `HPRL_PRUNE_GUIDANCE`), wired
+  through `run_hprl_qwen2.5_7b.sh` + `config/hprl_trainer.yaml`. **Default off** (full pool, as
+  before); **on by default in `run_auto_hint_qwen2.5_7b.sh`** since parity is that run's point.
+- Note: with pruning on, `HINT_GUIDANCE_FREE` (zero the X.0 penalty) is effectively redundant
+  on this path — the selector can no longer apply an X.0 hint at all.
+- Test: `test_prune_hint_pool_drops_x0_and_type` (29/29 pass).
+
+**2. Rollout viewer: show the selector's PROMPT and RAW OUTPUT for an injected-hint turn.**
+The auto-hint per-call debug dump (`auto_hint_agent_loop._dump`) recorded only the parsed
+`selection`, `problem`, and `trace` — not the raw selector output, not the prompt, and not a
+`messages` list. So (a) the viewer had nothing to show, and (b) `build_selector_index.py`
+(which content-keys on the record's assistant `messages`) couldn't even join auto-hint records
+(it saw an empty trace). Fixed end to end:
+- `hint_selector.select_multi` now also returns the **exact prompt** it sent (4-tuple
+  `selection, raw, err, prompt`).
+- `auto_hint_agent_loop._dump` now writes `selector_prompt`, `selector_raw`, and `messages`
+  (assistant turns through the calling turn, system content elided — for index keying), at all
+  three call sites (selector-failure, step-adv terminal label, normal hint).
+- `tools/rollout_viewer.py`: `api_selector_call` surfaces `selector_prompt` / `mode` /
+  `completed_status_before`; `renderSelectorCall` adds open-by-default **"full prompt sent to
+  selector"** and **"raw selector output"** panels, renders the multi-round `completed_hints`
+  (hint_id + quote), and hides empty detail panels.
+- **Caveat:** records dumped before this change have none of these fields (raw output is not
+  recoverable from the parsed `selection`), so the feature lights up only for dumps written by
+  the patched code — restart the run / start a fresh one, then rebuild
+  `selector_index.sqlite` via `tools/build_selector_index.py --run-dir logs/<EXP>`.
+
+Files: `selector_multi.py`, `auto_hint_agent_loop.py`, `hint_selector.py`,
+`config/hprl_trainer.yaml`, `run_hprl_qwen2.5_7b.sh`, `run_auto_hint_qwen2.5_7b.sh`,
+`tools/rollout_viewer.py`, `test_auto_hint.py`.
+
 ## 2026-06-25 — STEP-LEVEL advantage calculation (auto-hint): value-based per-segment advantage replacing GRPO's scalar
 
 Implements the TODO. In AUTO-HINT mode the selector already tells us, per turn, how far
@@ -109,6 +238,18 @@ with `returns is advantages` — correct a_C/a_I, in-place propagation, uid grou
 (default 1.0) tunes the gradient magnitude. Both flow as `data.hprl.auto_hint.step_adv.*`
 hydra overrides. Not yet run live.
 
+**Follow-up — per-group advantage normalization (`step_adv.normalize`, default false).** The
+raw value-based advantages are small (~`total_penalty/K`, std ≈ 0.04 on real data) → a too-small
+gradient. `normalize=true` (env `HPRL_STEP_ADV_NORM`) divides each GRPO group's per-token
+advantages by the group's advantage std (over its trained tokens), bringing them to ~unit scale
+ADAPTIVELY per group; `adv_scale` then sets the TARGET std (1.0 → unit). NO mean-centering — the
+value function V already baselines the advantages (their token-mean is ~0), and centering again
+would distort the `a_C≥0 / a_I≤0` sign. A near-zero-std (degenerate) group is left unnormalized
+(`_NORM_EPS=1e-6`, the divide-by-~0 blow-up guard). New metrics
+`step_adv/{group_std_mean,norm_factor_mean}`. Verified on real data: raw std 0.041 → 1.008 at
+scale 1 (factor ≈ 24×), → 3.02 at scale 3. `run_auto_hint_qwen2.5_7b.sh` defaults it ON (step-adv
+is on there).
+
 **Follow-up — free X.0 guidance hint (`hint_guidance_free`, default false).** New reward kwarg
 (env `HINT_GUIDANCE_FREE`) making every `<step_id>.0` GUIDANCE hint cost 0: in
 `hint_penalty.compute_hint_penalties` the guidance hint gets zero WEIGHT, so the step's penalty is
@@ -123,7 +264,8 @@ Verified on real data: x.0 → 0, total preserved at 0.8, substep `1.1` 0.0436�
 ### Files touched this session
 - `step_advantage.py` *(new)* — `prefix_state`, `compute_state_values` (the backward V
   recursion), `assign_row_advantages` (per-row a_C/a_I token write), `apply_step_level_advantages`
-  (group-by-uid orchestrator + stats); pure, duck-typed torch/numpy
+  (group-by-uid orchestrator + stats), `_group_token_std` (per-group normalization); pure,
+  duck-typed torch/numpy
 - `hint_penalty.py` — `guidance_free` in `compute_hint_penalties` / `applied_penalty` / `penalty_from_k`
 - `hint_reward.py` — `hint_guidance_free` kwarg (coerced) → `hint_penalty` + `penalty_from_k`
 - `auto_hint_agent_loop.py` — `step_adv_enable` flag; per-turn `step_adv_turns` recording

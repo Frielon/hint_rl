@@ -133,13 +133,22 @@ CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
 # MUST precede the TRAIN_FILE / HINT_* / HPRL_KPACK_* defaults so these win.
 HPRL_AUTO_HINT=${HPRL_AUTO_HINT:-true}
 HPRL_AUTO_HINT_FUZZY=${HPRL_AUTO_HINT_FUZZY:-0.8}
+# Prune the X.0 step-guidance hints from each pool before it reaches the selector, so the
+# rollout presents the SAME substep-only pools the offline selector eval (multi-cite-gpt-eval)
+# was built and scored on (eval/train parity). Default off -> the full pool (X.0 included).
+HPRL_PRUNE_GUIDANCE=${HPRL_PRUNE_GUIDANCE:-false}
 # STEP-LEVEL advantage (auto-hint only): replace GRPO's scalar advantage with the
 # value-based per-segment one (step_advantage.py) and SKIP the verified-prefix mask.
 # Default off (the mask runs). Set HPRL_STEP_ADV=true to switch the auto-hint job to it.
 HPRL_STEP_ADV=${HPRL_STEP_ADV:-false}
 # Uniform multiplier on the (small) value-based advantages -- raise to ~5-10 to match
 # GRPO's gradient magnitude without retuning the LR. 1.0 == the raw step-adv formula.
+# When HPRL_STEP_ADV_NORM=true, this is the TARGET std instead (1.0 -> unit).
 HPRL_STEP_ADV_SCALE=${HPRL_STEP_ADV_SCALE:-1.0}
+# GRPO-style per-group normalization: divide each group's advantages by their std so the
+# (small) raw value-based advantages become ~unit scale adaptively -- the fix for a too-small
+# gradient. true is recommended when enabling step-adv; false = the plain adv_scale multiply.
+HPRL_STEP_ADV_NORM=${HPRL_STEP_ADV_NORM:-false}
 case "${HPRL_AUTO_HINT}" in
   true | True | 1 | yes | on)
     # hint-wise re-seeded initial budgets (budget_calibration/apply_budget_state.py from
@@ -285,6 +294,12 @@ mkdir -p "${EXP_LOG_DIR}"
 # multi-turn GRPO (HintBudgetDataset + HPRLRayPPOTrainer become no-ops).
 HPRL_ENABLE=${HPRL_ENABLE:-True}
 BUDGET_STATE_PATH=${BUDGET_STATE_PATH:-"${EXP_LOG_DIR}/budget_state.json"}
+# ---- resume control (verl checkpoint) ------------------------------------
+# RESUME_MODE=auto (default) resumes the LATEST ckpt found in default_local_dir.
+# Set RESUME_MODE=resume_path + RESUME_FROM_PATH=<...>/global_step_N to pin a
+# SPECIFIC checkpoint (verl reads N from the path and loads actor/ + data.pt).
+RESUME_MODE=${RESUME_MODE:-auto}
+RESUME_FROM_PATH=${RESUME_FROM_PATH:-null}
 HPRL_MIN_BUDGET=${HPRL_MIN_BUDGET:-0}
 HPRL_DECREMENT=${HPRL_DECREMENT:-1}
 HPRL_DEFAULT_BUDGET=${HPRL_DEFAULT_BUDGET:-6}
@@ -436,8 +451,10 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     data.hprl.budget_sampling.shuffle_batch_order=${HPRL_BUDGET_SAMPLING_SHUFFLE_ORDER} \
     data.hprl.auto_hint.enable=${HPRL_AUTO_HINT} \
     data.hprl.auto_hint.fuzzy_threshold=${HPRL_AUTO_HINT_FUZZY} \
+    data.hprl.auto_hint.prune_guidance=${HPRL_PRUNE_GUIDANCE} \
     data.hprl.auto_hint.step_adv.enable=${HPRL_STEP_ADV} \
     data.hprl.auto_hint.step_adv.adv_scale=${HPRL_STEP_ADV_SCALE} \
+    data.hprl.auto_hint.step_adv.normalize=${HPRL_STEP_ADV_NORM} \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
@@ -531,7 +548,8 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.rollout_data_dir="${LOG_DIR}/${exp_name}/rollouts" \
     trainer.validation_data_dir="${LOG_DIR}/${exp_name}/val_rollouts" \
-    trainer.resume_mode=auto \
+    trainer.resume_mode=${RESUME_MODE} \
+    trainer.resume_from_path=${RESUME_FROM_PATH} \
     trainer.device=cuda \
     actor_rollout_ref.actor.entropy_checkpointing=True \
     actor_rollout_ref.ref.entropy_checkpointing=True \

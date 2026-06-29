@@ -654,15 +654,20 @@ def api_selector_call():
         calls.append({
             "request_id": rec.get("request_id"),
             "call_index": rec.get("call_index"),
+            "mode": rec.get("mode"),  # "auto_hint" (multi-round) vs the <hint_call/> path
             "strategy": rec.get("strategy"),
             "budget": rec.get("budget"),
             "select_latency_s": rec.get("select_latency_s"),
             "selector_err": rec.get("selector_err"),
             "applied_step_ids_before": rec.get("applied_step_ids_before"),
+            "completed_status_before": rec.get("completed_status_before"),  # auto-hint
             "n_assistant_in_messages": rec.get("n_assistant_in_messages"),
             "problem": rec.get("problem"),
             "trace": rec.get("trace"),
             "candidate_hints_str": rec.get("candidate_hints_str"),
+            # the EXACT prompt sent to the selector (auto-hint dumps this whole;
+            # the <hint_call/> path reconstructs it from problem+trace+candidates).
+            "selector_prompt": rec.get("selector_prompt"),
             "selection": sel,
             "selector_raw": rec.get("selector_raw"),
         })
@@ -1157,18 +1162,27 @@ function renderSelectorCall(c){
                   : (!c.selection ? `<span class="badge bad">no selection parsed</span>` : '');
   const meta = [
     (c.call_index!=null?`<span><span class="k">call</span> #${esc(c.call_index)}</span>`:''),
+    (c.mode?`<span><span class="k">mode</span> ${esc(c.mode)}</span>`:''),
     (c.strategy?`<span><span class="k">strategy</span> ${esc(c.strategy)}</span>`:''),
     (c.budget!=null?`<span><span class="k">budget</span> ${esc(c.budget)}</span>`:''),
     (c.select_latency_s!=null?`<span><span class="k">latency</span> ${esc(c.select_latency_s)}s</span>`:''),
     (c.n_assistant_in_messages!=null?`<span><span class="k">trace turns</span> ${esc(c.n_assistant_in_messages)}</span>`:''),
+    (Array.isArray(c.completed_status_before)&&c.completed_status_before.length?`<span><span class="k">completed before</span> ${esc(c.completed_status_before.join(', '))}</span>`:''),
     (c.request_id?`<span><span class="k">req</span> <span class="mono">${esc(c.request_id)}</span></span>`:''),
     failBadge,
   ].filter(Boolean).join('');
-  const completed = Array.isArray(s.completed_steps) && s.completed_steps.length
-    ? `<div class="selrow"><span class="k">completed steps (per selector)</span>` + s.completed_steps.map(cs =>
+  // completed entries: <hint_call/> path reports completed_steps (step_id/quote/why);
+  // the auto-hint multi-round path reports completed_hints (hint_id/quote) -- show either.
+  let completed = '';
+  if (Array.isArray(s.completed_steps) && s.completed_steps.length) {
+    completed = `<div class="selrow"><span class="k">completed steps (per selector)</span>` + s.completed_steps.map(cs =>
         `<div class="selcomplete"><span class="sid">step ${esc(cs.step_id)}</span>`
-        + (cs.quote?` — “${esc(cs.quote)}”`:'') + (cs.why?`<br>${esc(cs.why)}`:'') + `</div>`).join('') + `</div>`
-    : '';
+        + (cs.quote?` — “${esc(cs.quote)}”`:'') + (cs.why?`<br>${esc(cs.why)}`:'') + `</div>`).join('') + `</div>`;
+  } else if (Array.isArray(s.completed_hints) && s.completed_hints.length) {
+    completed = `<div class="selrow"><span class="k">completed hints this round (per selector)</span>` + s.completed_hints.map(cs =>
+        `<div class="selcomplete"><span class="sid">hint ${esc(cs.hint_id)}</span>`
+        + (cs.quote?` — “${esc(cs.quote)}”`:'') + `</div>`).join('') + `</div>`;
+  }
   const body = [
     completed,
     selRow('major step', (s.major_step_id!=null? s.major_step_id : '') + (conf!=null?`  ·  confidence ${conf}`:''), true),
@@ -1178,12 +1192,17 @@ function renderSelectorCall(c){
     selRow('chosen hint', s.hint, true),
     c.selector_err ? selRow('error', c.selector_err) : '',
   ].filter(Boolean).join('');
+  // open the prompt + raw output by default (the two the user most wants to read);
+  // the reconstructed-input details stay collapsed. Skip any detail with no content.
+  const det = (summary, body, open) => body
+    ? `<details class="seldetails"${open?' open':''}><summary>${summary}</summary><div class="selpre">${esc(body)}</div></details>` : '';
   const details = [
-    `<details class="seldetails"><summary>raw selector output</summary><div class="selpre">${esc(c.selector_raw||'(empty)')}</div></details>`,
-    `<details class="seldetails"><summary>candidate hints shown to selector</summary><div class="selpre">${esc(prettyMaybeJSON(c.candidate_hints_str))}</div></details>`,
-    `<details class="seldetails"><summary>student trace seen by selector</summary><div class="selpre">${esc(c.trace||'(empty)')}</div></details>`,
-    `<details class="seldetails"><summary>problem</summary><div class="selpre">${esc(c.problem||'(empty)')}</div></details>`,
-  ].join('');
+    det('full prompt sent to selector', c.selector_prompt, true),
+    det('raw selector output', c.selector_raw, true),
+    det('candidate hints shown to selector', prettyMaybeJSON(c.candidate_hints_str)),
+    det('student trace seen by selector', c.trace),
+    det('problem', c.problem),
+  ].filter(Boolean).join('');
   return `<div class="selcall">
     <div class="selcall-head">${meta}</div>
     <div class="selcall-body">${body}${details}</div>
@@ -1335,9 +1354,17 @@ async function loadRollouts(pid) {
     ].filter(Boolean).join('\n        ');
     let hintsMeta = '';
     if (r.applied_hints && r.applied_hints.length) {
-      hintsMeta = '<div class="hints-meta">' + r.applied_hints.map(h =>
-        `<span class="hchip">#${esc(h.call_index)} · step ${esc(h.major_step_id)} · conf ${esc(h.confidence_of_major_step)} · [${esc((h.hint_ids||[]).join(', '))}]</span>`
-      ).join('') + '</div>';
+      hintsMeta = '<div class="hints-meta">' + r.applied_hints.map(h => {
+        // prefer the EXACT selection: auto-hint records the chosen hint_id ("2.1") +
+        // hint text; the <hint_call/> path records a major step + its substep hint_ids.
+        const id = (h.hint_id != null && h.hint_id !== '') ? `hint ${esc(h.hint_id)}`
+                 : (h.hint_ids && h.hint_ids.length) ? `step ${esc(h.major_step_id)} · [${esc(h.hint_ids.join(', '))}]`
+                 : (h.major_step_id != null ? `step ${esc(h.major_step_id)}` : '');
+        const conf = h.confidence_of_major_step != null ? ` · conf ${esc(h.confidence_of_major_step)}` : '';
+        const ht = h.hint ? String(h.hint) : '';
+        const txt = ht ? ` · ${esc(ht.length > 140 ? ht.slice(0, 140) + '…' : ht)}` : '';
+        return `<span class="hchip" title="${esc(ht)}">#${esc(h.call_index)} · ${id}${conf}${txt}</span>`;
+      }).join('') + '</div>';
     }
     html += `<details class="roll">
       <summary class="roll-head">

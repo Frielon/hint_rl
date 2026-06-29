@@ -1,24 +1,22 @@
 #!/usr/bin/env bash
 #
-# run_eval_ckpt.sh -- evaluate EVERY checkpoint of two runs, in order:
-#   1. GRPO     GRPO-Qwen2.5-7B-Instruct-dapo-512-20260624-201758
-#   2. AutoHint HPRL-AutoHint-Qwen2.5-7B-dapo-20260625-230822
-# on the 4 eval datasets: BARE single-turn, NO --hint-mode, box-scored with
-# mathruler (so the AutoHint checkpoints are directly comparable to GRPO).
+# run_eval_base.sh -- evaluate the BASE model
+#   /share5/users/xutao.ma/model/Qwen2.5-7B-Instruct
+# on the eval datasets: BARE single-turn, NO --hint-mode, box-scored with
+# mathruler (directly comparable to GRPO / AutoHint numbers).
 #
-# Each verl FSDP actor is merged to HF (model_merger), served once on a local
-# vLLM OpenAI endpoint (DP=8, TP=1), and eval_ckpts.py rolls every problem out
-# N times (default 8) and grades the boxed answer. The server is torn down and
-# a fresh one launched per checkpoint.
+# The base model is already a plain HF checkpoint, so there is NO FSDP merge:
+# it is served directly on a local vLLM OpenAI endpoint (DP=8, TP=1), and
+# eval_ckpts.py rolls every problem out N times and grades the boxed answer.
 #
 # Datasets (all bare, hint_flag=0):
-#   acereason_math_sample_1024  aime2025  aime2024  dapo_sample_hard_100
+#   aime2025.parquet  aime2024.parquet  dapo_sample_hard_100.parquet
 #
 # All paths derive from this script's location. Override via env:
-#   STEPS                space-separated global_steps (default: all present)
 #   PORT CONTEXT_LEN MEM_FRAC MAX_NUM_SEQS                 (server)
 #   N CHUNK CONCURRENCY TEMPERATURE TOP_P TOP_K MAX_TOKENS LIMIT   (eval)
 #   CONDA_ROOT CONDA_ENV PYTHON_BIN                        (env)
+#   BASE_MODEL           full path to the HF model dir
 # ---------------------------------------------------------------------------
 set -eo pipefail
 
@@ -50,7 +48,7 @@ CONTEXT_LEN="${CONTEXT_LEN:-16384}"
 MEM_FRAC="${MEM_FRAC:-0.85}"
 TP="${TP:-1}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
-N="${N:-8}"                             # rollouts per problem
+N="${N:-16}"
 CHUNK="${CHUNK:-1}"
 CONCURRENCY="${CONCURRENCY:-192}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
@@ -60,21 +58,15 @@ MAX_TOKENS="${MAX_TOKENS:-8192}"
 LIMIT="${LIMIT:-}"
 BASE_URL="http://127.0.0.1:${PORT}/v1"
 
-# --- the runs whose every checkpoint we evaluate ---------------------------
-# Each entry: "<label-prefix>|<absolute run ckpt dir>". Every global_step_*/actor
-# under the dir is merged + evaluated, BARE (box-scored, no --hint-mode), so the
-# AutoHint checkpoints are directly comparable to GRPO. The GRPO run is done
-# first, then the AutoHint run.
-RUNS=(
-  "grpo-0624|$HINT_RL_HOME/ckpt/GRPO-Qwen2.5-7B-Instruct/GRPO-Qwen2.5-7B-Instruct-dapo-512-20260624-201758"
-  "autohint-0625|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Qwen2.5-7B-Instruct/HPRL-AutoHint-Qwen2.5-7B-dapo-20260625-230822"
-)
+# --- the BASE model to evaluate (plain HF dir, no FSDP merge) ---------------
+BASE_MODEL="${BASE_MODEL:-/share5/users/xutao.ma/model/Qwen2.5-7B-Instruct}"
+LABEL="base-qwen2.5-7b-instruct"
+SERVED_NAME="base-qwen2.5-7b"
 
 # --- datasets (all BARE, box-scored like GRPO) -----------------------------
 DATASET_DIR="$HINT_RL_HOME/dataset"
 EVAL_SETS=(
-  "$DATASET_DIR/hmmt_nov_2025.parquet"
-  # "$DATASET_DIR/acereason_math_sample_1024.parquet"
+  "$DATASET_DIR/acereason_math_sample_1024.parquet"
   # "$DATASET_DIR/aime2025.parquet"
   # "$DATASET_DIR/aime2024.parquet"
   # "$DATASET_DIR/dapo_sample_hard_100.parquet"
@@ -84,7 +76,7 @@ MERGED_DIR="${MERGED_DIR:-$SCRIPT_DIR/merged}"
 
 # --- output ----------------------------------------------------------------
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
-OUT_BASE="${OUT_BASE:-$SCRIPT_DIR/results/ckpt_${RUN_TS}}"
+OUT_BASE="${OUT_BASE:-$SCRIPT_DIR/results/base_${RUN_TS}}"
 LOG_DIR="$SCRIPT_DIR/logs"
 mkdir -p "$OUT_BASE" "$LOG_DIR" "$MERGED_DIR"
 
@@ -144,6 +136,7 @@ DP="${DP:-$(detect_gpus)}"
 
 # --- sanity checks ---------------------------------------------------------
 [ -f "$EVAL_PY" ] || { echo "FATAL: eval script not found: $EVAL_PY" >&2; exit 1; }
+[ -f "$BASE_MODEL/config.json" ] || { echo "FATAL: base model dir not found: $BASE_MODEL (set BASE_MODEL)" >&2; exit 1; }
 "$PYTHON_BIN" - "$VERL_HOME" <<'PYCHK' || { echo "FATAL: env $CONDA_ENV is missing required packages (see above)" >&2; exit 1; }
 import importlib, sys
 missing = []
@@ -161,8 +154,8 @@ PYCHK
 
 echo "=================================================================="
 echo " repo root   : $HINT_RL_HOME"
-for _r in "${RUNS[@]}"; do echo " run         : ${_r%%|*}  (${_r#*|})"; done
-[ -n "${STEPS:-}" ] && echo " steps       : ${STEPS} (override)"
+echo " base model  : $BASE_MODEL"
+echo " label       : $LABEL"
 echo " topology    : dp=$DP tp=$TP"
 echo " server      : ctx=$CONTEXT_LEN mem=$MEM_FRAC max_num_seqs=$MAX_NUM_SEQS port=$PORT"
 echo " eval        : n=$N chunk=$CHUNK concurrency=$CONCURRENCY temp=$TEMPERATURE top_p=$TOP_P max_tokens=$MAX_TOKENS${LIMIT:+ limit=$LIMIT}"
@@ -259,52 +252,17 @@ eval_one() {
       "${extra[@]}"
 }
 
-# eval every checkpoint of one run. args: label_prefix run_ckpt_dir
-eval_run() {
-  local prefix="$1" run_dir="$2"
-  if [ ! -d "$run_dir" ]; then
-    echo "[eval] WARN: run dir missing, skipping: $run_dir" >&2
-    return 0
-  fi
-  # steps: STEPS env override, else every global_step_* present, ascending.
-  local steps
-  if [ -n "${STEPS:-}" ]; then
-    steps=($STEPS)
-  else
-    steps=($(ls -d "$run_dir"/global_step_*/actor 2>/dev/null \
-      | sed -E 's#.*/global_step_([0-9]+)/actor#\1#' | sort -n))
-  fi
-  [ "${#steps[@]}" -gt 0 ] || { echo "[eval] WARN: no checkpoints under $run_dir" >&2; return 0; }
-  echo ""
-  echo "=================================================================="
-  echo " RUN: $prefix   steps: ${steps[*]}"
-  echo "=================================================================="
-  local step ACTOR_DIR LABEL SERVED_NAME HF_DIR ds
-  for step in "${steps[@]}"; do
-    ACTOR_DIR="$run_dir/global_step_${step}/actor"
-    LABEL="${prefix}-step${step}"
-    SERVED_NAME="${prefix}-step${step}"
-    if [ ! -d "$ACTOR_DIR" ]; then
-      echo "[eval] WARN: actor dir missing, skipping: $ACTOR_DIR" >&2
-      continue
-    fi
-    echo ""
-    echo "##################################################################"
-    echo "# MODEL: $LABEL   ($ACTOR_DIR)"
-    echo "##################################################################"
-    HF_DIR="$(merge_fsdp "$ACTOR_DIR" "$MERGED_DIR/${LABEL}")"
-    serve "$HF_DIR" "$SERVED_NAME"
-    for ds in "${EVAL_SETS[@]}"; do
-      eval_one "$SERVED_NAME" "$LABEL" "$ds" "$OUT_BASE/$LABEL/$(basename "${ds%.parquet}")"
-    done
-    stop_server
-  done
-}
-
-# --- run every checkpoint of each run (GRPO first, then AutoHint) -----------
-for _run in "${RUNS[@]}"; do
-  eval_run "${_run%%|*}" "${_run#*|}"
+# --- run -------------------------------------------------------------------
+echo ""
+echo "##################################################################"
+echo "# MODEL: $LABEL   ($BASE_MODEL)"
+echo "##################################################################"
+# base model is a plain HF dir -> serve directly, no FSDP merge
+serve "$BASE_MODEL" "$SERVED_NAME"
+for ds in "${EVAL_SETS[@]}"; do
+  eval_one "$SERVED_NAME" "$LABEL" "$ds" "$OUT_BASE/$LABEL/$(basename "${ds%.parquet}")"
 done
+stop_server
 
 # --- combined summary table ------------------------------------------------
 echo ""

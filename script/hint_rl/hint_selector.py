@@ -333,7 +333,7 @@ class HintSelector:
 
     async def select_multi(
         self, problem: str, trace: str, pool, completed
-    ) -> tuple[Optional[dict], Optional[str], Optional[str]]:
+    ) -> tuple[Optional[dict], Optional[str], Optional[str], str]:
         """Pick the next hint with the MULTI-ROUND Template F prompt (selector_multi).
 
         Renders the WHOLE pool with per-hint ``status`` (completed | pending) -- the
@@ -343,11 +343,15 @@ class HintSelector:
         by the auto-hint rollout (auto_hint_agent_loop). ``pool`` is the FULL hint
         pool (JSON str or dict); ``completed`` the ids already given/verified.
 
-        Returns (selection_dict, raw_text, err); selection is None on failure. The
-        parsed dict carries at least ``hint_id`` / ``hint`` / ``completed_hints``.
+        Returns (selection_dict, raw_text, err, prompt); selection is None on
+        failure. ``prompt`` is the EXACT text sent to the selector (so the rollout
+        viewer can show it verbatim). The parsed dict carries at least ``hint_id`` /
+        ``hint`` / ``completed_hints``.
         """
         hints_rendered = render_hints_with_status(pool, completed)
-        return await self._complete(build_prompt_multi(problem, trace, hints_rendered))
+        prompt = build_prompt_multi(problem, trace, hints_rendered)
+        selection, raw, err = await self._complete(prompt)
+        return selection, raw, err, prompt
 
     async def _complete(
         self, prompt: str
