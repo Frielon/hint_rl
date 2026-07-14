@@ -45,6 +45,20 @@
 # So self-achieving a step that OFTEN trips others (F_k/D_k high) is rewarded, and
 # failing a step OTHERS clear is penalized -- the GRPO-relative intuition, per step.
 #
+# WHOLE-TURN variant (data.hprl.auto_hint.step_adv.whole_turn). Instead of the a_C/a_I
+# split, score the ENTIRE turn [turn_start, turn_end) with ONE advantage -- the TD form
+# for the whole turn as a macro-action that carried the rollout from its start state to
+# its post-turn state, earning immediate reward = the injected hint's penalty r_se:
+#     A = V[se+1] + r_se - V[ss]     (FAILED turn; == a_C + a_I telescoped)
+#     A = V[se]          - V[ss]     (solve / no-fail turn; no hint given)
+# i.e. V(s_end) + hint_penalty - V(s_start), where a failed turn ENDS at S_{se+1} (the
+# hinted step completes -- exactly where the next turn resumes). This is BOUNDARY-FREE:
+# it needs only (ss, se, is_fail), not the fuzzy verified-prefix boundary, so the whole
+# turn is reinforced/penalized together. Non-fail turns are IDENTICAL to the split mode;
+# a failed turn's verified-prefix tokens now share the combined value instead of getting
+# a separate V[se]-V[ss]. The per-group value recursion, zeroing, scale/normalize and
+# overlong penalty are unchanged.
+#
 # ALL-INCORRECT groups get ZERO advantage everywhere (no gradient): without a single
 # solve the V[K]=1 anchor is unreached and the positive a_C pulls would chase a goal
 # nobody hit. (data.hprl.auto_hint.step_adv.zero_if_no_correct, default true.)
@@ -71,6 +85,37 @@ def prefix_state(pool_order, completed) -> int:
         else:
             break
     return s
+
+
+def classify_length_cut(n_tokens: int, max_turn_tokens: int, room: int) -> str | None:
+    """How was an assistant turn's generation cut, for the auto-hint per-turn length cap?
+
+    The rollout loop generates each turn with ``max_tokens = min(max_turn_tokens, room)``,
+    where ``room`` is the GLOBAL response tokens still available BEFORE this turn
+    (response_length - tokens already used). vLLM reports both an EOS and a length cut as
+    "completed", so the cut is detected purely from the produced token count ``n_tokens``.
+
+    Returns:
+        "per_turn" -- the PER-TURN cap bound the turn and it ran to that cap: the per-turn
+            cap is the binding limit (``max_turn_tokens <= room``, so it is <= room; the
+            tie ``max_turn_tokens == room`` counts here) AND ``n_tokens`` reached it. The
+            loop PUNISHES this (the turn failed to finish its next hint step).
+        "global" -- the GLOBAL ceiling bound the turn: either the per-turn cap is off, or
+            the remaining room was STRICTLY smaller than ``max_turn_tokens`` so the turn ran
+            out of TOTAL budget (``n_tokens >= room``). The loop scores a LATER such turn
+            with advantage 0 (the ceiling is arbitrary w.r.t. the turn).
+        None -- the turn stopped EARLY (on EOS), short of every length limit: an ordinary
+            turn the loop grades and continues from.
+
+    So at the boundary the rule is: a turn cut at length ``== max_turn_tokens`` is
+    "per_turn" (punished) even when that coincides with the global ceiling; only a strictly
+    smaller global room (``room < max_turn_tokens``) yields a neutral "global" cut.
+    """
+    if max_turn_tokens and max_turn_tokens > 0:
+        turn_cap = max(1, min(int(max_turn_tokens), int(room)))
+        if int(max_turn_tokens) <= int(room) and n_tokens >= turn_cap:
+            return "per_turn"
+    return "global" if n_tokens >= int(room) else None
 
 
 def compute_state_values(
@@ -114,14 +159,25 @@ def compute_state_values(
     return V
 
 
-def assign_row_advantages(adv_row, returns_row, turns, V, penalty_vec, K, *, adv_scale: float = 1.0) -> dict:
+def assign_row_advantages(
+    adv_row, returns_row, turns, V, penalty_vec, K, *, adv_scale: float = 1.0, whole_turn: bool = False
+) -> dict:
     """Overwrite one rollout's per-token advantage from its turn segments (IN PLACE).
 
     Zeroes the whole row first (dropping the stale GRPO advantage on every response
-    token, incl. the masked injected-hint tokens), then writes each segment:
+    token, incl. the masked injected-hint tokens), then writes each turn.
+
+    Default (``whole_turn=False``) -- the two-segment SPLIT:
       * a_C [turn_start, boundary)  -> V[se] - V[ss]
       * a_I [boundary, turn_end)    -> r_se + V[se+1] - V[se]  (only a FAILED turn,
                                        se < K)
+    ``whole_turn=True`` -- ONE advantage over the entire turn [turn_start, turn_end),
+    ignoring ``boundary``:
+      * FAILED turn (se < K)  -> r_se + V[se+1] - V[ss]   (== a_C + a_I telescoped)
+      * else (solve/no-fail)  -> V[se] - V[ss]
+    i.e. V(s_end) + hint_penalty - V(s_start), the whole turn scored together. Non-fail
+    turns are identical to the split (they already carry b == turn_end).
+
     ``turns`` items are ``(turn_start, boundary, turn_end, state_start, state_end,
     is_fail)`` in RESPONSE-relative token coords (0 == first response token), exactly
     the columns of ``adv_row``. ``adv_scale`` multiplies every assigned advantage (a
@@ -135,6 +191,17 @@ def assign_row_advantages(adv_row, returns_row, turns, V, penalty_vec, K, *, adv
     neg_sum = 0.0
     n_pos = 0
     n_neg = 0
+
+    def _tally(a_val, n):
+        nonlocal n_tok, pos_sum, neg_sum, n_pos, n_neg
+        n_tok += n
+        if a_val > 0:
+            pos_sum += a_val * n
+            n_pos += n
+        elif a_val < 0:
+            neg_sum += a_val * n
+            n_neg += n
+
     for t in turns:
         ts, b, te, ss, se, is_fail = (int(t[0]), int(t[1]), int(t[2]), int(t[3]), int(t[4]), int(t[5]))
         ss = max(0, min(K, ss))
@@ -142,31 +209,32 @@ def assign_row_advantages(adv_row, returns_row, turns, V, penalty_vec, K, *, adv
         ts = max(0, min(seq_len, ts))
         b = max(0, min(seq_len, b))
         te = max(0, min(seq_len, te))
+        if whole_turn:
+            # ONE value over the whole turn [ts, te): the failed turn (its generation plus
+            # the hint the loop injects) carries the rollout from S_ss to S_{se+1}, earning
+            # immediate reward r_se (the hint's penalty); a solve/no-fail turn just advances
+            # ss -> se with no hint. Boundary is unused (so no fuzzy-prefix dependence).
+            if is_fail and se < K:
+                r_se = -float(penalty_vec[se]) if se < len(penalty_vec) else 0.0
+                a_val = float(r_se + V[se + 1] - V[ss]) * adv_scale
+            else:
+                a_val = float(V[se] - V[ss]) * adv_scale
+            if te > ts:
+                adv_row[ts:te] = a_val
+                _tally(a_val, te - ts)
+            continue
+        # --- SPLIT mode ---
         # a_C: verified prefix advances ss -> se.
         if b > ts:
             a_c = float(V[se] - V[ss]) * adv_scale
             adv_row[ts:b] = a_c
-            n = b - ts
-            n_tok += n
-            if a_c > 0:
-                pos_sum += a_c * n
-                n_pos += n
-            elif a_c < 0:
-                neg_sum += a_c * n
-                n_neg += n
+            _tally(a_c, b - ts)
         # a_I: failed-step tail (only when the turn FAILED a hint that exists).
         if is_fail and se < K and te > b:
             r_se = -float(penalty_vec[se]) if se < len(penalty_vec) else 0.0
             a_i = float(r_se + V[se + 1] - V[se]) * adv_scale
             adv_row[b:te] = a_i
-            n = te - b
-            n_tok += n
-            if a_i > 0:
-                pos_sum += a_i * n
-                n_pos += n
-            elif a_i < 0:
-                neg_sum += a_i * n
-                n_neg += n
+            _tally(a_i, te - b)
     # returns mirrors advantages (GRPO carries no critic; returns == advantages).
     # No-op when the trainer passes the same tensor object for both.
     returns_row[:] = adv_row
@@ -227,6 +295,9 @@ def apply_step_level_advantages(
     zero_if_no_correct: bool = True,
     adv_scale: float = 1.0,
     normalize: bool = False,
+    overlong_penalty: float = 0.0,
+    turn_truncated_per_row: Sequence[Any] | None = None,
+    whole_turn: bool = False,
 ) -> tuple[Any, Any, dict]:
     """Replace GRPO advantages with the step-level value-based advantages.
 
@@ -247,6 +318,23 @@ def apply_step_level_advantages(
     (their token-mean is ~0), and centering again would distort the a_C>=0 / a_I<=0 sign.
     A near-zero-std (degenerate) group is left unnormalized (the divide-by-~0 blow-up
     guard). With ``normalize=False`` it is the plain ``adv_scale`` multiply.
+
+    ``whole_turn`` (default false): score each turn with a SINGLE value over its whole
+    span (V[se+1]+r_se-V[ss] for a failed turn, V[se]-V[ss] otherwise) instead of the
+    a_C/a_I prefix/tail split -- boundary-free, the turn reinforced/penalized together
+    (see the module header). Everything else (values, zeroing, scale/normalize, overlong
+    penalty) is identical; only the per-row token assignment changes.
+
+    ``overlong_penalty`` (P_over, raw units, 0 = off): subtract this ABSOLUTE value from
+    every per-turn-cap TRUNCATION tail (rows with ``turn_truncated_per_row[i]`` truthy;
+    the truncation is the row's LAST turn segment) BEFORE the per-group std/normalize.
+    The value-based tail is ``a_I = penalty[se]*(fc/d - 1)``, which collapses toward 0 as
+    a group co-truncates (``fc/d -> 1``) -- so the value machinery cannot punish truncation
+    once it is the group norm. Subtracting an absolute P_over restores a floor that survives
+    that collapse, and because it is applied BEFORE the std it is scaled INTO the group's
+    unit range (raw ~penalty/K, so ~0.1 lands near unit after normalize). Only SCORED groups
+    reach this point (no-correct groups are already zeroed + skipped above), so all-truncate /
+    no-correct groups get NO penalty by construction.
     """
     n_rows = int(advantages.shape[0])
     groups: dict[Any, list] = {}
@@ -265,6 +353,8 @@ def apply_step_level_advantages(
     v0_sum = 0.0
     group_std_sum = 0.0
     norm_factor_sum = 0.0
+    ov_rows = 0
+    ov_tokens = 0
 
     for _uid, idxs in groups.items():
         # pool size / penalty vector are the same across a group; take the row with
@@ -314,7 +404,7 @@ def apply_step_level_advantages(
         for i in idxs:
             tally = assign_row_advantages(
                 advantages[i], returns[i], (turns_per_row[i] or []), V, pvec, K,
-                adv_scale=1.0,
+                adv_scale=1.0, whole_turn=whole_turn,
             )
             g_tokens += tally["tokens"]
             g_pos += tally["pos_sum"]
@@ -322,6 +412,27 @@ def apply_step_level_advantages(
             g_np += tally["n_pos"]
             g_nn += tally["n_neg"]
             n_scored_rows += 1
+
+        # over-turn-length penalty: subtract an absolute P_over from each per-turn-cap
+        # truncation tail (the row's LAST segment) BEFORE the std/normalize below, so it is
+        # read into the group std and scaled with the rest -- and, unlike the value-based
+        # a_I, it does NOT ride the fc/d brake, so it survives a co-truncating group. Scored
+        # groups only (no-correct groups already `continue`d), honoring "no penalty there".
+        if overlong_penalty > 0.0 and turn_truncated_per_row is not None:
+            for i in idxs:
+                if not turn_truncated_per_row[i]:
+                    continue
+                trow = turns_per_row[i] or []
+                if not trow:
+                    continue
+                seq_len = int(advantages[i].shape[0])
+                b = max(0, min(seq_len, int(trow[-1][1])))
+                te = max(0, min(seq_len, int(trow[-1][2])))
+                if te > b:
+                    advantages[i][b:te] -= float(overlong_penalty)
+                    returns[i][b:te] = advantages[i][b:te]  # keep returns mirrored
+                    ov_rows += 1
+                    ov_tokens += (te - b)
 
         # group scale factor: normalize to unit std (then x adv_scale = target std), or
         # the plain adv_scale multiply. A degenerate (near-0-std) group keeps adv_scale.
@@ -356,5 +467,7 @@ def apply_step_level_advantages(
         "step_adv/value_s0_mean": float(v0_sum / n_scored_groups) if n_scored_groups else 0.0,
         "step_adv/group_std_mean": float(group_std_sum / n_scored_groups) if n_scored_groups else 0.0,
         "step_adv/norm_factor_mean": float(norm_factor_sum / n_scored_groups) if n_scored_groups else 0.0,
+        "step_adv/overlong_rows": float(ov_rows),
+        "step_adv/overlong_tokens": float(ov_tokens),
     }
     return advantages, returns, stats

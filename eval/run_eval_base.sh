@@ -44,7 +44,7 @@ fi
 
 # --- config (env-overridable) ---------------------------------------------
 PORT="${PORT:-30000}"
-CONTEXT_LEN="${CONTEXT_LEN:-16384}"
+CONTEXT_LEN="${CONTEXT_LEN:-36864}"
 MEM_FRAC="${MEM_FRAC:-0.85}"
 TP="${TP:-1}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
@@ -54,22 +54,23 @@ CONCURRENCY="${CONCURRENCY:-192}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-1.0}"
 TOP_K="${TOP_K:--1}"
-MAX_TOKENS="${MAX_TOKENS:-8192}"
+MAX_TOKENS="${MAX_TOKENS:-32768}"
 LIMIT="${LIMIT:-}"
 BASE_URL="http://127.0.0.1:${PORT}/v1"
 
 # --- the BASE model to evaluate (plain HF dir, no FSDP merge) ---------------
-BASE_MODEL="${BASE_MODEL:-/share5/users/xutao.ma/model/Qwen2.5-7B-Instruct}"
-LABEL="base-qwen2.5-7b-instruct"
-SERVED_NAME="base-qwen2.5-7b"
+BASE_MODEL="${BASE_MODEL:-/share5/users/xutao.ma/model/Qwen3-8B}"
+LABEL="qwen3-8b"
+SERVED_NAME="qwen3-8b"
 
 # --- datasets (all BARE, box-scored like GRPO) -----------------------------
 DATASET_DIR="$HINT_RL_HOME/dataset"
 EVAL_SETS=(
-  "$DATASET_DIR/acereason_math_sample_1024.parquet"
-  # "$DATASET_DIR/aime2025.parquet"
-  # "$DATASET_DIR/aime2024.parquet"
-  # "$DATASET_DIR/dapo_sample_hard_100.parquet"
+  "$DATASET_DIR/hmmt_nov_2025.parquet"
+  # "$DATASET_DIR/acereason_math_sample_1024.parquet"
+  "$DATASET_DIR/aime2025.parquet"
+  "$DATASET_DIR/aime2024.parquet"
+  "$DATASET_DIR/dapo_sample_hard_100.parquet"
 )
 
 MERGED_DIR="${MERGED_DIR:-$SCRIPT_DIR/merged}"

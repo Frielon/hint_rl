@@ -72,8 +72,8 @@ if [ -f "${HINT_RL_HOME}/.envrc" ]; then
 fi
 export WANDB_API_KEY="${WANDB_API_KEY:-${wandb_key:-}}"
 
-project_name='GRPO-Olmo-3-7B-Instruct-SFT'
-exp_name="GRPO-Olmo-3-7B-Instruct-SFT-dapo-3139-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
+project_name='GRPO-Olmo-3-7B-Instruct-RL'
+exp_name="GRPO-Olmo-3-7B-Instruct-RL-dapo-512-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
 wandb_project=${wandb_project:-"hint_rl"}
 
 adv_estimator=grpo
@@ -95,14 +95,14 @@ loss_agg_mode="token-mean"
 # Cluster: 6 nodes x 8 H100 = 48 GPUs. This requires a Ray cluster spanning
 # all nodes (see the `ray job submit` at the bottom); the job is dispatched
 # across whatever GPUs the cluster actually has.
-NNODES=${NNODES:-4}
+NNODES=${NNODES:-2}
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 
 # No dynamic-sampling oversample here, so the generation batch equals the
 # training batch (the trainer generates train_prompt_bsz prompts per step).
-train_prompt_bsz=128
-n_resp_per_prompt=32
-train_prompt_mini_bsz=32
+train_prompt_bsz=64
+n_resp_per_prompt=8
+train_prompt_mini_bsz=64
 
 # Ray
 VERL_HOME=${VERL_HOME:-"${PROJECT_HOME}/verl"}
@@ -112,13 +112,13 @@ WORKING_DIR=${WORKING_DIR:-"${VERL_HOME}"}
 # can inject secrets/log paths via env_vars; ${VERL_HOME}/recipe/dapo/runtime_env.yaml
 # is the upstream template it mirrors.
 # Paths
-MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Olmo-3-7B-Instruct-SFT"}
+MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Olmo-3-7B-Instruct"}
 CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
 # Single-turn, dapo_17k-style prompts (no agent_name column), so every row routes
 # through verl's built-in single_turn_agent -> plain single-turn GRPO, no hint
 # agent loop. Use dapo-3139-hint-verl-mt-clean.parquet (agent_name="hint_agent")
 # only with the HPRL launcher (run_hprl), which registers that loop.
-TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dapo-3139-single-turn.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dapo-512-single-turn.parquet"}
 TEST_FILE=${TEST_FILE:-"${HINT_RL_HOME}/dataset/aime2024.parquet"}
 TEST_FILE2=${TEST_FILE2:-"${HINT_RL_HOME}/dataset/dapo_sample_hard_100.parquet"}
 TEST_FILE3=${TEST_FILE3:-"${HINT_RL_HOME}/dataset/aime2025.parquet"}
@@ -257,9 +257,9 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=True \
     trainer.test_freq=5 \
-    trainer.save_freq=100 \
+    trainer.save_freq=20 \
     `# trainer.max_actor_ckpt_to_keep=1` \
-    trainer.total_epochs=100 \
+    trainer.total_epochs=40 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.rollout_data_dir="${LOG_DIR}/${exp_name}/rollouts" \
     trainer.validation_data_dir="${LOG_DIR}/${exp_name}/val_rollouts" \

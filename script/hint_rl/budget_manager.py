@@ -61,7 +61,7 @@ import argparse
 import json
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Sequence, Tuple
 
 # A single rollout's outcome: (correct?, number of hint calls it used).
@@ -135,6 +135,10 @@ class BudgetUpdate:
     #                   B' at which >= ``require_successes`` correct rollouts (pooled over
     #                   all probe packs) used <= B' hints (== the require_successes-th
     #                   smallest pooled correct hint count). See compute_kpack_budget.
+    #   Any of the above may carry a "_held" SUFFIX (e.g. "pivot_set_held"): the rule
+    #   chose a LOWER budget but the manager's allow_decrease=False veto held B_q at the
+    #   current value (BudgetManager._hold_decrease). The decision stats (n_correct,
+    #   pivot/min hint counts) are kept as the rule computed them.
     rule: str = "unchanged"
     # The (N/2)-th-SMALLEST correct hint count that drove a "pivot" decision (None
     # otherwise -- e.g. the fast path, or an unchanged budget).
@@ -445,6 +449,7 @@ class BudgetManager:
         kpack_require_successes: int = 2,
         max_budget: Optional[int] = None,
         ratchet_mode: str = "downward",
+        allow_decrease: bool = True,
     ):
         self.path = path
         self.default_budget = int(default_budget)
@@ -458,6 +463,12 @@ class BudgetManager:
         # Single-pack ratchet rule: "downward" (compute_downward_budget, strictly down) or
         # "adaptive" (compute_adaptive_budget: raise on zero-correct, N/2-set on majority).
         self.ratchet_mode = str(ratchet_mode or "downward").strip().lower()
+        # False -> ONE-SIDED (never-decrease) guard: any rule outcome that would LOWER
+        # B_q is vetoed and held at the current budget (_hold_decrease; the update's rule
+        # gains a "_held" suffix). Raises pass through. Applies to EVERY rule: under
+        # "adaptive" it keeps only the raise-on-zero-correct branch (pivot_set is held);
+        # under "downward" / the k-pack probe (which only lower) it freezes budgets.
+        self.allow_decrease = bool(allow_decrease)
         # problem_id -> current budget B_q
         self._budgets: dict[str, int] = {}
         if path and os.path.exists(path):
@@ -485,6 +496,18 @@ class BudgetManager:
     # ------------------------------------------------------------------ #
     # the ratchet
     # ------------------------------------------------------------------ #
+    def _hold_decrease(self, upd: BudgetUpdate, current_budget: int) -> BudgetUpdate:
+        """The ``allow_decrease=False`` veto: replace a would-be DECREASE with a hold.
+
+        Applied AFTER the rule runs, so the returned update keeps the rule's decision
+        stats (n_correct, pivot/min hint counts); the rule name gains a ``"_held"``
+        suffix to mark the veto in logs/metrics. Raises and holds pass through, as does
+        everything when ``allow_decrease`` is True (the default).
+        """
+        if self.allow_decrease or upd.new_budget >= current_budget:
+            return upd
+        return replace(upd, new_budget=current_budget, changed=False, rule=upd.rule + "_held")
+
     def update_group(
         self,
         problem_id: str,
@@ -514,6 +537,7 @@ class BudgetManager:
                 min_budget=self.min_budget,
                 decrement=self.decrement,
             )
+        upd = self._hold_decrease(upd, current_budget)
         self._budgets[problem_id] = upd.new_budget
         return upd
 
@@ -542,6 +566,7 @@ class BudgetManager:
             require_successes=(self.kpack_require_successes if require_successes is None else require_successes),
             num_packs=num_packs,
         )
+        upd = self._hold_decrease(upd, current_budget)
         self._budgets[problem_id] = upd.new_budget
         return upd
 
@@ -712,6 +737,34 @@ def _selftest() -> None:
         chk("manager reloaded", bm2.get("probA"), 3)
         chk("manager kpack reloaded", bm2.get("probK"), 4)
         chk("manager unseen default", bm2.get("probB"), 8)
+
+    # ---- allow_decrease=False: one-sided (raise-only) manager guard -----------
+    bm = BudgetManager(None, default_budget=8, max_budget=8, ratchet_mode="adaptive", allow_decrease=False)
+    # the adaptive RAISE branch passes through untouched: zero-correct still grants +1.
+    r = bm.update_group("q", [(False, 3)] * 8, current_budget=3)
+    chk("no-decrease: raise passes", r.new_budget, 4)
+    chk("no-decrease: raise rule", r.rule, "raise")
+    # the pivot_set DOWN branch is vetoed: held at the current budget, stats kept.
+    r = bm.update_group("q", [(True, 1)] * 6 + [(False, 4)] * 2, current_budget=4)
+    chk("no-decrease: pivot_set held", r.new_budget, 4)
+    chk("no-decrease: held rule", r.rule, "pivot_set_held")
+    chk("no-decrease: held unchanged", r.changed, False)
+    chk("no-decrease: held keeps pivot stat", r.pivot_hint_count, 1)
+    chk("no-decrease: store holds too", bm.get("q"), 4)
+    # the k-pack probe rule (pure decrease) is vetoed under the same flag.
+    r = bm.update_group_kpack("q", [(True, 2), (True, 3)], current_budget=5, num_packs=2)
+    chk("no-decrease: kpack held", r.new_budget, 5)
+    chk("no-decrease: kpack held rule", r.rule, "kpack_held")
+    # downward mode + no-decrease == frozen budgets (the frugal snap is vetoed as well).
+    bm = BudgetManager(None, default_budget=8, ratchet_mode="downward", allow_decrease=False)
+    r = bm.update_group("q", [(True, 1)] + [(False, 5)] * 7, current_budget=5)
+    chk("no-decrease: downward frozen", r.new_budget, 5)
+    chk("no-decrease: downward rule", r.rule, "min_frugal_held")
+    # default (allow_decrease=True) still ratchets down -- the guard is opt-in.
+    bm = BudgetManager(None, default_budget=8, max_budget=8, ratchet_mode="adaptive")
+    r = bm.update_group("q", [(True, 1)] * 6 + [(False, 4)] * 2, current_budget=4)
+    chk("decrease-allowed default: pivot_set applies", r.new_budget, 1)
+    chk("decrease-allowed default: rule unsuffixed", r.rule, "pivot_set")
 
     print("all budget_manager self-tests passed.")
 

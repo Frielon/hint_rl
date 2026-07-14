@@ -16,6 +16,7 @@
 #
 # All paths derive from this script's location. Override via env:
 #   STEPS                space-separated global_steps (default: all present)
+#   START_STEP           skip checkpoints with global_step < this (inclusive; ignored when STEPS is set)
 #   PORT CONTEXT_LEN MEM_FRAC MAX_NUM_SEQS                 (server)
 #   N CHUNK CONCURRENCY TEMPERATURE TOP_P TOP_K MAX_TOKENS LIMIT   (eval)
 #   CONDA_ROOT CONDA_ENV PYTHON_BIN                        (env)
@@ -46,7 +47,7 @@ fi
 
 # --- config (env-overridable) ---------------------------------------------
 PORT="${PORT:-30000}"
-CONTEXT_LEN="${CONTEXT_LEN:-16384}"
+CONTEXT_LEN="${CONTEXT_LEN:-36864}"   # must be >= MAX_TOKENS + prompt; else vLLM 400-rejects every request
 MEM_FRAC="${MEM_FRAC:-0.85}"
 TP="${TP:-1}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
@@ -56,8 +57,9 @@ CONCURRENCY="${CONCURRENCY:-192}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-1.0}"
 TOP_K="${TOP_K:--1}"
-MAX_TOKENS="${MAX_TOKENS:-8192}"
+MAX_TOKENS="${MAX_TOKENS:-32768}"
 LIMIT="${LIMIT:-}"
+START_STEP="${START_STEP:-420}"           # skip checkpoints with global_step < this (inclusive; ignored when STEPS is set)
 BASE_URL="http://127.0.0.1:${PORT}/v1"
 
 # --- the runs whose every checkpoint we evaluate ---------------------------
@@ -66,8 +68,9 @@ BASE_URL="http://127.0.0.1:${PORT}/v1"
 # AutoHint checkpoints are directly comparable to GRPO. The GRPO run is done
 # first, then the AutoHint run.
 RUNS=(
-  "grpo-0624|$HINT_RL_HOME/ckpt/GRPO-Qwen2.5-7B-Instruct/GRPO-Qwen2.5-7B-Instruct-dapo-512-20260624-201758"
-  "autohint-0625|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Qwen2.5-7B-Instruct/HPRL-AutoHint-Qwen2.5-7B-dapo-20260625-230822"
+  # "autohint-olmo-512|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Olmo-3-7B-Instruct-SFT/HPRL-AutoHint-Olmo-3-7B-Instruct-SFT-dapo-20260701-220850"
+  # "autohint-olmo-512|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Olmo-3-7B-Instruct-SFT/HPRL-AutoHint-Olmo-3-7B-Instruct-SFT-dapo-20260630-224821"
+  "grpo-olmo-512|$HINT_RL_HOME/ckpt/GRPO-Olmo-3-7B-Instruct-SFT/GRPO-Olmo-3-7B-Instruct-SFT-dapo-512-20260702-155352"
 )
 
 # --- datasets (all BARE, box-scored like GRPO) -----------------------------
@@ -75,9 +78,9 @@ DATASET_DIR="$HINT_RL_HOME/dataset"
 EVAL_SETS=(
   "$DATASET_DIR/hmmt_nov_2025.parquet"
   # "$DATASET_DIR/acereason_math_sample_1024.parquet"
-  # "$DATASET_DIR/aime2025.parquet"
-  # "$DATASET_DIR/aime2024.parquet"
-  # "$DATASET_DIR/dapo_sample_hard_100.parquet"
+  "$DATASET_DIR/aime2025.parquet"
+  "$DATASET_DIR/aime2024.parquet"
+  "$DATASET_DIR/dapo_sample_hard_100.parquet"
 )
 
 MERGED_DIR="${MERGED_DIR:-$SCRIPT_DIR/merged}"
@@ -163,6 +166,7 @@ echo "=================================================================="
 echo " repo root   : $HINT_RL_HOME"
 for _r in "${RUNS[@]}"; do echo " run         : ${_r%%|*}  (${_r#*|})"; done
 [ -n "${STEPS:-}" ] && echo " steps       : ${STEPS} (override)"
+[ -z "${STEPS:-}" ] && [ -n "${START_STEP:-}" ] && echo " start_step  : ${START_STEP} (inclusive)"
 echo " topology    : dp=$DP tp=$TP"
 echo " server      : ctx=$CONTEXT_LEN mem=$MEM_FRAC max_num_seqs=$MAX_NUM_SEQS port=$PORT"
 echo " eval        : n=$N chunk=$CHUNK concurrency=$CONCURRENCY temp=$TEMPERATURE top_p=$TOP_P max_tokens=$MAX_TOKENS${LIMIT:+ limit=$LIMIT}"
@@ -273,6 +277,14 @@ eval_run() {
   else
     steps=($(ls -d "$run_dir"/global_step_*/actor 2>/dev/null \
       | sed -E 's#.*/global_step_([0-9]+)/actor#\1#' | sort -n))
+    # START_STEP: skip checkpoints before this step (inclusive). Ignored when STEPS is set.
+    if [ -n "${START_STEP:-}" ]; then
+      local _filtered=()
+      for _s in "${steps[@]}"; do
+        [ "$_s" -ge "$START_STEP" ] && _filtered+=("$_s")
+      done
+      steps=("${_filtered[@]}")
+    fi
   fi
   [ "${#steps[@]}" -gt 0 ] || { echo "[eval] WARN: no checkpoints under $run_dir" >&2; return 0; }
   echo ""

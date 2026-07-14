@@ -72,7 +72,7 @@ loss_agg_mode="token-mean"
 # ---- lengths: multi-turn trajectories accumulate tokens across turns ------
 max_prompt_length=2048
 # bumped from 8192: prompt + N*(assistant turn + hint tool result).
-max_response_length=16384
+max_response_length=28000
 
 # ---- multi-turn / hint knobs ----------------------------------------------
 # Cap on assistant turns; must be >= the largest per-problem hint budget B_q.
@@ -107,9 +107,9 @@ export SELECTOR_MAX_RETRIES=${SELECTOR_MAX_RETRIES:-3}
 NNODES=${NNODES:-4}
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 
-train_prompt_bsz=128
-n_resp_per_prompt=32
-train_prompt_mini_bsz=32
+train_prompt_bsz=64
+n_resp_per_prompt=8
+train_prompt_mini_bsz=64
 
 # Ray
 VERL_HOME=${VERL_HOME:-"${PROJECT_HOME}/verl"}
@@ -149,6 +149,25 @@ HPRL_STEP_ADV_SCALE=${HPRL_STEP_ADV_SCALE:-1.0}
 # (small) raw value-based advantages become ~unit scale adaptively -- the fix for a too-small
 # gradient. true is recommended when enabling step-adv; false = the plain adv_scale multiply.
 HPRL_STEP_ADV_NORM=${HPRL_STEP_ADV_NORM:-false}
+# Over-turn-length penalty (auto-hint + step-adv + per-turn cap). Subtract this ABSOLUTE
+# value from every per-turn-cap truncation tail BEFORE the per-group normalize, so it does
+# NOT ride the value-baseline brake a_I=penalty*(fc/d-1) that collapses to ~0 once a group
+# co-truncates -- the reason the truncation penalty vanishes exactly when truncation is
+# widespread. Raw units (~total_penalty/K); ~0.1 lands near unit scale after normalize.
+# SCORED groups only (no-correct/all-truncate groups stay zeroed). 0 = off (default).
+HPRL_OVERLONG_PENALTY=${HPRL_OVERLONG_PENALTY:-0}
+# WHOLE-TURN step-adv (auto-hint + step-adv). Score each turn with ONE advantage --
+# A = V[s_end] + hint_penalty - V[s_start] (= r_se + V[se+1] - V[ss] for a failed turn,
+# V[se] - V[ss] otherwise) -- instead of the verified-prefix a_C / failed-tail a_I split.
+# Boundary-free (no fuzzy-quote dependence); the whole turn is scored together. Default
+# false -> the a_C/a_I split. Only meaningful when HPRL_STEP_ADV=true.
+HPRL_STEP_ADV_WHOLE_TURN=${HPRL_STEP_ADV_WHOLE_TURN:-false}
+# Per-turn generation-length cap (auto-hint only). When > 0, each assistant turn is
+# bounded to min(this, remaining global room) tokens; a turn that hits the cap without an
+# EOS (global budget remaining) is scored as failing its next hint step (whole turn = a_I,
+# length_truncated -> acc=0) and the rollout terminates. 0 (default) -> off (global
+# max_response_length only). Mind that max_response_length must cover ~(#turns x cap).
+HPRL_MAX_TURN_TOKENS=${HPRL_MAX_TURN_TOKENS:-0}
 case "${HPRL_AUTO_HINT}" in
   true | True | 1 | yes | on)
     # hint-wise re-seeded initial budgets (budget_calibration/apply_budget_state.py from
@@ -295,11 +314,17 @@ mkdir -p "${EXP_LOG_DIR}"
 HPRL_ENABLE=${HPRL_ENABLE:-True}
 BUDGET_STATE_PATH=${BUDGET_STATE_PATH:-"${EXP_LOG_DIR}/budget_state.json"}
 # ---- resume control (verl checkpoint) ------------------------------------
-# RESUME_MODE=auto (default) resumes the LATEST ckpt found in default_local_dir.
-# Set RESUME_MODE=resume_path + RESUME_FROM_PATH=<...>/global_step_N to pin a
-# SPECIFIC checkpoint (verl reads N from the path and loads actor/ + data.pt).
-RESUME_MODE=${RESUME_MODE:-auto}
+# SINGLE KNOB: set RESUME_FROM_PATH=<...>/global_step_N to fork/continue from a SPECIFIC
+# checkpoint (verl reads N from the path and loads actor/ + data.pt = weights, optimizer,
+# dataloader); RESUME_MODE then flips to resume_path automatically. Leave it null (default)
+# for a fresh start -- RESUME_MODE=auto then resumes the LATEST ckpt in THIS run's own
+# default_local_dir (none for a new exp_name, so it trains from the base model).
 RESUME_FROM_PATH=${RESUME_FROM_PATH:-null}
+if [ "${RESUME_FROM_PATH}" != "null" ] && [ -n "${RESUME_FROM_PATH}" ]; then
+    RESUME_MODE=${RESUME_MODE:-resume_path}
+else
+    RESUME_MODE=${RESUME_MODE:-auto}
+fi
 HPRL_MIN_BUDGET=${HPRL_MIN_BUDGET:-0}
 HPRL_DECREMENT=${HPRL_DECREMENT:-1}
 HPRL_DEFAULT_BUDGET=${HPRL_DEFAULT_BUDGET:-6}
@@ -309,6 +334,12 @@ HPRL_DEFAULT_BUDGET=${HPRL_DEFAULT_BUDGET:-6}
 HPRL_RATCHET_MODE=${HPRL_RATCHET_MODE:-downward}
 # Ceiling on B_q (bounds the adaptive rule's upward branch). Defaults to the turn cap.
 HPRL_MAX_BUDGET=${HPRL_MAX_BUDGET:-6}
+# false -> ONE-SIDED (raise-only) ratchet: budget DECREASES are vetoed and held at the
+# current B_q (BudgetUpdate.rule gains "_held"; wandb hprl/num_decrease_held counts them)
+# while the adaptive raise-on-zero-correct branch keeps working. With ratchet_mode=downward
+# or the k-pack probe (which only lower) false freezes budgets entirely. Default true ->
+# the unchanged two-sided/downward behavior. See budget_manager.BudgetManager.
+HPRL_ALLOW_DECREASE=${HPRL_ALLOW_DECREASE:-true}
 
 # k-pack counterfactual-probe ratchet ("double-rollout" / k-pack). OFF by default ->
 # the single-pack downward ratchet runs unchanged. When on, EVERY problem's rollout.n
@@ -366,9 +397,24 @@ top_k=-1
 # Performance
 sp_size=4
 use_dynamic_bsz=True
-actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) / sp_size))
-infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) / sp_size))
-offload=True
+# --- update-phase speed (lever 4) ------------------------------------------------
+# The step is ~86% generation and ~10% actor update; these two knobs trim the update
+# (and the ref/rollout log-prob) passes. Both RAISE peak GPU memory during the update,
+# so each is env-gated for an easy revert if the first step OOMs.
+#
+# (a) micro-batch packing: with use_dynamic_bsz the per-GPU token budget below caps how
+#     many tokens are packed per forward/backward micro-batch. It was one full-length
+#     sequence's worth ((prompt+resp)/sp_size); PPO_TOKEN_MULT packs that many sequences
+#     per micro-batch -> ~1/MULT as many micro-batches. Gradient checkpointing bounds the
+#     activation memory. Lower PPO_TOKEN_MULT (or set 1) if the update OOMs.
+PPO_TOKEN_MULT=${PPO_TOKEN_MULT:-2}
+actor_ppo_max_token_len=$((PPO_TOKEN_MULT * (max_prompt_length + max_response_length) / sp_size))
+infer_ppo_max_token_len=$((PPO_TOKEN_MULT * (max_prompt_length + max_response_length) / sp_size))
+# (b) offload: the actor params+optimizer are FSDP-sharded across all 32 GPUs (~a few GB
+#     each), so offloading them to CPU every step costs a load/reload for no real memory
+#     saving. vLLM sleeps during the update (async colocated mode), so keeping them
+#     resident does not contend with the KV cache. OFFLOAD=True reverts to CPU offload.
+offload=${OFFLOAD:-False}
 gen_tp=1
 
 # Per-run Ray runtime env. Env vars from this shell do NOT propagate to a
@@ -440,6 +486,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     data.hprl.default_budget=${HPRL_DEFAULT_BUDGET} \
     data.hprl.ratchet_mode=${HPRL_RATCHET_MODE} \
     data.hprl.max_budget=${HPRL_MAX_BUDGET} \
+    data.hprl.allow_decrease=${HPRL_ALLOW_DECREASE} \
     data.hprl.strategy=${HINT_STRATEGY} \
     data.hprl.step_exclude_mode=${HINT_STEP_EXCLUDE_MODE} \
     data.hprl.finalize_incorrect=${HINT_FINALIZE_INCORRECT} \
@@ -452,9 +499,12 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     data.hprl.auto_hint.enable=${HPRL_AUTO_HINT} \
     data.hprl.auto_hint.fuzzy_threshold=${HPRL_AUTO_HINT_FUZZY} \
     data.hprl.auto_hint.prune_guidance=${HPRL_PRUNE_GUIDANCE} \
+    data.hprl.auto_hint.max_turn_tokens=${HPRL_MAX_TURN_TOKENS} \
     data.hprl.auto_hint.step_adv.enable=${HPRL_STEP_ADV} \
     data.hprl.auto_hint.step_adv.adv_scale=${HPRL_STEP_ADV_SCALE} \
     data.hprl.auto_hint.step_adv.normalize=${HPRL_STEP_ADV_NORM} \
+    data.hprl.auto_hint.step_adv.overlong_penalty=${HPRL_OVERLONG_PENALTY} \
+    data.hprl.auto_hint.step_adv.whole_turn=${HPRL_STEP_ADV_WHOLE_TURN} \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
@@ -543,8 +593,8 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     trainer.val_before_train=True \
     trainer.test_freq=5 \
     trainer.save_freq=20 \
-    trainer.max_actor_ckpt_to_keep=10 \
-    trainer.total_epochs=100 \
+    trainer.max_actor_ckpt_to_keep=100 \
+    trainer.total_epochs=40 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.rollout_data_dir="${LOG_DIR}/${exp_name}/rollouts" \
     trainer.validation_data_dir="${LOG_DIR}/${exp_name}/val_rollouts" \

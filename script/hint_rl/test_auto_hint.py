@@ -11,11 +11,15 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+from types import SimpleNamespace
 
 import numpy as np
 
 from auto_hint_mask import apply_positive_adv_masking, sequence_advantage
 from budget_manager import BudgetManager, compute_adaptive_budget
+from hint_budget_callback import hprl_update_budgets
 from hint_penalty import compute_hint_penalties
 from selector_multi import (
     locate_quote_end,
@@ -25,6 +29,7 @@ from selector_multi import (
 )
 from step_advantage import (
     apply_step_level_advantages,
+    classify_length_cut,
     compute_state_values,
     prefix_state,
 )
@@ -231,6 +236,24 @@ def test_budget_manager_dispatch():
     assert upd2.new_budget == 1 and upd2.rule == "min_frugal"
 
 
+def test_allow_decrease_false_is_raise_only():
+    # allow_decrease=False (HPRL_ALLOW_DECREASE=false): the adaptive RAISE branch still
+    # fires on zero-correct...
+    bm = BudgetManager(path=None, default_budget=8, min_budget=0, max_budget=8,
+                       ratchet_mode="adaptive", allow_decrease=False)
+    upd = bm.update_group("p1", [(False, 3)] * 8, current_budget=3)
+    assert upd.new_budget == 4 and upd.rule == "raise" and bm.get("p1") == 4
+    # ...but the pivot_set DECREASE is vetoed: held at the current budget, decision
+    # stats kept, rule suffixed "_held", and the store holds too.
+    results = [(True, 0), (True, 1), (True, 2), (True, 3), (True, 4)] + [(False, 6)] * 3
+    upd = bm.update_group("p1", results, current_budget=6)
+    assert upd.new_budget == 6 and not upd.changed and upd.rule == "pivot_set_held"
+    assert upd.pivot_hint_count == 3 and bm.get("p1") == 6
+    # the k-pack probe rule (pure decrease) is frozen under the same flag.
+    upd = bm.update_group_kpack("p1", [(True, 1), (True, 2)], current_budget=5, num_packs=2)
+    assert upd.new_budget == 5 and upd.rule == "kpack_held" and bm.get("p1") == 5
+
+
 # --------------------------------------------------------------------------- #
 # step-level advantage (step_advantage.py)
 # --------------------------------------------------------------------------- #
@@ -304,6 +327,44 @@ def test_apply_step_level_advantages_worked_example():
     assert stats["step_adv/groups_scored"] == 1.0 and stats["step_adv/groups_zeroed"] == 0.0
 
 
+def test_apply_step_level_advantages_whole_turn():
+    # Same worked example, whole_turn=True: each turn gets ONE value over its whole span.
+    # A FAILED turn = r_se + V[se+1] - V[ss] (== a_C + a_I telescoped) across [ts, te), so
+    # its verified-prefix tokens share that value instead of a separate V[se]-V[ss]=0.
+    # Solve / boundary-at-turn-start turns are identical to the split.
+    L = 24
+    adv = np.full((3, L), 9.9, dtype=np.float64)
+    ret = adv.copy()
+    mask = np.ones((3, L), dtype=np.int64)
+    turns = [
+        [[0, 10, 10, 0, 5, 0]],                                            # A: solve
+        [[0, 0, 6, 0, 0, 1], [8, 18, 18, 1, 5, 0]],                        # B: fail@0, solve
+        [[0, 0, 5, 0, 0, 1], [7, 9, 12, 1, 2, 1], [14, 16, 20, 3, 4, 1]],  # C
+    ]
+    a, r, stats = apply_step_level_advantages(
+        adv, ret, mask, ["p", "p", "p"], turns, [True, True, False], [_P5] * 3, [5] * 3,
+        whole_turn=True,
+    )
+    V = _V_EXPECT
+    # Row A (solve) unchanged: V5 - V0 = 0.3 over the whole turn.
+    assert np.allclose(a[0, 0:10], 0.3) and np.allclose(a[0, 10:], 0.0)
+    # Row B: the fail turn's boundary was already turn_start, so it matches the split --
+    # [0,6) = r0 + V1 - V0 = -0.1 ; solve [8,18) = V5 - V1 = 0.1 ; gaps 0.
+    assert np.allclose(a[1, 0:6], -0.1) and np.allclose(a[1, 6:8], 0.0)
+    assert np.allclose(a[1, 8:18], 0.1) and np.allclose(a[1, 18:], 0.0)
+    # Row C: each WHOLE failed turn shares one value (its prefix is no longer 0 as in the
+    # split): turn2 [7,12) = r2 + V3 - V1 (not just [9,12)); turn3 [14,20) = r4 + V5 - V3.
+    a_t2 = -_P5[2] + (V[3] - V[1])
+    a_t3 = -_P5[4] + (V[5] - V[3])
+    assert np.allclose(a[2, 0:5], -0.1) and np.allclose(a[2, 5:7], 0.0)
+    assert np.allclose(a[2, 7:12], a_t2) and np.allclose(a[2, 12:14], 0.0)
+    assert np.allclose(a[2, 14:20], a_t3) and np.allclose(a[2, 20:], 0.0)
+    # the two prefix sub-ranges are exactly where whole-turn differs from the split (there 0).
+    assert not np.isclose(a_t2, 0.0) and not np.isclose(a_t3, 0.0)
+    assert np.allclose(r, a)
+    assert stats["step_adv/groups_scored"] == 1.0 and stats["step_adv/groups_zeroed"] == 0.0
+
+
 def test_apply_step_level_advantages_adv_scale():
     # the worked example (V[0]=0.7 driven by others' failures) at scale 1 vs 5 -- row A's
     # solve advantage V5-V0=0.3 must scale exactly 5x.
@@ -373,6 +434,151 @@ def test_apply_step_level_advantages_zero_if_no_correct_false():
     assert stats["step_adv/groups_scored"] == 1.0
     # row0 failed step0 (a_I negative); not all-zero.
     assert a[0, 0] < 0.0
+
+
+def test_apply_step_level_advantages_overlong_penalty():
+    # A per-turn-cap truncation (turn_truncated=1) gets an EXTRA absolute P_over on its
+    # LAST-turn tail, subtracted BEFORE normalize; no-correct groups stay zeroed (no penalty).
+    L = 12
+    turns = [
+        [[0, 6, 6, 0, 5, 0]],     # row0: correct solve -> group is SCORED
+        [[0, 0, 6, 0, 0, 1]],     # row1: truncated-at-0 tail (a_I) == the per-turn cut
+    ]
+    Pov = 0.5
+    a0 = np.zeros((2, L))
+    apply_step_level_advantages(a0, a0.copy(), np.ones((2, L)), ["g", "g"], turns,
+                                [True, False], [_P5, _P5], [5, 5])
+    a1 = np.zeros((2, L))
+    _, r1, st = apply_step_level_advantages(
+        a1, a1.copy(), np.ones((2, L)), ["g", "g"], turns, [True, False], [_P5, _P5], [5, 5],
+        overlong_penalty=Pov, turn_truncated_per_row=[0, 1],
+    )
+    # truncation tail dropped by exactly P_over; the non-truncated correct row untouched.
+    assert np.allclose(a1[1, 0:6], a0[1, 0:6] - Pov), (a1[1, 0:6], a0[1, 0:6])
+    assert np.allclose(a1[0], a0[0])
+    assert np.allclose(r1, a1)                        # returns stay mirrored
+    assert st["step_adv/overlong_rows"] == 1.0 and st["step_adv/overlong_tokens"] == 6.0
+
+    # no-correct group: zeroed, so its truncation gets NO overlong penalty.
+    an = np.zeros((2, L))
+    _, _, stz = apply_step_level_advantages(
+        an, an.copy(), np.ones((2, L)), ["g", "g"], turns, [False, False], [_P5, _P5], [5, 5],
+        overlong_penalty=Pov, turn_truncated_per_row=[0, 1],
+    )
+    assert np.allclose(an, 0.0) and stz["step_adv/overlong_rows"] == 0.0
+
+    # INSIDE normalize: the extra-negative tail is read into the group std (widens it),
+    # and the group is still scaled to unit std afterward.
+    base = np.zeros((2, L))
+    _, _, sb = apply_step_level_advantages(base, base.copy(), np.ones((2, L)), ["g", "g"],
+                                           turns, [True, False], [_P5, _P5], [5, 5], normalize=True)
+    ov = np.zeros((2, L))
+    _, _, so = apply_step_level_advantages(ov, ov.copy(), np.ones((2, L)), ["g", "g"], turns,
+                                           [True, False], [_P5, _P5], [5, 5], normalize=True,
+                                           overlong_penalty=Pov, turn_truncated_per_row=[0, 1])
+    assert so["step_adv/group_std_mean"] > sb["step_adv/group_std_mean"]
+    assert abs(float(ov.std()) - 1.0) < 1e-6         # still unit std after normalize
+
+
+def test_classify_length_cut_per_turn_vs_global():
+    # cap off (max_turn_tokens=0) -> only the global ceiling matters.
+    assert classify_length_cut(100, 0, 200) is None            # EOS early
+    assert classify_length_cut(200, 0, 200) == "global"        # ran out the whole budget
+    # per-turn cap is the binding limit (max_turn_tokens < room): hit it -> punish.
+    assert classify_length_cut(4096, 4096, 8000) == "per_turn"
+    assert classify_length_cut(4095, 4096, 8000) is None       # EOS one short -> ordinary
+    # the TIE room == max_turn_tokens: a turn cut at length == max_turn_tokens is a
+    # PER-TURN cut (punished), NOT a neutral global cut -- the boundary the rule fixes.
+    assert classify_length_cut(4096, 4096, 4096) == "per_turn"
+    # global room STRICTLY smaller than the per-turn cap -> a cut here is the global
+    # ceiling (advantage 0 for a later turn), not the per-turn cap.
+    assert classify_length_cut(3000, 4096, 3000) == "global"
+    assert classify_length_cut(2999, 4096, 3000) is None       # EOS before the global room
+
+
+def test_all_truncated_group_zeroed():
+    # An all-truncated GROUP: every rollout hit a length cap (per-turn or global), so each
+    # is length_truncated -> acc=0 -> correct_per_row=False. With no correct anchor and
+    # zero_if_no_correct (the default), the WHOLE group gets advantage 0 (no gradient),
+    # whatever mix of truncation segments the rollouts carry -- the group is zeroed before
+    # any per-segment advantage is assigned, so the a_I failed tails never reach the rows.
+    L = 10
+    adv = np.full((3, L), 0.5, dtype=np.float64)  # stale values that must be wiped to 0
+    ret = adv.copy()
+    mask = np.ones((3, L), dtype=np.int64)
+    turns = [
+        [[0, 0, 6, 0, 0, 1]],                        # per-turn truncation at S_0 (fails h_1)
+        [[0, 4, 8, 0, 2, 1], [8, 8, 10, 3, 3, 1]],   # advanced, then per-turn truncated at S_3
+        [],                                          # later-turn GLOBAL truncation -> no segment
+    ]
+    a, r, stats = apply_step_level_advantages(
+        adv, ret, mask, ["p", "p", "p"], turns, [False, False, False], [_P5] * 3, [5] * 3
+    )
+    assert np.allclose(a, 0.0) and np.allclose(r, 0.0)
+    assert stats["step_adv/groups_zeroed"] == 1.0 and stats["step_adv/groups_scored"] == 0.0
+
+
+def test_per_turn_truncation_segment_whole_turn_a_i():
+    # The per-turn length cap records, for an over-long turn at state S_k, the segment
+    # [turn_start, turn_start, turn_end, k, k, is_fail=1] -- boundary == turn_start so the
+    # WHOLE turn is the a_I failed tail, failing hint h_{k+1} (0-indexed k). Verify the
+    # math for k=2 (a mid-rollout truncation, generalizing the k=0 first-turn case).
+    L = 8
+    adv = np.full((2, L), 7.7, dtype=np.float64)  # stale GRPO values to be overwritten
+    ret = adv.copy()
+    mask = np.ones((2, L), dtype=np.int64)
+    turns = [
+        [[0, 6, 6, 0, 5, 0]],        # A: solves first try (anchor) -> a_C over [0,6)
+        [[0, 0, 6, 2, 2, 1]],        # B: per-turn truncation at S_2 -> whole turn a_I, fails h_3
+    ]
+    a, r, stats = apply_step_level_advantages(
+        adv, ret, mask, ["p", "p"], turns, [True, False], [_P5, _P5], [5, 5]
+    )
+    # V with final_states=[5,2], fails=[[],[2]]: only step 2 ever failed (1/2 reached it),
+    # so V = [0.9,0.9,0.9,1,1,1].
+    # B's whole turn = r2 + V3 - V2 = -0.2 + 0.1 = -0.1 over [0,6); no a_C (boundary==start).
+    assert np.allclose(a[1, 0:6], -0.1), a[1, 0:6]
+    assert np.allclose(a[1, 6:], 0.0)
+    # A's solve a_C = V5 - V0 = 0.1 (driven entirely by B's failure of step 2).
+    assert np.allclose(a[0, 0:6], 0.1), a[0, 0:6]
+    assert stats["step_adv/groups_scored"] == 1.0 and stats["step_adv/groups_zeroed"] == 0.0
+    assert np.allclose(r, a)
+
+
+# --------------------------------------------------------------------------- #
+# truncation metrics (hint_budget_callback.hprl_update_budgets)
+# --------------------------------------------------------------------------- #
+def test_truncation_frac_metrics():
+    # The callback aggregates the per-rollout length_truncated / turn_truncated flags into
+    # hprl/* fractions -- the TRUE truncation ratio (vs verl's response_length/clip_ratio,
+    # which counts only rollouts that filled the WHOLE global budget, missing a per-turn
+    # cut that terminates early). 4 rollouts of one problem: 2 length-truncated (1 of them
+    # via the per-turn cap), 1 correct.
+    ntb = {
+        "extra_info": [{"problem_id": "p1"}] * 4,
+        "acc": [0.0, 0.0, 0.0, 1.0],
+        "num_hints": [1, 1, 2, 0],
+        "length_truncated": [1.0, 1.0, 0.0, 0.0],  # 2/4 (per-turn OR global ceiling)
+        "turn_truncated": [1, 0, 0, 0],            # 1/4 (the per-turn-cap subset)
+    }
+    # hprl_update_budgets persists the ratchet, so give the BudgetManager a real (fresh,
+    # not-yet-created) temp path -- an empty pre-created file would fail the JSON loader.
+    tmpdir = tempfile.mkdtemp()
+    path = os.path.join(tmpdir, "budget_state.json")
+    try:
+        bm = BudgetManager(path=path, default_budget=8, min_budget=0, max_budget=8, ratchet_mode="adaptive")
+        m = hprl_update_budgets(SimpleNamespace(non_tensor_batch=ntb), bm)
+        assert m["hprl/length_truncated"] == 2.0 and m["hprl/length_truncated_frac"] == 0.5, m
+        assert m["hprl/turn_truncated"] == 1.0 and m["hprl/turn_truncated_frac"] == 0.25, m
+        # the per-turn subset can never exceed total truncations.
+        assert m["hprl/turn_truncated"] <= m["hprl/length_truncated"]
+        # absent keys (e.g. a non-auto-hint batch) -> the metrics are simply skipped, no crash.
+        ntb2 = {"extra_info": [{"problem_id": "p1"}], "acc": [1.0], "num_hints": [0]}
+        m2 = hprl_update_budgets(SimpleNamespace(non_tensor_batch=ntb2), bm)
+        assert "hprl/length_truncated_frac" not in m2 and "hprl/turn_truncated_frac" not in m2
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #

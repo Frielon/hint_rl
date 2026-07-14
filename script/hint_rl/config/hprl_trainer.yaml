@@ -45,6 +45,13 @@ data:
     # ceiling on B_q -- only bounds the adaptive rule's upward (raise) branch so a
     # persistently-hard problem cannot grow without limit. Defaults to default_budget.
     max_budget: 8
+    # false -> ONE-SIDED (raise-only) ratchet: any rule outcome that would LOWER B_q is
+    # vetoed and held at the current budget (BudgetUpdate.rule gains a "_held" suffix;
+    # counted in wandb as hprl/num_decrease_held). Under "adaptive" this keeps ONLY the
+    # raise-on-zero-correct branch (the N/2-th-smallest pivot_set decrease is disabled);
+    # under "downward" / the k-pack probe (which only lower) it freezes budgets entirely.
+    # true (default) -> the unchanged two-sided / downward behavior.
+    allow_decrease: true
     # tool name whose create_kwargs.budget is injected/enforced.
     tool_name: request_hint
     # RETIRED (no longer changes behavior): an over-budget <hint_call/> is now
@@ -169,6 +176,21 @@ data:
       # exhaustion check, and the step-adv hint order all see one pruned pool. Default
       # off -> the full pool (X.0 included) is used as before.
       prune_guidance: false
+      # per-turn generation-length cap. When > 0, each assistant turn's generation is
+      # bounded to min(max_turn_tokens, remaining global room) via the per-request
+      # max_tokens -- an INDEPENDENT per-turn limit on top of the global
+      # data.max_response_length budget (which alone only ever bounded the FIRST turn,
+      # later turns just sharing the remaining room). A turn that hits this cap without
+      # an EOS, with global budget still remaining, is treated as FAILING to finish its
+      # next hint step: the WHOLE turn becomes the a_I failed tail (it fails the next
+      # pending hint h_{k+1} at the rollout's current state S_k), the rollout is flagged
+      # length_truncated (floor reward, acc=0 -> incorrect), and it terminates (no
+      # selector call, no hint injected). A turn that instead runs into the GLOBAL
+      # response-length ceiling keeps the prior behavior (its tail carries advantage 0).
+      # NOTE the global budget must cover ~(#turns x max_turn_tokens) + injected-hint
+      # tokens or the global ceiling bites first; and the cap also bounds the SOLVING
+      # turn, so set it >= a realistic single-step solution length. 0 (default) -> off.
+      max_turn_tokens: 0
       # ---- STEP-LEVEL advantage (supersedes the verified-prefix mask) ------------
       # When enabled, the trainer REPLACES GRPO's single scalar-per-rollout advantage
       # with a value-based, per-segment one (step_advantage.py): each turn's verified
@@ -198,3 +220,21 @@ data:
         # advantages are ~penalty/K). No mean-centering (V already baselines them; centering
         # would distort the a_C>=0 / a_I<=0 sign). false -> the plain adv_scale multiply.
         normalize: false
+        # over-turn-length penalty (P_over, raw units, 0 = off). Subtract this ABSOLUTE value
+        # from every PER-TURN-CAP truncation tail BEFORE the per-group normalize. The value-
+        # based tail a_I = penalty[se]*(fc/d - 1) collapses toward 0 as a group co-truncates
+        # (fc/d -> 1), so it cannot punish truncation once truncation is the group norm; an
+        # absolute P_over restores a floor that survives the collapse and, applied pre-norm, is
+        # scaled into the group's unit range (~penalty/K, so ~0.1 lands near unit). SCORED
+        # groups only -- no-correct / all-truncate groups stay zeroed (unchanged).
+        overlong_penalty: 0.0
+        # WHOLE-TURN advantage: don't split a turn into the verified prefix (a_C) and the
+        # failed tail (a_I); score the ENTIRE turn with a SINGLE value
+        #   A = V[s_end] + hint_penalty - V[s_start]
+        # = r_se + V[se+1] - V[ss] for a FAILED turn (the whole turn -- generation + the hint
+        # then injected -- carried the rollout S_ss -> S_{se+1}, earning the hint penalty r_se;
+        # this equals a_C + a_I telescoped), or V[se] - V[ss] for a solve/no-fail turn. Unlike
+        # the split it needs NO verified-prefix boundary (no fuzzy-quote dependence): the turn
+        # is reinforced/penalized together. Values, zeroing, adv_scale/normalize and the
+        # overlong penalty are unchanged. Default false -> the a_C/a_I split above.
+        whole_turn: false

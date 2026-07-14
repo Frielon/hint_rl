@@ -15,6 +15,285 @@ _(none open — the step-level advantage calculation landed 2026-06-25; see the 
 
 # Done log
 
+## 2026-07-05 — auto-hint step-adv: WHOLE-TURN advantage mode (score each turn as one macro-action, boundary-free) — flag-gated
+
+A second step-adv scoring mode, alternative to the `a_C`/`a_I` per-segment SPLIT (2026-06-25).
+Instead of cutting each turn at the selector-verified boundary into a non-negative verified prefix
+`a_C` and a non-positive failed tail `a_I`, score the ENTIRE turn `[turn_start, turn_end)` with ONE
+value — the TD form of the whole turn as a macro-action:
+
+    A = V(s_end) + hint_penalty − V(s_start)
+      = r_se + V[se+1] − V[ss]     (FAILED turn; == a_C + a_I telescoped)
+      = V[se]         − V[ss]      (solve / no-fail turn; no hint given)
+
+**Interpretation (the one design choice).** `s_start = S_ss`; `hint_penalty = r_se = −penalty[se]`
+(the injected hint's cost); `s_end = S_{se+1}` — the POST-HINT state (the turn's own tokens reach the
+verified `S_se`, fail step `se`, then the injected hint completes it, landing at `S_{se+1}`, exactly
+where the next turn resumes). Using the post-step value `V[se+1]` (NOT `V[se]`) is what keeps this a
+proper advantage: `V` is built by the backward recursion `V[k]=V[k+1]+F_k·r_k/D_k` precisely so that
+per-step advantages sum to ~0 across the group — `F_k·(r_k+V[k+1]−V[k]) + (D_k−F_k)·(V[k+1]−V[k]) = 0`
+— and that GRPO-relative baselining only holds with `V[se+1]`. So whole-turn = `a_C + a_I` telescoped,
+written uniformly over the whole span. (If one ever wanted the literal verified state `s_end = S_se`
+instead, it is a one-line `V[se+1]→V[se]` flip; not what we want — it double-prices the hint.)
+
+**What changes vs the split — and what doesn't.** Solve / no-fail turns are IDENTICAL (they already
+carry `boundary == turn_end`, so `[ts,b) == [ts,te)` and both modes write `V[se]−V[ss]`). The ONLY
+difference is a genuine progress-making FAILED turn (`turn_start < boundary < turn_end`): the SPLIT
+gives its verified-prefix tokens `V[se]−V[ss]` and its tail `r_se+V[se+1]−V[se]`; whole-turn gives
+EVERY token of the turn the single combined value `r_se+V[se+1]−V[ss]`. **Boundary-free** — it reads
+only `(ss, se, is_fail)`, never the fuzzy verified-prefix boundary, so the gradient has ZERO dependence
+on the selector citation-locate (`locate_quote_end`) accuracy; the whole turn is reinforced/penalized
+together. Motivation: remove the fuzzy-quote boundary as a per-token noise source.
+
+**The loop is unchanged.** `AutoHintAgentLoop` still records the SAME `step_adv_turns=[ts,boundary,te,
+ss,se,is_fail]` segments (the boundary is still computed — it drives the legacy MASK mode and the
+rollout dumps); whole-turn merely ignores column `boundary` when assigning. Purely a trainer-side switch.
+
+**`HPRL_OVERLONG_PENALTY` still works — IDENTICALLY (asked & verified).** The over-turn-length penalty
+(2026-07-01) touches ONLY rows flagged `turn_truncated=1`, and the per-turn-cap path always records its
+truncation segment with `boundary == turn_start` (2026-06-29). That single fact makes the two modes
+COINCIDE on exactly those rows: `boundary==ts` ⟹ the split's `a_C` is empty and `a_I` already spans the
+whole turn, and with `ss==se` both compute the same base `r_se+V[se+1]−V[se]`; the penalty then subtracts
+`P_over` from `[boundary,turn_end) = [ts,te)` = the whole turn in both. Confirmed empirically (3-rollout
+group, one progress-fail-then-truncate row): identical penalty delta (`−0.5` over the truncated span),
+identical truncated-turn value pre/post; the only place whole-turn differs (a PRIOR progress turn's
+prefix) is not a truncation segment, and the penalty leaves it untouched. Same for `normalize` (P_over
+still subtracted pre-std) and `zero_if_no_correct` (no-correct/all-truncate groups still zeroed first).
+So the Olmo run's `HPRL_OVERLONG_PENALTY=0.1` behaves the same with whole-turn on.
+
+**Wiring (flag-gated as usual).** New knob `data.hprl.auto_hint.step_adv.whole_turn` (yaml **default
+`false`** → the `a_C`/`a_I` split runs) → `HPRLRayPPOTrainer._hprl_apply_step_advantage` reads
+`sa.get("whole_turn")` and passes `whole_turn=` into `step_advantage.apply_step_level_advantages` →
+`assign_row_advantages` branches (default keyword arg, so every other caller is byte-identical). Env
+`HPRL_STEP_ADV_WHOLE_TURN` in `run_hprl_qwen2.5_7b.sh` (default `false`) + job arg. **`run_auto_hint_-
+olmo3_7b_instruct.sh` defaults it to `true`** — whole-turn is now that run's default step-adv mode (as
+`HPRL_ALLOW_DECREASE=false` is there); `HPRL_STEP_ADV_WHOLE_TURN=false` restores the split. Only
+meaningful when `HPRL_STEP_ADV=true`. The trainer's step-adv log line gains `wt=<0|1>`.
+
+**Tests.** New `test_apply_step_level_advantages_whole_turn` on the 2026-06-25 3-rollout worked example:
+the whole failed turn shares one value (its prefix is no longer 0 as in the split), asserted against the
+split on the two verified-prefix sub-ranges; solve / `boundary==ts` turns match the split exactly.
+Existing truncation/overlong tests pass unchanged (their segments carry `boundary==ts`, where the modes
+coincide). Suite 36/36.
+
+### Files touched
+- `step_advantage.py` — `assign_row_advantages(..., whole_turn=False)` branch (stats refactored into a `_tally` closure); threaded through `apply_step_level_advantages`; module header + docstring notes
+- `hprl_ray_trainer.py` — read `step_adv.whole_turn`, pass through, log `wt=%d`
+- `config/hprl_trainer.yaml` — `data.hprl.auto_hint.step_adv.whole_turn: false` + doc
+- `run_hprl_qwen2.5_7b.sh` — `HPRL_STEP_ADV_WHOLE_TURN` env (default false) + job arg
+- `run_auto_hint_olmo3_7b_instruct.sh` — export knob (default **true** for this run) + echo line
+- `test_auto_hint.py` — `test_apply_step_level_advantages_whole_turn`
+
+## 2026-07-01 (b) — `HPRL_ALLOW_DECREASE`: raise-only budget ratchet (decreases vetoed at the manager)
+
+Follow-up lever from the truncation-tax diagnosis below (`hprl/budget_mean` compounding
+4.09 → 1.97 fed the tax): a knob that keeps the adaptive rule's RAISE-on-zero-correct branch
+but disables every budget-LOWERING outcome, so B_q can only go up (or hold).
+
+**Mechanism.** `BudgetManager(allow_decrease=False)` applies a post-rule veto
+(`_hold_decrease`) in `update_group` / `update_group_kpack`: any update whose `new_budget`
+lands below the budget the group ran under is HELD at that budget; the `BudgetUpdate` keeps
+the rule's decision stats (n_correct, pivot/min hint counts) and its `rule` gains a `"_held"`
+suffix (`pivot_set_held`, ...). One mechanism covers all three rules — adaptive keeps only
+the raise branch; `downward` and the k-pack probe (pure decreases) freeze entirely. Raises
+and holds pass through; `allow_decrease=true` (default) is byte-identical to before. NOT
+persisted in the state-JSON meta (same as `ratchet_mode`/`max_budget`), so flipping the env
+on a resumed run takes effect.
+
+**Wiring (flag-gated as usual).** `data.hprl.allow_decrease` (yaml, default `true`) →
+`HPRLRayPPOTrainer._hprl_budget_mgr` → manager; env `HPRL_ALLOW_DECREASE` in
+`run_hprl_qwen2.5_7b.sh` (default `true`). `run_auto_hint_olmo3_7b_instruct.sh` defaults it
+to **`false`** — raise-only is now that run's default; `HPRL_ALLOW_DECREASE=true` restores
+the two-sided rule. New wandb scalar `hprl/num_decrease_held` counts vetoed decreases per
+step (0 unless the guard is on).
+
+**Validation.** `python budget_manager.py --selftest` (raise passes through / pivot_set held
+with stats kept / kpack + downward frozen / default-mode unchanged) + new
+`test_auto_hint.py::test_allow_decrease_false_is_raise_only`; full suite 35/35. `bash -n` on
+both launch scripts.
+
+### Files touched
+- `budget_manager.py` — `allow_decrease` ctor knob + `_hold_decrease` veto + selftests
+- `hprl_ray_trainer.py` — read `data.hprl.allow_decrease`, include it in the ratchet log line
+- `config/hprl_trainer.yaml` — `data.hprl.allow_decrease: true` (+ doc)
+- `hint_budget_callback.py` — `hprl/num_decrease_held` metric
+- `run_hprl_qwen2.5_7b.sh` — `HPRL_ALLOW_DECREASE` env (default `true`) + hydra override
+- `run_auto_hint_olmo3_7b_instruct.sh` — defaults `HPRL_ALLOW_DECREASE=false` (raise-only) + echo
+- `test_auto_hint.py` — `test_allow_decrease_false_is_raise_only`
+
+## 2026-07-01 — FINDING: auto-hint reward decline is a length-TRUNCATION TAX; step_adv's over-long `a_I` penalty self-extinguishes (co-truncation at `se=0` dilutes its own brake)
+
+Diagnostic of `logs/HPRL-AutoHint-Olmo-3-7B-Instruct-SFT-dapo-20260630-224821` (dapo-512,
+`total_epochs=100` → ~8 steps/epoch, `rollout.n=8`, step_adv ON with `normalize=true` /
+`adv_scale=1.0`, `loss_agg_mode=token-mean`, `max_turn_tokens=16384`,
+`max_response_length=34768`, `incorrect_reward=0.0`). Symptom: scalar train reward
+(`critic/rewards/mean`) peaks ~0.376 @ ep6, sags to ~0.336 @ ep8 then hovers ~0.36; `correct_frac`
+peaks ~0.499 @ ep4–6 → ~0.42 @ ep8–12. Question: budget ratchet vs length truncation vs policy
+degradation. **Verdict: length-truncation tax. NOT the budget, NOT sustained policy degradation.**
+
+**Policy is improving, not degrading (three independent signals).**
+- `val_acc` (unaided pass@1; `val-aux/*/length_truncated == 0` at every step) rises 0.058 → 0.19 @ ep6,
+  dips to 0.128 @ ep8, then RECOVERS to 0.19–0.21 by ep9–12 (ends at/above the ep6 peak).
+- `step_adv/value_s0_mean` = `V[0]` rises MONOTONICALLY 0.337 → 0.620, no ep8 dip.
+- Within-budget-bucket reward and "finished-rollout" correctness (`correct/(1−trunc)`) both rise; the
+  ep7–8 wobble is a transient blip that heals. `value_s0` grows a +0.20 gap ABOVE `correct_frac` by
+  ep12 = potential-vs-realized, i.e. the truncation tax made visible from a second computation.
+
+**Budget decrease is NOT the trigger (refuted).** `hprl/budget_mean` falls monotonically 4.09 → 1.97
+across epochs (ratchet compounding), INCLUDING ep0–6 where reward was RISING. Raw
+`corr(reward, budget) = −0.92` (lower budget ↔ higher reward). A monotone variable can't cause a
+reversal at ep8. Budget's role is INDIRECT: fewer hints → model self-solves → longer turn-1 CoT →
+more truncation.
+
+**Length truncation IS the sustained driver.** `hprl/length_truncated_frac` climbs 0.3% (ep0) → 3.3%
+(ep6) → 5.4% (ep8) → 10.3% (ep12); `response_length/mean` 4.8k → 11.8k; `clip_ratio` 0 → 0.02. Each
+truncated rollout floors to `acc=0`. Clincher: val (0% truncation) keeps rising while train reward
+stalls — val↑/train↓ can ONLY be the training-specific truncation. NB the scalar reward is a
+MONITORING signal; the gradient uses step_adv (whose `value_s0` rises), so part of the "reward
+decrease" is a metric artifact, not what is optimized.
+
+**The step_adv over-long penalty SELF-EXTINGUISHES (the core mechanistic finding).** A per-turn cut is
+coded `fail@pre_state`, whole turn as `a_I` (see 2026-06-29 entry). By the backward-value recursion this
+is EXACT: `a_I = penalty[se]·(fail_count[se]/d_se − 1) ≤ 0`, i.e. `|a_I| = penalty[se]·brake`,
+`brake ≡ 1 − fc/d`. Reconstructed from `rollouts/<step>.jsonl` (`step_adv_turns` + `acc` +
+`length_truncated`, grouped by `input`; per-turn cut ⟺ last seg `b==ts, is_fail=1, te−ts≈16384`,
+validated EXACT vs the `turn_truncated` metric — 55/55 @ step84):
+- **brake fades as truncation spreads:** ~0.44 (rare, ep6/12) → ~0.22 (common, ep10–13).
+  `corr(per-turn%, eff_brake) = −0.35`; `zero_if_no_correct`-zeroed share of per-turn cuts rises to ~28%.
+- **it's MUTUAL-INFLATION, not skill loss:** decomposing `fc` at `se`,
+  `corr(per-turn%, truncated-fail/d) = +0.84` but `corr(per-turn%, genuine-fail/d) = −0.27` (flat). The
+  `#correct/group` drop (−0.59) is truncated-rollouts-counted-incorrect, not lower skill (val/`value_s0`
+  rise). Truncated rollouts are what land in `fc`, and they push `fc/d → 1`, killing each other's brake.
+- **why they collide:** 93.4% of per-turn truncations land on `se=0` — the FIRST unaided turn hits
+  16384 before boxing. 47% of truncating groups have ≥2 co-truncations, and 94% of those share the
+  same `se`. Co-located `fail@0` within a group is exactly the mutual-inflation condition.
+- **plus two leak holes:** `zero_if_no_correct` zeros all-fail groups (→ `a_I=0`); and global-ceiling
+  LATER-turn cuts (~11–19% of truncations, RISING as rollouts lengthen toward 34768) record no segment,
+  so their tail keeps advantage 0 — fully unpenalized.
+
+**Root-cause chain.** budget ratchet strips hints → turn-1 unaided CoT inflates → hits the 16384
+per-turn cap at `se=0` → coded `fail@0`, clustered within group → group-relative `a_I` brake collapses
+(+ `zero_if_no_correct`) → penalty can't arrest length growth → more truncation. Self-reinforcing; a
+turn-1 length problem masquerading as a reward decline.
+
+**Implication / fix direction.** A GROUP-RELATIVE penalty structurally cannot self-regulate truncation
+— the offenders (co-truncated `fail@0` rollouts) dilute their own punishment, and it is weakest exactly
+where truncation is worst. Want an ABSOLUTE per-token soft-overlong penalty (DAPO-style ramp over the
+last `L_buffer` tokens before the cap), magnitude independent of group composition; OR, since
+val/`value_s0` say the length growth is genuinely productive, raise the caps. This is NOT a
+loss-normalization issue — the run already uses `token-mean` (the Dr-GRPO/DAPO no-length-norm
+aggregation); flipping that lever does nothing here. Do NOT use DAPO over-long MASKING (it would delete
+the negative signal that does exist). Artifacts in the run dir: `reward_decline_analysis.png`,
+`truncation_brake_evolution.png`, `perturn_penalty_evolution.png`.
+
+**Implemented (2026-07-01): absolute over-turn-length penalty, flag-gated, default off.** New knob
+`data.hprl.auto_hint.step_adv.overlong_penalty` (env `HPRL_OVERLONG_PENALTY`, default `0` = off). In
+`step_advantage.apply_step_level_advantages`, AFTER pass-1 assigns the raw value-based advantages and
+BEFORE `_group_token_std`/normalize, subtract an absolute `P_over` from every per-turn-cap truncation
+tail — the row's LAST segment for rows with `turn_truncated=1` (the trainer reads `turn_truncated` from
+`non_tensor_batch` → `turn_truncated_per_row`). Because it is subtracted PRE-normalize it is read into
+the group std and scaled into the unit range ("inside-normalization", so raw ~`penalty/K`; ~`0.1` lands
+near unit); because it is an ABSOLUTE term (not `penalty·(fc/d−1)`) it does NOT ride the brake, so it
+survives a co-truncating group (`fc/d→1`). The injection sits after the `zero_if_no_correct` `continue`,
+so **no-correct / all-truncate groups stay zeroed — no penalty there (deliberate design choice)**.
+New metrics `step_adv/overlong_rows`, `step_adv/overlong_tokens`. Test
+`test_apply_step_level_advantages_overlong_penalty` (subtracts exactly `P_over` off the truncated tail
+only; no-correct group untouched; std widens under normalize) — suite 34/34. Design notes: chose
+inside-normalize (subtract pre-norm) over a post-norm absolute floor — folds P_over into the group std
+so it self-limits and stays in-distribution, at the cost of collapsing on the fully-degenerate
+all-same/all-truncate group (which we accept, since those are the no-correct groups we leave zeroed).
+NOT YET DONE: the `L_buffer` ramp (penalty is currently flat over the whole truncated turn, not
+concentrated on the last tokens before the cap). To enable: `HPRL_OVERLONG_PENALTY=0.1`, watch
+`length_truncated_frac`/`turn_truncated_frac` fall and `response_length/mean` stabilize.
+
+## 2026-06-29 — auto-hint PER-TURN generation-length cap: an over-long turn fails its next hint step (whole-span `a_I`); the global ceiling stays neutral
+
+Adds an independent per-turn token cap to the AUTO-HINT rollout. Before this, only the
+GLOBAL response budget bounded generation, and it effectively bounded just the FIRST turn:
+the rollout `sampling_params` carries **no `max_tokens`** (`agent_loop.py:496-502`), so
+`vllm_async_server.generate` takes its fallback `min(response_length, prompt_length +
+response_length − len(prompt_ids))` (`:482-494`) — on turn 1 the short prompt makes that
+`= response_length` (the full 16384), but on later turns it is only the *remaining context
+room*, so a turn could eat whatever was left of the global budget with no per-turn limit of
+its own.
+
+**Feasibility (checked first).** A per-turn cap is just a per-request `max_tokens`:
+`generate()` honors an explicit `sampling_params["max_tokens"]` if present (`:483-484`) and
+otherwise uses the fallback, clamping only DOWN to context room (`:498`). Same per-turn
+override pattern the base `ToolAgentLoop` already uses for `stop_token_ids`. The catch:
+`stop_reason` can't tell a length cut from an EOS — vLLM reports both as `"completed"`
+(`vllm_async_server.py:577`) — so a cut must be detected by **token count**, not stop reason.
+
+**Mechanism (`auto_hint_agent_loop._handle_generating_state`).** New knob
+`data.hprl.auto_hint.max_turn_tokens` (env `HPRL_MAX_TURN_TOKENS`, **default 0 = off**). When
+> 0, each turn is generated with `max_tokens = min(max_turn_tokens, room)` where `room =
+response_length − tokens-used-so-far`, passed as a **copy** of `sampling_params` (which also
+stops the loop's prior in-place mutation of the rollout-shared dict that `generate()` pops).
+
+**Two length cuts, by which limit binds** — decided by the pure, unit-tested
+`step_advantage.classify_length_cut(n_tokens, max_turn_tokens, room)` (single source of
+truth; the loop calls it instead of duplicating the inline checks):
+- **`per_turn`** — the per-turn cap is the binding limit (`max_turn_tokens <= room`) and the
+  turn ran to it. Treated as FAILING to finish its next hint step: `length_truncated=1`
+  (reward floor → `acc=0` → incorrect) + a `turn_truncated=1` extra-field flag, and in step-adv mode
+  one whole-span segment `[turn_start, turn_start, turn_end, pre_state, pre_state,
+  is_fail=1]` — `boundary == turn_start` so the WHOLE turn is the `a_I` tail (no verified
+  `a_C`), failing the next pending hint `h_{k+1}` at the rollout's current state
+  `S_k = pre_state` (so `h_{k+1} ∈ H_i`). Then terminate — **no** selector call, **no**
+  injection. This GENERALIZES the 2026-06-26 first-turn-global case (which hardcoded
+  `pre_state 0`) to any turn at any state.
+- **`global`** — the global ceiling bound the turn (cap off, or `room < max_turn_tokens` so it
+  ran out of TOTAL budget). UNCHANGED behavior: `length_truncated=1`; in step-adv a FIRST-turn
+  cut is charged as failing `h_0` at `S_0`, a LATER-turn cut records no segment → its tail
+  keeps **advantage 0** (the ceiling is not the turn's fault).
+
+**Boundary (the tie `room == max_turn_tokens`).** The per-turn branch is checked first and
+wins the tie, so a turn cut at length `== max_turn_tokens` is PUNISHED even when it coincides
+with the global ceiling; only a *strictly smaller* global room (`room < max_turn_tokens`) is
+the neutral, advantage-0 global cut. (Discriminator rule: `max_turn_tokens <= room` → per-turn
+binds.) Cap-off is byte-for-byte the old behavior — `classify_length_cut(n, 0, room)` returns
+`"global"` iff `n >= room`, identical to the old `len(response_mask) >= response_length`.
+
+**All-truncated GROUP → zero gradient.** If every rollout in a GRPO group truncates, all are
+`length_truncated → acc=0 → correct_per_row=False`, so `has_correct=False` and (with the
+DEFAULT `zero_if_no_correct=true`, overridden nowhere) the group is zeroed in
+`apply_step_level_advantages` BEFORE any per-segment advantage is assigned — no `a_I` tail
+reaches the rows. (Special case of the existing all-incorrect-group zeroing.)
+
+**Truncation metrics.** verl's `response_length/clip_ratio` is
+`mean(total_response_tokens == max_response_length)` (`metric_utils.py:236`) — it counts only
+rollouts that filled the WHOLE global budget, so a per-turn cut (which terminates the rollout
+EARLY, below the global ceiling) is invisible to it and it UNDER-reports truncation once the
+cap is on. The reliable signals are the per-rollout flags surfaced through
+`hint_budget_callback`: `hprl/length_truncated_frac` (mean of `length_truncated` = the TRUE
+truncation ratio, both cuts) and `hprl/turn_truncated_frac` (mean of the new `turn_truncated`
+= the per-turn-cap subset). The per-turn flag was made an EXTRA-FIELD (not an
+`agent_data.metrics["turn_length_truncated"]` counter, which `AgentLoopMetrics` strips on
+`model_dump`, same fate as the hint_select timer) so it survives to `non_tensor_batch`.
+
+**Tuning interactions (documented in the configs, not bugs).** The global
+`max_response_length` must cover ~`#turns × max_turn_tokens` + injected-hint tokens, else the
+global ceiling bites first (e.g. cap 4096 → ~4 turns under 16384; raise the global budget to
+suit). The cap also bounds the SOLVING turn, so keep it ≥ a realistic single-step solution
+length. Scoped to `AutoHintAgentLoop` only (the legacy `<hint_call/>` loop is untouched).
+
+**Verified.** 33/33 `test_auto_hint.py`, incl. four new tests:
+`test_classify_length_cut_per_turn_vs_global` (the discriminator incl. the tie
+`classify_length_cut(4096,4096,4096) == "per_turn"`), `test_per_turn_truncation_segment_whole_turn_a_i`
+(whole-turn `a_I` failing `h_{k+1}` at `pre_state=2`: `a_I=−0.1` on every turn token, `h_3 ∈ H`),
+`test_all_truncated_group_zeroed` (mixed truncation shapes, no correct → all rows 0), and
+`test_truncation_frac_metrics` (drives the real `hprl_update_budgets`: `length_truncated_frac`
+0.5 / `turn_truncated_frac` 0.25, and absent keys skip cleanly).
+
+### Files touched
+- `auto_hint_agent_loop.py` — `max_turn_tokens` parsed in `__init__`; `_handle_generating_state` applies the per-turn `max_tokens` and routes the cut through `classify_length_cut` (per-turn punish vs global neutral); `turn_truncated` extra-field flag (setdefault 0 + set 1 on a per-turn cut)
+- `step_advantage.py` — new pure `classify_length_cut(n_tokens, max_turn_tokens, room)` discriminator (per_turn / global / None; per-turn wins the tie)
+- `hint_budget_callback.py` — `hprl/length_truncated_frac` (true truncation ratio, both cuts) + `hprl/turn_truncated_frac` (per-turn subset), mirroring `hint_budget_exceeded_frac`
+- `config/hprl_trainer.yaml` — `data.hprl.auto_hint.max_turn_tokens: 0` (+ rationale)
+- `run_hprl_qwen2.5_7b.sh` — `HPRL_MAX_TURN_TOKENS` default + Hydra override
+- `run_auto_hint_olmo3_7b_instruct.sh` — `HPRL_MAX_TURN_TOKENS` export (defaults to **8192** for this run — opts in; overridable) + echo. Note vs the global `max_response_length=34768` this leaves room for only ~4 turns before the global ceiling; raise `max_response_length` for more
+- `test_auto_hint.py` — `test_classify_length_cut_per_turn_vs_global`, `test_per_turn_truncation_segment_whole_turn_a_i`, `test_all_truncated_group_zeroed`
+
 ## 2026-06-27 — selector citation locator: ambiguous quote now anchors on the FIRST matched sentence
 
 A correctness fix to where a selector citation is located in the student trace. The

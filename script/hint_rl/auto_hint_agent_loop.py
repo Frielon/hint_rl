@@ -54,7 +54,7 @@ from verl.workers.rollout.replica import TokenOutput
 from hint_agent_loop import HintAgentLoop, _dump_selector_call
 from hint_selector import build_trace, hint_id_of
 from selector_multi import locate_quote_end, pending_hint_ids, prune_hint_pool
-from step_advantage import prefix_state as _prefix_state
+from step_advantage import classify_length_cut as _classify_length_cut, prefix_state as _prefix_state
 
 # Same boxed-answer grader the reward uses, so the loop's "is it correct yet?"
 # decision matches how the rollout is ultimately scored. Guarded so the module
@@ -111,6 +111,21 @@ class AutoHintAgentLoop(HintAgentLoop):
         self.prune_guidance = str(
             ah.get("prune_guidance", os.environ.get("HPRL_PRUNE_GUIDANCE", "false"))
         ).strip().lower() in {"1", "true", "yes", "on"}
+        # PER-TURN generation-length cap (data.hprl.auto_hint.max_turn_tokens; env
+        # HPRL_MAX_TURN_TOKENS). When > 0, each turn's generation is bounded to
+        # min(max_turn_tokens, remaining global room) via the per-request max_tokens --
+        # an INDEPENDENT per-turn limit on top of the global response_length budget. A
+        # turn that hits this cap WITHOUT an EOS, with global budget still remaining, is
+        # treated as having FAILED to finish its next hint step: the WHOLE turn becomes
+        # the a_I failed tail (boundary == turn_start, no verified prefix) failing the
+        # next pending hint h_{k+1} at the rollout's current state S_k, the rollout is
+        # flagged length_truncated (floor reward -> acc=0 -> incorrect), and it
+        # terminates (no selector call, no hint injected). A turn that instead runs into
+        # the GLOBAL response_length ceiling keeps the prior behavior (its tail carries
+        # advantage 0). 0 (default) -> no per-turn cap; only the global one applies.
+        self.max_turn_tokens = int(
+            ah.get("max_turn_tokens", os.environ.get("HPRL_MAX_TURN_TOKENS", "0")) or 0
+        )
         if not _GRADER_OK:
             logger.warning(
                 "AutoHintAgentLoop: mathruler grader UNAVAILABLE -- every answer will be "
@@ -118,10 +133,11 @@ class AutoHintAgentLoop(HintAgentLoop):
             )
         logger.warning(
             "AutoHintAgentLoop: auto-hint rollout active (fuzzy_threshold=%.2f, step_adv=%s, "
-            "prune_guidance=%s)",
+            "prune_guidance=%s, max_turn_tokens=%d)",
             self.auto_hint_fuzzy_threshold,
             self.step_adv_enable,
             self.prune_guidance,
+            self.max_turn_tokens,
         )
 
     # ------------------------------------------------------------------ #
@@ -163,6 +179,16 @@ class AutoHintAgentLoop(HintAgentLoop):
         """Generate one answer turn (EOS-terminated), then decide: correct -> stop;
         wrong & budget remains -> go inject a hint (PROCESSING_TOOLS); else stop."""
         # (1) EOS only -- no tool/stop tokens injected (the policy is unaware of hints).
+        # PER-TURN length cap: ``room`` = global response tokens left BEFORE this turn;
+        # classify_length_cut (below) uses it with the per-turn cap to label how the turn
+        # was cut (vLLM reports EOS and a length cut alike, so we go by token count). When
+        # the cap is on we bound THIS turn to min(max_turn_tokens, room) via the per-request
+        # max_tokens, passed as a COPY so generate() (which pops/mutates max_tokens,
+        # logprobs, ...) cannot corrupt the rollout-shared sampling_params reused every turn.
+        room = self.response_length - len(agent_data.response_mask)
+        if self.max_turn_tokens and self.max_turn_tokens > 0 and not ignore_termination:
+            turn_cap = max(1, min(self.max_turn_tokens, room))
+            sampling_params = {**sampling_params, "max_tokens": turn_cap}
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(
                 request_id=agent_data.request_id,
@@ -208,6 +234,13 @@ class AutoHintAgentLoop(HintAgentLoop):
         # run-on rollout that never emits a boxed answer is scored as the worst outcome
         # rather than an ordinary (and sometimes accidentally-boxed) failure.
         agent_data.extra_fields.setdefault("length_truncated", 0)
+        # Per-rollout flag: 1 when this rollout ended on a PER-TURN length-cap cut
+        # (max_turn_tokens hit with global budget remaining) -- the subset of
+        # length_truncated attributable to the per-turn cap rather than the global
+        # ceiling. Surfaced (vs an agent_data.metrics counter, which AgentLoopMetrics
+        # drops) so hint_budget_callback can report hprl/turn_truncated_frac. Initialized
+        # on every rollout for the DataProto.concat key-consistency reason as applied_hints.
+        agent_data.extra_fields.setdefault("turn_truncated", 0)
         agent_data.extra_fields.setdefault("hint_select_time", 0.0)
         agent_data.extra_fields.setdefault("hint_select_calls", 0)
         agent_data.extra_fields.setdefault("hint_calls_total", 0)
@@ -239,20 +272,46 @@ class AutoHintAgentLoop(HintAgentLoop):
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
 
-        # --- hard caps (same as base). A capped turn is the ending turn; nothing more
-        #     to inject. In the legacy mask path it carries no disable_span (full
-        #     promote); in step-adv a FIRST-turn cap is scored as a failed step (below). -
-        if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
-            # Generation hit the response-length cap (truncated, no EOS): flag it so the
-            # reward floors this rollout to the minimum (see hint_reward.compute_score).
+        # --- hard caps. TWO distinct length cuts, by WHICH limit bound the turn (the cut
+        #     reason is invisible in stop_reason -- vLLM reports EOS and a length cut alike
+        #     as "completed" -- so classify_length_cut goes by token count). The PER-TURN
+        #     cut wins the tie room == max_turn_tokens, so a turn cut at length ==
+        #     max_turn_tokens is punished even when it coincides with the global ceiling;
+        #     only a STRICTLY smaller global room (room < max_turn_tokens) is neutral. -----
+        cut = None if ignore_termination else _classify_length_cut(
+            len(output.token_ids), self.max_turn_tokens, room
+        )
+        # (a) PER-TURN cap bound the turn and it ran to that cap -> treat the turn as
+        #     FAILING to finish its next hint step. Flag length_truncated (reward floors to
+        #     the minimum, acc=0 -> incorrect), and in step-adv mode charge the WHOLE turn
+        #     as the a_I failed tail (boundary == turn_start, no verified prefix) failing
+        #     the next pending hint h_{k+1} at the rollout's current state S_k = pre_state
+        #     (ss == se == pre_state, so that hint joins H). Generalizes the FIRST-turn
+        #     global-cap case (b) -- which hardcodes pre_state 0 -- to any turn/state. Then
+        #     terminate WITHOUT a selector call or hint injection.
+        if cut == "per_turn":
+            agent_data.extra_fields["length_truncated"] = 1
+            agent_data.extra_fields["turn_truncated"] = 1
+            if self.step_adv_enable:
+                turn_end = len(agent_data.response_mask)
+                turn_start = turn_end - len(agent_data.response_ids)
+                order = pending_hint_ids(self._pool(agent_data), [])
+                pre_state = _prefix_state(
+                    order, agent_data.extra_fields.get("auto_hint_completed", [])
+                )
+                self._record_step_adv_turn(
+                    agent_data, turn_start, turn_start, turn_end, pre_state, pre_state, is_fail=1
+                )
+            return AgentState.TERMINATED
+        # (b) GLOBAL response-length ceiling bound the turn (no per-turn cap, or the
+        #     remaining room was STRICTLY smaller than max_turn_tokens so the turn ran out
+        #     of TOTAL budget, not its own step cap). Flag length_truncated; in step-adv a
+        #     FIRST-turn cut is charged as failing h_0 at S_0 (it never reached step 1),
+        #     while a LATER-turn cut records NO segment, so its tail keeps advantage 0 --
+        #     the global ceiling is not the turn's "fault" (earlier turns already scored).
+        if cut == "global":
             agent_data.extra_fields["length_truncated"] = 1
             if self.step_adv_enable and agent_data.assistant_turns == 1:
-                # STEP-ADV, FIRST turn ONLY: a turn that ran past the length cap before
-                # ever reaching a hint earns NO verified-prefix credit -- boundary ==
-                # turn_start makes its WHOLE span the a_I tail -- and is charged with
-                # FAILING h_0 at state S_0 (ss == se == 0, so h_0 joins H): we treat it
-                # as not even reaching the first step. A LATER-turn cap records no
-                # segment, so its tail keeps advantage 0 (earlier turns already scored).
                 turn_end = len(agent_data.response_mask)
                 turn_start = turn_end - len(agent_data.response_ids)
                 self._record_step_adv_turn(

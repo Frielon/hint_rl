@@ -170,6 +170,9 @@ def hprl_update_budgets(
     # -------- metrics --------
     new_budgets = [u.new_budget for u in updates]
     n_changed = sum(1 for u in updates if u.changed)
+    # decreases vetoed by the manager's allow_decrease=False guard (rule "*_held");
+    # always 0 when the ratchet runs two-sided/downward as before.
+    n_held = sum(1 for u in updates if u.rule.endswith("_held"))
     correct_fracs = [(u.n_correct / u.n_total) for u in updates if u.n_total]
     deltas = [(u.old_budget - u.new_budget) for u in updates]
     n_problems = len(updates)
@@ -234,6 +237,7 @@ def hprl_update_budgets(
         "hprl/budget_delta_mean": float(sum(deltas) / n_problems),
         "hprl/num_ratcheted": float(n_changed),
         "hprl/frac_ratcheted": float(n_changed / n_problems),
+        "hprl/num_decrease_held": float(n_held),
         "hprl/correct_frac_mean": float(sum(correct_fracs) / len(correct_fracs)) if correct_fracs else 0.0,
         # fraction of problems with mixed correct/incorrect rollouts this step.
         "hprl/active_learning_frac": float(n_active / n_problems),
@@ -299,6 +303,24 @@ def hprl_update_budgets(
         be_total = sum(int(round(float(_to_py(be_arr[i]) or 0))) for i in range(len(be_arr)))
         metrics["hprl/hint_budget_exceeded"] = float(be_total)
         metrics["hprl/hint_budget_exceeded_frac"] = float(be_total / n) if n else 0.0
+
+    # -------- truncation rate: rollouts cut at a length cap -----------------
+    # length_truncated covers BOTH cuts -- the auto-hint PER-TURN max_turn_tokens cap
+    # AND the GLOBAL response-length ceiling -- each of which floors the rollout to acc=0.
+    # This is the TRUE truncation ratio, unlike verl's response_length/clip_ratio, which
+    # counts only rollouts whose TOTAL multi-turn response filled the whole global budget
+    # (a per-turn cut terminates the rollout EARLY, below that, so clip_ratio misses it).
+    # turn_truncated is the per-turn-cap SUBSET (0 when max_turn_tokens is off).
+    lt_arr = ntb.get("length_truncated")
+    if lt_arr is not None:
+        lt_total = sum(int(round(float(_to_py(lt_arr[i]) or 0))) for i in range(len(lt_arr)))
+        metrics["hprl/length_truncated"] = float(lt_total)
+        metrics["hprl/length_truncated_frac"] = float(lt_total / n) if n else 0.0
+    tt_arr = ntb.get("turn_truncated")
+    if tt_arr is not None:
+        tt_total = sum(int(round(float(_to_py(tt_arr[i]) or 0))) for i in range(len(tt_arr)))
+        metrics["hprl/turn_truncated"] = float(tt_total)
+        metrics["hprl/turn_truncated_frac"] = float(tt_total / n) if n else 0.0
 
     # -------- out-of-hints rate: pool-exhausted hint calls ------------------
     # Hint calls that found an EMPTY candidate pool (every hint already surfaced) and

@@ -81,12 +81,16 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
                 # adaptive ratchet (raise on zero-correct, N/2-set on majority) + its ceiling.
                 ratchet_mode=str(cfg.get("ratchet_mode", "downward")),
                 max_budget=int(cfg.get("max_budget", default_budget)),
+                # False -> never LOWER B_q: a would-be decrease is held at the current
+                # budget (rule "*_held"); the adaptive raise branch still applies.
+                allow_decrease=bool(cfg.get("allow_decrease", True)),
             )
             logger.warning(
-                "HPRL ratchet enabled: budget_state=%s mode=%s default=%d min=%d max=%d dec=%d "
+                "HPRL ratchet enabled: budget_state=%s mode=%s allow_decrease=%s default=%d min=%d max=%d dec=%d "
                 "(loaded %d problems)",
                 path,
                 self._budget_mgr.ratchet_mode,
+                self._budget_mgr.allow_decrease,
                 self._budget_mgr.default_budget,
                 self._budget_mgr.min_budget,
                 self._budget_mgr.max_budget,
@@ -395,6 +399,7 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
 
         n = int(bb["advantages"].shape[0])
         acc_arr = ntb.get("acc")
+        tt_arr = ntb.get("turn_truncated")  # per-turn-cap cut flag (for the overlong penalty)
         extra_arr = ntb.get("extra_info")
         total_penalty, hard_factor, guidance, guidance_free = self._step_adv_penalty_cfg()
 
@@ -403,6 +408,9 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
             (float(_to_py(acc_arr[i]) or 0.0) >= 0.5) if acc_arr is not None else False
             for i in range(n)
         ]
+        turn_truncated_per_row = (
+            [int(_to_py(tt_arr[i]) or 0) for i in range(n)] if tt_arr is not None else None
+        )
         penalty_per_row: list = []
         K_per_row: list = []
         cache: dict = {}
@@ -423,17 +431,21 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
         zinc = _truthy(sa.get("zero_if_no_correct", True))
         scale = float(sa.get("adv_scale", 1.0))
         normalize = _truthy(sa.get("normalize", False))
+        overlong = float(sa.get("overlong_penalty", 0.0))
+        whole_turn = _truthy(sa.get("whole_turn", False))
         # GRPO sets returns == advantages (same tensor); fall back to advantages if absent.
         returns_t = bb["returns"] if "returns" in bb.keys() else bb["advantages"]
         _, _, mstats = apply_step_level_advantages(
             bb["advantages"], returns_t, bb["response_mask"], list(uids),
             turns_per_row, correct_per_row, penalty_per_row, K_per_row,
             terminal_value=tv, zero_if_no_correct=zinc, adv_scale=scale, normalize=normalize,
+            overlong_penalty=overlong, turn_truncated_per_row=turn_truncated_per_row,
+            whole_turn=whole_turn,
         )
         stats.update(mstats)
         logger.warning(
             "[HPRL step=%s] step-adv: groups=%d scored=%d zeroed=%d rows=%d tokens=%d "
-            "pos=%.4f neg=%.4f V0=%.4f gstd=%.4f nfac=%.2f cite=%.3f",
+            "pos=%.4f neg=%.4f V0=%.4f gstd=%.4f nfac=%.2f cite=%.3f wt=%d",
             self.global_steps,
             int(mstats["step_adv/groups_total"]), int(mstats["step_adv/groups_scored"]),
             int(mstats["step_adv/groups_zeroed"]), int(mstats["step_adv/rows_scored"]),
@@ -441,6 +453,7 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
             mstats["step_adv/adv_pos_mean"], mstats["step_adv/adv_neg_mean"],
             mstats["step_adv/value_s0_mean"], mstats["step_adv/group_std_mean"],
             mstats["step_adv/norm_factor_mean"], stats.get("auto_hint/cite_found_rate", 0.0),
+            int(whole_turn),
         )
         return stats
 
