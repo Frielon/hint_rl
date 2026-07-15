@@ -15,6 +15,103 @@ _(none open — the step-level advantage calculation landed 2026-06-25; see the 
 
 # Done log
 
+## 2026-07-14 — over-long penalty: VALUE-INTEGRATED routing (`overlong_penalty_type=post_hoc|value`), flag-gated — RESULT: does NOT arrest the truncation; root cause is a length-POSITIVE reward
+
+A second routing for the over-turn-length surcharge built 2026-07-01. That entry fixed the
+*brake-collapse* half (an ABSOLUTE `P_over` survives `fc/d→1`); it leaves the other half untouched.
+Being applied AFTER the advantages are assigned, post-hoc only ever moves the TRUNCATED rows DOWN —
+every non-truncated row keeps its value-based advantage, which for a within-length turn failing at
+`se=0` is `a_I = penalty[0]·(F_0/D_0 − 1) ≈ 0` once co-failure is common. So the group carries **no
+positive signal for "produce a within-length turn"**, only a penalty for not doing so.
+
+**The value mode (math).** Route the surcharge through the VALUE recursion instead: a rollout truncated
+at state `k` carries reward `r_k − P_over` at its failed step, so with `T_k ≡ #truncated-at-k` (⊆ `F_k`,
+since a per-turn cut is already coded `fail@pre_state`, 2026-06-29):
+
+    V[k] = V[k+1] + (F_k·r_k − T_k·P_over) / D_k
+
+Only `V[0..k]` drop (a truncated row has `V_i = k`, so it never enters `F_j`/`D_j` for `j>k`; a
+first-turn cut at `se=0` lowers `V[0]` alone). With NO mean-centering that shift is not absorbed:
+
+    non-truncated row at state k :  A += T_k·P_over / D_k          (LIFTED, → positive)
+    truncated row at state k     :  A  = r_k(1 − F_k/D_k) − P_over(1 − T_k/D_k)
+    gap(non-truncate, truncate)  =  P_over                          (EXACTLY, ∀ T_k/D_k)
+
+i.e. the same absolute, brake-proof gap post-hoc gives, but positioned so the within-length rows land
+ABOVE zero instead of at it — a "do the within-length thing" reward, not only a "don't truncate" push.
+The rarer the survivor the bigger its lift (`T_k/D_k → 1`). Trade-off taken knowingly: it also
+positively reinforces a concise-but-WRONG turn, so keep `P_over` small.
+
+**Unchanged.** Scored-groups-only (no-correct groups still `continue`d + zeroed → no penalty either way,
+same deliberate choice as 2026-07-01); `whole_turn` and split both work (the truncation segment carries
+`boundary==ts`, so `−P_over` on the LAST segment's `r_se` lands on the whole turn in both); `normalize`
+still reads it into the group std (it is in the raw advantage pre-std). `post_hoc` is byte-identical at
+the default.
+
+**Wiring (flag-gated as usual).** `data.hprl.auto_hint.step_adv.overlong_penalty_type` (yaml **default
+`post_hoc`** = the 2026-07-01 behaviour) → trainer reads `sa.get("overlong_penalty_type")` → passed into
+`apply_step_level_advantages`, which builds per-group `trunc_counts` (`T_k` from each truncated row's LAST
+segment `se`) and threads `overlong_penalty`/`row_truncated` into `compute_state_values` /
+`assign_row_advantages`; the post-hoc subtraction block is SKIPPED in value mode (no double-count).
+Magnitude stays `HPRL_OVERLONG_PENALTY`. Env `HPRL_OVERLONG_PENALTY_TYPE` (default `post_hoc`) in
+`run_hprl_qwen2.5_7b.sh` + job arg, exported + echoed in `run_auto_hint_olmo3_7b_instruct.sh`. New metric
+`step_adv/overlong_value_mode`; trainer log gains `ov=<mode>(rows=N)`. Test
+`test_apply_step_level_advantages_overlong_value_mode` (lift == `T_0·P_over/D_0`; the wrong-but-within-
+length row flips negative→POSITIVE; gap == `P_over`; ≠ the naive post-hoc `a0 − P_over`; post_hoc leaves
+the non-truncated row untouched) — suite 37/37.
+
+**RESULT — it does NOT arrest the truncation.** Run
+`logs/HPRL-AutoHint-Olmo-3-7B-Instruct-SFT-dapo-20260714-000914` (dapo-512, FRESH start, 82 steps,
+`max_turn_tokens=4096`, `max_response_length=28000`, whole_turn, normalize, `P_over=0.1`,
+`overlong_penalty_type=value`, `lr_scheduler_type=constant`). Mode confirmed LIVE:
+`overlong_value_mode=1.0` every step, `overlong_rows`≈79/step, `overlong_tokens`≈325k/step. Yet per-turn
+truncation = **18.15%** (7621/41984; 100% per-turn, global=0; reconstruction validated EXACT against
+`hprl/turn_truncated` at every step) and RISING: 16.6% → 18.8% → 19.0% (early/mid/late thirds). Turn mix
+t1 37.2% / t2 43.6% / t3 12.4% (t1+t2 = 80.8%). Telling split: **turn-1 rate FALLS 7.5→5.8% while turn-2
+rate RISES 5.7→9.8%** — the penalty bites where the truncated turn IS the whole rollout, and the inflation
+migrates to the hinted turns. (vs the 20260705 post_hoc run: 15.6%, t1-dominant — NOT a clean A/B, that
+one forked a mid-training ckpt, this one is fresh.)
+
+**Why — the root cause is not the penalty, it is a length-POSITIVE reward (GRPO baseline).**
+`logs/GRPO-Olmo-3-7B-Instruct-SFT-dapo-512-20260704-172025` is single-turn (`multi_turn.enable=False`) at
+the SAME 4096 budget with reward `{correct_reward:0.9, format_reward:0.1, incorrect_reward:0.0}` — **no
+over-long penalty of any kind** — and resolves length for free: `clip_ratio` 5.3% → ~0% (3% late),
+`response_length/mean` 857 → ~590. Its reward is length-neutral and **success-GATED**: extra tokens have
+no upside, only truncation risk, so the optimum is "solve as concisely as possible" and length collapses.
+step_adv's reward is the opposite — it pays for the STATE reached (`V[se]−V[ss]`, `V` monotone), and
+reaching a higher state costs tokens, **including on rollouts that ultimately FAIL**. Two failing
+rollouts: GRPO scores both `0.0` (ties them — no length signal); step_adv scores the one that got further
+HIGHER, i.e. pays for its extra tokens. Measured: step-adv all-turn mean length 789 → 1361, first-turn p90
+2703 → 3934, incorrect first-turn p90 = 4096 (AT the cap), incorrect rows lengthen (×1.17) and reach
+higher states (0.25→0.29); GRPO's incorrect rows do NOT lengthen (×1.05) and its correct rows COMPRESS
+(×0.60). Note step-adv accuracy is HIGHER (32→57% vs GRPO 2→12%) — it is not truncating because it fails
+more. Same root in entropy: GRPO 0.594→0.278 (−0.264 over its first 82 steps) vs step-adv 0.628→0.582
+(−0.046) — a broad partial-progress target never concentrates the policy, and with `normalize` + hints
+(`groups_zeroed→0`) every group keeps emitting a unit-scale gradient, so nothing anneals. GRPO's own late
+3% is the signature of a success-gated coupling: drifts up with accuracy, then plateaus, because failed
+length is never paid.
+
+**Fix direction (next; supersedes "bigger / graded penalty").** A truncation-boundary penalty of ANY
+shape (post_hoc, value, or the still-unbuilt `L_buffer` ramp) only touches tokens AT the cap, while the
+inflation lives in the 500→3000-token body BELOW it, where progress is bought with free tokens. Make the
+progress credit length-aware instead — fix the turn's TOTAL credit and charge for the tokens:
+
+    A'_j = A_turn / L_turn − λ      ⟹   Σ_{j∈turn} A'_j = A_turn − λ·L_turn
+
+so reaching `se` pays `A_turn` regardless of how many tokens it took (genuine progress still rewarded,
+B-at-state-2 still beats A-at-state-0) and every token costs `λ` → the shortest path to each state wins;
+a padding token adds 0 to `A_turn` and −λ to the cost. NB a FLAT `A_j − λ` is NOT sufficient under
+`whole_turn`+`token-mean`: the positive part scales with `L` too, so any turn with `A_turn > λ` still
+profits from padding. Keep the overlong knobs as off-by-default — they are symptom-level.
+
+### Files touched
+- `step_advantage.py` — `compute_state_values(..., trunc_counts=None, overlong_penalty=0.0)` (the `−T_k·P_over/D_k` term); `assign_row_advantages(..., overlong_penalty=0.0, row_truncated=False)` (`−P_over` on the LAST segment's `r_se`; both modes); `apply_step_level_advantages(..., overlong_penalty_type="post_hoc")` — mode routing, per-group `trunc_counts`, post-hoc block gated; `step_adv/overlong_value_mode` stat; module header + docstrings
+- `hprl_ray_trainer.py` — read `step_adv.overlong_penalty_type`, pass through, log `ov=%s(rows=%d)`
+- `config/hprl_trainer.yaml` — `overlong_penalty_type: post_hoc` + doc
+- `run_hprl_qwen2.5_7b.sh` — `HPRL_OVERLONG_PENALTY_TYPE` env (default `post_hoc`) + job arg
+- `run_auto_hint_olmo3_7b_instruct.sh` — export knob + echo (`overlong_type=`)
+- `test_auto_hint.py` — `test_apply_step_level_advantages_overlong_value_mode`
+
 ## 2026-07-05 — auto-hint step-adv: WHOLE-TURN advantage mode (score each turn as one macro-action, boundary-free) — flag-gated
 
 A second step-adv scoring mode, alternative to the `a_C`/`a_I` per-segment SPLIT (2026-06-25).

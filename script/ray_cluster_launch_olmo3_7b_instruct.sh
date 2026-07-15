@@ -89,7 +89,7 @@ done
 # waited for. Otherwise that script falls back to its own NNODES default and can
 # tell verl a different trainer.nnodes than the cluster actually has (e.g. 6 pods
 # join Ray but verl claims 4 -> 2 nodes idle).
-export NNODES=${NNODES:-${WORLD_SIZE:-4}}
+export NNODES=${NNODES:-${WORLD_SIZE:-2}}
 export N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8265}
 NODE_WAIT_TIMEOUT=${NODE_WAIT_TIMEOUT:-180}   # minutes

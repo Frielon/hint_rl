@@ -480,6 +480,54 @@ def test_apply_step_level_advantages_overlong_penalty():
     assert abs(float(ov.std()) - 1.0) < 1e-6         # still unit std after normalize
 
 
+def test_apply_step_level_advantages_overlong_value_mode():
+    # VALUE mode: fold the P_over surcharge into the VALUE recursion (a truncated-at-k rollout's
+    # failed reward is r_k - P_over) instead of the post-hoc tail subtraction. That LOWERS V[0]
+    # and -- with no mean-centering -- LIFTS every NON-truncated row at state 0 by +T_0*P_over/D_0
+    # (a concise-but-wrong within-length turn goes from ~0 to POSITIVE), while the
+    # non-truncate<->truncate gap stays exactly P_over. Contrast: post_hoc moves ONLY the
+    # truncated row. Group (K=5, _P5): a solve anchors V, one truncated-at-0 row, one concise-
+    # wrong-at-0 within-length row. D_0=3, T_0=1  ->  lift = P_over/3.
+    Lseq = 12
+    turns = [
+        [[0, 6, 6, 0, 5, 0]],     # row0: correct solve  -> group SCORED
+        [[0, 0, 6, 0, 0, 1]],     # row1: truncated-at-0  (turn_truncated=1)
+        [[0, 3, 6, 0, 0, 1]],     # row2: concise-WRONG-at-0, WITHIN length (turn_truncated=0)
+    ]
+    correct = [True, False, False]
+    tt = [0, 1, 0]
+    Pov = 0.5
+    lift = Pov / 3.0                                   # +T_0*P_over/D_0
+    a0 = np.zeros((3, Lseq))                           # baseline: overlong off
+    apply_step_level_advantages(a0, a0.copy(), np.ones((3, Lseq)), ["g"] * 3, turns,
+                                correct, [_P5] * 3, [5] * 3)
+    av = np.zeros((3, Lseq))                           # value mode
+    _, rv, sv = apply_step_level_advantages(
+        av, av.copy(), np.ones((3, Lseq)), ["g"] * 3, turns, correct, [_P5] * 3, [5] * 3,
+        overlong_penalty=Pov, overlong_penalty_type="value", turn_truncated_per_row=tt,
+    )
+    ap = np.zeros((3, Lseq))                           # post_hoc mode (contrast)
+    apply_step_level_advantages(
+        ap, ap.copy(), np.ones((3, Lseq)), ["g"] * 3, turns, correct, [_P5] * 3, [5] * 3,
+        overlong_penalty=Pov, overlong_penalty_type="post_hoc", turn_truncated_per_row=tt,
+    )
+    # (a) NON-truncated rows lifted by T_0*P_over/D_0 (the solve prefix and row2's failed tail);
+    #     row2's within-length wrong tail flips from negative to POSITIVE -- the point of value.
+    assert np.allclose(av[0, 0:6], a0[0, 0:6] + lift)
+    assert np.allclose(av[2, 3:6], a0[2, 3:6] + lift)
+    assert av[2, 3] > 0 > a0[2, 3]
+    # (b) the non-truncate<->truncate gap at state 0 is exactly P_over (co-truncation-proof),
+    #     and the truncated row is NOT the naive post_hoc a0-P_over.
+    assert np.allclose(av[2, 3:6] - av[1, 3:6], Pov)
+    assert not np.allclose(av[1, 0:6], a0[1, 0:6] - Pov)
+    # (c) post_hoc moves ONLY the truncated row (naive -P_over); leaves row2 at its ~0/neg value.
+    assert np.allclose(ap[1, 0:6], a0[1, 0:6] - Pov)
+    assert np.allclose(ap[2, 3:6], a0[2, 3:6]) and av[2, 3] > ap[2, 3]
+    # stats flag the mode + count the row; returns stay mirrored.
+    assert sv["step_adv/overlong_value_mode"] == 1.0 and sv["step_adv/overlong_rows"] == 1.0
+    assert np.allclose(rv, av)
+
+
 def test_classify_length_cut_per_turn_vs_global():
     # cap off (max_turn_tokens=0) -> only the global ceiling matters.
     assert classify_length_cut(100, 0, 200) is None            # EOS early

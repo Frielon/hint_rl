@@ -432,6 +432,7 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
         scale = float(sa.get("adv_scale", 1.0))
         normalize = _truthy(sa.get("normalize", False))
         overlong = float(sa.get("overlong_penalty", 0.0))
+        overlong_type = str(sa.get("overlong_penalty_type", "post_hoc"))
         whole_turn = _truthy(sa.get("whole_turn", False))
         # GRPO sets returns == advantages (same tensor); fall back to advantages if absent.
         returns_t = bb["returns"] if "returns" in bb.keys() else bb["advantages"]
@@ -439,13 +440,14 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
             bb["advantages"], returns_t, bb["response_mask"], list(uids),
             turns_per_row, correct_per_row, penalty_per_row, K_per_row,
             terminal_value=tv, zero_if_no_correct=zinc, adv_scale=scale, normalize=normalize,
-            overlong_penalty=overlong, turn_truncated_per_row=turn_truncated_per_row,
+            overlong_penalty=overlong, overlong_penalty_type=overlong_type,
+            turn_truncated_per_row=turn_truncated_per_row,
             whole_turn=whole_turn,
         )
         stats.update(mstats)
         logger.warning(
             "[HPRL step=%s] step-adv: groups=%d scored=%d zeroed=%d rows=%d tokens=%d "
-            "pos=%.4f neg=%.4f V0=%.4f gstd=%.4f nfac=%.2f cite=%.3f wt=%d",
+            "pos=%.4f neg=%.4f V0=%.4f gstd=%.4f nfac=%.2f cite=%.3f wt=%d ov=%s(rows=%d)",
             self.global_steps,
             int(mstats["step_adv/groups_total"]), int(mstats["step_adv/groups_scored"]),
             int(mstats["step_adv/groups_zeroed"]), int(mstats["step_adv/rows_scored"]),
@@ -454,6 +456,7 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
             mstats["step_adv/value_s0_mean"], mstats["step_adv/group_std_mean"],
             mstats["step_adv/norm_factor_mean"], stats.get("auto_hint/cite_found_rate", 0.0),
             int(whole_turn),
+            (overlong_type if overlong > 0.0 else "off"), int(mstats["step_adv/overlong_rows"]),
         )
         return stats
 

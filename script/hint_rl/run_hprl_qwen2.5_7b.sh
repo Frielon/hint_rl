@@ -156,6 +156,15 @@ HPRL_STEP_ADV_NORM=${HPRL_STEP_ADV_NORM:-false}
 # widespread. Raw units (~total_penalty/K); ~0.1 lands near unit scale after normalize.
 # SCORED groups only (no-correct/all-truncate groups stay zeroed). 0 = off (default).
 HPRL_OVERLONG_PENALTY=${HPRL_OVERLONG_PENALTY:-0}
+# Overlong penalty ROUTING (auto-hint + step-adv; only matters when HPRL_OVERLONG_PENALTY > 0):
+#   post_hoc (default) -- subtract P_over from each per-turn-cap truncation tail AFTER the
+#     advantage is assigned (the original behavior); only the truncated rows move down.
+#   value -- fold P_over into the VALUE recursion instead (truncated-at-k rollouts carry reward
+#     r_k - P_over), lowering V[k] so every NON-truncated rollout anchored there is LIFTED to a
+#     POSITIVE advantage -- a "do the within-length thing" reward, not just a "don't truncate"
+#     push; the non-truncate<->truncate gap stays a co-truncation-proof P_over. Keep P_over small
+#     (it also positively reinforces a concise-but-wrong first turn).
+HPRL_OVERLONG_PENALTY_TYPE=${HPRL_OVERLONG_PENALTY_TYPE:-post_hoc}
 # WHOLE-TURN step-adv (auto-hint + step-adv). Score each turn with ONE advantage --
 # A = V[s_end] + hint_penalty - V[s_start] (= r_se + V[se+1] - V[ss] for a failed turn,
 # V[se] - V[ss] otherwise) -- instead of the verified-prefix a_C / failed-tail a_I split.
@@ -504,6 +513,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     data.hprl.auto_hint.step_adv.adv_scale=${HPRL_STEP_ADV_SCALE} \
     data.hprl.auto_hint.step_adv.normalize=${HPRL_STEP_ADV_NORM} \
     data.hprl.auto_hint.step_adv.overlong_penalty=${HPRL_OVERLONG_PENALTY} \
+    data.hprl.auto_hint.step_adv.overlong_penalty_type=${HPRL_OVERLONG_PENALTY_TYPE} \
     data.hprl.auto_hint.step_adv.whole_turn=${HPRL_STEP_ADV_WHOLE_TURN} \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
@@ -543,7 +553,8 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     +actor_rollout_ref.model.override_config.resid_pdrop=0. \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+    actor_rollout_ref.actor.optim.lr_warmup_steps=1 \
+    actor_rollout_ref.actor.optim.lr_scheduler_type=${HPRL_LR_SCHEDULER:-constant} \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.fsdp_config.param_offload=${offload} \

@@ -67,9 +67,9 @@ conda activate "${CONDA_ENV}"
 # count that disagrees with the requested split fails at launch, not mid-run.
 # If TRAIN_NNODES is unset it is derived as WORLD_SIZE - SELECTOR_NNODES (the
 # original behavior); if WORLD_SIZE is unset it is derived as the sum.
-SELECTOR_NNODES=${SELECTOR_NNODES:-4}
+SELECTOR_NNODES=${SELECTOR_NNODES:-2}
 if [ -z "${TRAIN_NNODES:-}" ]; then
-    TRAIN_NNODES=$(( ${WORLD_SIZE:-8} - SELECTOR_NNODES ))
+    TRAIN_NNODES=$(( ${WORLD_SIZE:-2} - SELECTOR_NNODES ))
 fi
 WORLD_SIZE=${WORLD_SIZE:-$((TRAIN_NNODES + SELECTOR_NNODES))}
 if [ "$((TRAIN_NNODES + SELECTOR_NNODES))" -ne "${WORLD_SIZE}" ]; then

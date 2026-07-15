@@ -228,6 +228,17 @@ data:
         # scaled into the group's unit range (~penalty/K, so ~0.1 lands near unit). SCORED
         # groups only -- no-correct / all-truncate groups stay zeroed (unchanged).
         overlong_penalty: 0.0
+        # overlong penalty ROUTING (only matters when overlong_penalty > 0):
+        #   post_hoc (default) -- subtract P_over from each truncation tail AFTER the advantage
+        #     is assigned (the original behavior); only the truncated rows move (down), the
+        #     non-truncated rows stay ~0.
+        #   value -- fold P_over into the VALUE recursion instead (truncated-at-k rollouts carry
+        #     reward r_k - P_over), lowering V[k] so -- with no mean-centering -- every
+        #     non-truncated row anchored at k is LIFTED to a POSITIVE advantage (+T_k*P_over/D_k),
+        #     turning length into a "do the within-length thing" reward rather than only a "don't
+        #     truncate" push; the non-truncate<->truncate gap stays a co-truncation-proof P_over.
+        #     (Also reinforces a concise-but-WRONG first turn, so keep P_over small.)
+        overlong_penalty_type: post_hoc
         # WHOLE-TURN advantage: don't split a turn into the verified prefix (a_C) and the
         # failed tail (a_I); score the ENTIRE turn with a SINGLE value
         #   A = V[s_end] + hint_penalty - V[s_start]

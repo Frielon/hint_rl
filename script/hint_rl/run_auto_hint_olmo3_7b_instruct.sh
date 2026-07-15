@@ -114,6 +114,13 @@ export HPRL_STEP_ADV_NORM=${HPRL_STEP_ADV_NORM:-true}
 # collapses to ~0 once a group co-truncates. ~0.1 lands near unit scale after normalize;
 # 0 = off. Full rationale in run_hprl_qwen2.5_7b.sh / devlog 2026-07-01.
 export HPRL_OVERLONG_PENALTY=${HPRL_OVERLONG_PENALTY:-0.1}
+# Overlong penalty ROUTING (only matters when HPRL_OVERLONG_PENALTY > 0):
+#   post_hoc (default) -- subtract P_over from the truncation tail AFTER the advantage (original).
+#   value -- fold P_over into the value recursion so NON-truncated rollouts get a POSITIVE
+#     advantage lift (not just the truncated ones a penalty); the non-truncate<->truncate gap
+#     stays a co-truncation-proof P_over. Rationale in run_hprl_qwen2.5_7b.sh / step_advantage.py.
+# Set HPRL_OVERLONG_PENALTY_TYPE=value to try the value-integrated penalty.
+export HPRL_OVERLONG_PENALTY_TYPE=${HPRL_OVERLONG_PENALTY_TYPE:-value}
 # WHOLE-TURN advantage mode: score each turn with a SINGLE value
 #   A = V(s_end) + hint_penalty - V(s_start)
 # = r_se + V[se+1] - V[ss] for a FAILED turn (== a_C + a_I telescoped), V[se] - V[ss] for a
@@ -122,6 +129,14 @@ export HPRL_OVERLONG_PENALTY=${HPRL_OVERLONG_PENALTY:-0.1}
 # turn is reinforced/penalized together. Default OFF (the a_C/a_I split runs); set
 # HPRL_STEP_ADV_WHOLE_TURN=true to enable this mode.
 export HPRL_STEP_ADV_WHOLE_TURN=${HPRL_STEP_ADV_WHOLE_TURN:-true}
+
+# --- actor LR schedule: CONSTANT (no decay) -----------------------------------
+# Pin the actor optimizer to a CONSTANT learning rate (flat at optim.lr after the warmup
+# steps) rather than leaving lr_scheduler_type at verl's default. Maps to
+# actor_rollout_ref.actor.optim.lr_scheduler_type in run_hprl_qwen2.5_7b.sh. The 10 warmup
+# steps (lr_warmup_steps, set in the launcher) still ramp lr up first; the schedule is then
+# flat -- no cosine decay. Set HPRL_LR_SCHEDULER=cosine (etc.) to override.
+export HPRL_LR_SCHEDULER=${HPRL_LR_SCHEDULER:-constant}
 
 # --- PER-TURN generation-length cap -------------------------------------------
 # 0 = off: only the global max_response_length bounds generation, which on its own
@@ -170,5 +185,5 @@ echo "[run_auto_hint] auto-hint mode ON  (model=${MODEL_PATH})"
 echo "[run_auto_hint]   TRAIN_FILE=${TRAIN_FILE}"
 echo "[run_auto_hint]   resume_from=${RESUME_FROM_PATH:-<fresh>}"
 echo "[run_auto_hint]   strategy=${HINT_STRATEGY} call_reward=${HINT_CALL_REWARD} shape=${HINT_SHAPE_COEFF} kpack=${HPRL_KPACK_ENABLE} ratchet=${HPRL_RATCHET_MODE} allow_decrease=${HPRL_ALLOW_DECREASE}"
-echo "[run_auto_hint]   step_adv=${HPRL_STEP_ADV} step_adv_scale=${HPRL_STEP_ADV_SCALE} step_adv_norm=${HPRL_STEP_ADV_NORM} whole_turn=${HPRL_STEP_ADV_WHOLE_TURN} overlong_penalty=${HPRL_OVERLONG_PENALTY} guidance_free=${HINT_GUIDANCE_FREE} prune_guidance=${HPRL_PRUNE_GUIDANCE} max_turn_tokens=${HPRL_MAX_TURN_TOKENS}"
+echo "[run_auto_hint]   step_adv=${HPRL_STEP_ADV} step_adv_scale=${HPRL_STEP_ADV_SCALE} step_adv_norm=${HPRL_STEP_ADV_NORM} whole_turn=${HPRL_STEP_ADV_WHOLE_TURN} overlong_penalty=${HPRL_OVERLONG_PENALTY} overlong_type=${HPRL_OVERLONG_PENALTY_TYPE} guidance_free=${HINT_GUIDANCE_FREE} prune_guidance=${HPRL_PRUNE_GUIDANCE} max_turn_tokens=${HPRL_MAX_TURN_TOKENS} lr_sched=${HPRL_LR_SCHEDULER}"
 exec bash "${SCRIPT_DIR}/run_hprl_qwen2.5_7b.sh" "$@"

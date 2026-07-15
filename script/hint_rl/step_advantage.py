@@ -59,6 +59,23 @@
 # a separate V[se]-V[ss]. The per-group value recursion, zeroing, scale/normalize and
 # overlong penalty are unchanged.
 #
+# OVERLONG PENALTY -- two modes (data.hprl.auto_hint.step_adv.overlong_penalty_type):
+#   * "post_hoc" (default): AFTER the advantages are assigned, subtract an absolute P_over
+#     from each per-turn-cap TRUNCATION tail. Restores a floor the value-based a_I loses as a
+#     group co-truncates (a_I = penalty*(fc/d - 1) -> 0 when fc/d -> 1). Only the truncated
+#     rows move (down); every other row is untouched (so the non-truncate rows stay ~0).
+#   * "value": fold the surcharge into the VALUE recursion instead -- a truncated rollout's
+#     failed-step reward at its truncation state k is r_k - P_over, so
+#         V[k] = V[k+1] + (F_k*r_k - T_k*P_over) / D_k      (T_k = #truncated-at-k <= F_k)
+#     which LOWERS V[k] (and every state below it). With NO mean-centering that LIFTS every
+#     non-truncated rollout anchored at state k to a POSITIVE advantage (+T_k*P_over/D_k),
+#     while the non-truncate<->truncate gap stays a stable P_over that does NOT collapse as
+#     the group co-truncates. Turns the length signal into a "do the within-length thing"
+#     reward, not only a "don't truncate" push. (Trade-off: it also positively reinforces a
+#     concise-but-WRONG first turn -- keep P_over small.)
+# Both modes are SCORED-groups-only: a no-correct group is already zeroed, so it gets NO
+# length penalty either way.
+#
 # ALL-INCORRECT groups get ZERO advantage everywhere (no gradient): without a single
 # solve the V[K]=1 anchor is unreached and the positive a_C pulls would chase a goal
 # nobody hit. (data.hprl.auto_hint.step_adv.zero_if_no_correct, default true.)
@@ -125,6 +142,8 @@ def compute_state_values(
     K: int,
     *,
     terminal_value: float = 1.0,
+    trunc_counts: Sequence[int] | None = None,
+    overlong_penalty: float = 0.0,
 ) -> list:
     """Backward value recursion V[0..K] over a problem's N rollouts.
 
@@ -134,9 +153,16 @@ def compute_state_values(
         penalty_vec: per-hint penalty WEIGHTS p[0..K-1] (>= 0); r_k = -p_k.
         K: number of hints in the pool (states are 0..K).
         terminal_value: V[K] (default 1.0).
+        trunc_counts: VALUE-mode overlong (see the module header). ``trunc_counts[k]`` = T_k =
+            #rollouts whose per-turn-cap TRUNCATION happened at state k (a subset of F_k). None
+            (or ``overlong_penalty == 0``) -> the plain recursion (post-hoc / no overlong).
+        overlong_penalty: P_over surcharge added to each truncated rollout's failed-step reward
+            (r_k -> r_k - P_over) when ``trunc_counts`` is given, so it enters V BEFORE the
+            advantage: ``V[k] = V[k+1] + (F_k*r_k - T_k*P_over) / D_k``.
 
     Returns:
-        list V of length K+1. V[k] <= V[k+1] (non-decreasing toward the goal).
+        list V of length K+1. V[k] <= V[k+1] (non-decreasing toward the goal); a value-mode
+        overlong only lowers it further at/below the truncation states.
     """
     V = [0.0] * (K + 1)
     if K < 0:
@@ -148,19 +174,23 @@ def compute_state_values(
         for k in fs:
             if 0 <= k < K:
                 fail_count[k] += 1
+    L = float(overlong_penalty)
     for k in range(K - 1, -1, -1):
         # D_k = #rollouts that reached state k (V_i >= k) = took transition k->k+1.
         d_k = sum(1 for v in final_states if v >= k)
-        if d_k > 0 and fail_count[k] > 0:
+        # T_k = #truncated-at-k (value-mode overlong): each carries an extra -P_over reward.
+        t_k = int(trunc_counts[k]) if (trunc_counts is not None and k < len(trunc_counts)) else 0
+        if d_k > 0 and (fail_count[k] > 0 or t_k > 0):
             r_k = -float(penalty_vec[k]) if k < len(penalty_vec) else 0.0
-            V[k] = V[k + 1] + (fail_count[k] * r_k) / d_k
+            V[k] = V[k + 1] + (fail_count[k] * r_k - t_k * L) / d_k
         else:
             V[k] = V[k + 1]
     return V
 
 
 def assign_row_advantages(
-    adv_row, returns_row, turns, V, penalty_vec, K, *, adv_scale: float = 1.0, whole_turn: bool = False
+    adv_row, returns_row, turns, V, penalty_vec, K, *, adv_scale: float = 1.0, whole_turn: bool = False,
+    overlong_penalty: float = 0.0, row_truncated: bool = False,
 ) -> dict:
     """Overwrite one rollout's per-token advantage from its turn segments (IN PLACE).
 
@@ -183,6 +213,13 @@ def assign_row_advantages(
     the columns of ``adv_row``. ``adv_scale`` multiplies every assigned advantage (a
     uniform gradient-magnitude knob; 1.0 == the raw value-based advantage). Returns
     scalar tallies for logging.
+
+    ``row_truncated`` / ``overlong_penalty`` (VALUE-mode overlong, see the module header):
+    when the row ended on a per-turn-cap TRUNCATION, its LAST turn segment failed its step
+    while running over length, so that segment's reward is charged an extra ``-overlong_penalty``
+    (r_se -> r_se - P_over). Paired with the ``T_k`` term in ``compute_state_values`` this keeps
+    the whole-turn/a_I telescoping exact. No-op unless both are set (post-hoc mode passes
+    neither -- its P_over is subtracted by the caller AFTER this).
     """
     seq_len = int(adv_row.shape[0])
     adv_row[:] = 0.0
@@ -191,6 +228,8 @@ def assign_row_advantages(
     neg_sum = 0.0
     n_pos = 0
     n_neg = 0
+    n_turns = len(turns)
+    L = float(overlong_penalty)
 
     def _tally(a_val, n):
         nonlocal n_tok, pos_sum, neg_sum, n_pos, n_neg
@@ -202,13 +241,17 @@ def assign_row_advantages(
             neg_sum += a_val * n
             n_neg += n
 
-    for t in turns:
+    for ti, t in enumerate(turns):
         ts, b, te, ss, se, is_fail = (int(t[0]), int(t[1]), int(t[2]), int(t[3]), int(t[4]), int(t[5]))
         ss = max(0, min(K, ss))
         se = max(0, min(K, se))
         ts = max(0, min(seq_len, ts))
         b = max(0, min(seq_len, b))
         te = max(0, min(seq_len, te))
+        # value-mode overlong: the truncation is the row's LAST segment; charge its failed
+        # step an extra -P_over so the surcharge rides V / the telescoping (not a post-hoc
+        # subtract). Pairs with the T_k term in compute_state_values.
+        trunc_here = bool(row_truncated) and L > 0.0 and ti == n_turns - 1
         if whole_turn:
             # ONE value over the whole turn [ts, te): the failed turn (its generation plus
             # the hint the loop injects) carries the rollout from S_ss to S_{se+1}, earning
@@ -216,6 +259,8 @@ def assign_row_advantages(
             # ss -> se with no hint. Boundary is unused (so no fuzzy-prefix dependence).
             if is_fail and se < K:
                 r_se = -float(penalty_vec[se]) if se < len(penalty_vec) else 0.0
+                if trunc_here:
+                    r_se -= L
                 a_val = float(r_se + V[se + 1] - V[ss]) * adv_scale
             else:
                 a_val = float(V[se] - V[ss]) * adv_scale
@@ -232,6 +277,8 @@ def assign_row_advantages(
         # a_I: failed-step tail (only when the turn FAILED a hint that exists).
         if is_fail and se < K and te > b:
             r_se = -float(penalty_vec[se]) if se < len(penalty_vec) else 0.0
+            if trunc_here:
+                r_se -= L
             a_i = float(r_se + V[se + 1] - V[se]) * adv_scale
             adv_row[b:te] = a_i
             _tally(a_i, te - b)
@@ -296,6 +343,7 @@ def apply_step_level_advantages(
     adv_scale: float = 1.0,
     normalize: bool = False,
     overlong_penalty: float = 0.0,
+    overlong_penalty_type: str = "post_hoc",
     turn_truncated_per_row: Sequence[Any] | None = None,
     whole_turn: bool = False,
 ) -> tuple[Any, Any, dict]:
@@ -325,16 +373,22 @@ def apply_step_level_advantages(
     (see the module header). Everything else (values, zeroing, scale/normalize, overlong
     penalty) is identical; only the per-row token assignment changes.
 
-    ``overlong_penalty`` (P_over, raw units, 0 = off): subtract this ABSOLUTE value from
-    every per-turn-cap TRUNCATION tail (rows with ``turn_truncated_per_row[i]`` truthy;
-    the truncation is the row's LAST turn segment) BEFORE the per-group std/normalize.
-    The value-based tail is ``a_I = penalty[se]*(fc/d - 1)``, which collapses toward 0 as
-    a group co-truncates (``fc/d -> 1``) -- so the value machinery cannot punish truncation
-    once it is the group norm. Subtracting an absolute P_over restores a floor that survives
-    that collapse, and because it is applied BEFORE the std it is scaled INTO the group's
-    unit range (raw ~penalty/K, so ~0.1 lands near unit after normalize). Only SCORED groups
-    reach this point (no-correct groups are already zeroed + skipped above), so all-truncate /
-    no-correct groups get NO penalty by construction.
+    ``overlong_penalty`` (P_over, raw units, 0 = off) + ``overlong_penalty_type`` select how the
+    per-turn-cap TRUNCATION surcharge is charged (rows with ``turn_truncated_per_row[i]`` truthy;
+    the truncation is the row's LAST turn segment). SCORED groups only either way -- no-correct
+    groups are already zeroed + skipped above, so all-truncate / no-correct groups get NO penalty.
+
+    * ``"post_hoc"`` (default): subtract P_over from each truncation tail AFTER the advantages
+      are assigned, BEFORE the per-group std/normalize. The value-based tail
+      ``a_I = penalty[se]*(fc/d - 1)`` collapses toward 0 as a group co-truncates (``fc/d -> 1``),
+      so the value machinery cannot punish truncation once it is the group norm; the absolute
+      P_over restores a floor that survives that collapse, and applied pre-std it is scaled INTO
+      the group's unit range (~penalty/K, so ~0.1 lands near unit). Only the truncated rows move.
+    * ``"value"``: fold P_over into the VALUE recursion instead (T_k truncated-at-k carry
+      reward r_k - P_over), lowering ``V[k]`` and -- with no mean-centering -- LIFTING every
+      non-truncated row anchored at k to a positive advantage (+T_k*P_over/D_k) while the
+      non-truncate<->truncate gap stays a stable P_over. No post-hoc subtraction runs. See the
+      module header for the full rationale / trade-off.
     """
     n_rows = int(advantages.shape[0])
     groups: dict[Any, list] = {}
@@ -355,6 +409,13 @@ def apply_step_level_advantages(
     norm_factor_sum = 0.0
     ov_rows = 0
     ov_tokens = 0
+
+    # overlong penalty routing: "post_hoc" subtracts P_over from truncation tails after the
+    # advantages are assigned; "value" folds it into the value recursion (see docstring).
+    _mode = str(overlong_penalty_type or "post_hoc").lower()
+    _ov_on = float(overlong_penalty) > 0.0 and turn_truncated_per_row is not None
+    value_overlong = _ov_on and _mode == "value"
+    posthoc_overlong = _ov_on and _mode != "value"
 
     for _uid, idxs in groups.items():
         # pool size / penalty vector are the same across a group; take the row with
@@ -388,8 +449,25 @@ def apply_step_level_advantages(
             fails = [int(t[4]) for t in turns if int(t[5]) and int(t[4]) < K]
             fail_states_list.append(fails)
 
+        # VALUE-mode overlong: T_k = #rollouts truncated at state k (their last-turn se).
+        # Folded into the recursion so the surcharge lowers V[k] and LIFTS the non-truncated
+        # rows anchored there (vs the post-hoc tail subtraction further below).
+        trunc_counts = None
+        if value_overlong:
+            trunc_counts = [0] * K
+            for i in idxs:
+                if not turn_truncated_per_row[i]:
+                    continue
+                trow = turns_per_row[i] or []
+                if not trow:
+                    continue
+                s_tr = int(trow[-1][4])
+                if 0 <= s_tr < K:
+                    trunc_counts[s_tr] += 1
         V = compute_state_values(
-            final_states, fail_states_list, pvec, K, terminal_value=terminal_value
+            final_states, fail_states_list, pvec, K, terminal_value=terminal_value,
+            trunc_counts=trunc_counts,
+            overlong_penalty=(float(overlong_penalty) if value_overlong else 0.0),
         )
         v0_sum += V[0]
         n_scored_groups += 1
@@ -402,9 +480,12 @@ def apply_step_level_advantages(
         g_np = 0
         g_nn = 0
         for i in idxs:
+            row_tr = bool(value_overlong and turn_truncated_per_row[i])
             tally = assign_row_advantages(
                 advantages[i], returns[i], (turns_per_row[i] or []), V, pvec, K,
                 adv_scale=1.0, whole_turn=whole_turn,
+                overlong_penalty=(float(overlong_penalty) if row_tr else 0.0),
+                row_truncated=row_tr,
             )
             g_tokens += tally["tokens"]
             g_pos += tally["pos_sum"]
@@ -412,13 +493,25 @@ def apply_step_level_advantages(
             g_np += tally["n_pos"]
             g_nn += tally["n_neg"]
             n_scored_rows += 1
+            # value-mode overlong bookkeeping (parity with the post-hoc counters): the last
+            # (truncated) segment carried the surcharge INSIDE the value/advantage above.
+            if row_tr:
+                trow = turns_per_row[i] or []
+                if trow:
+                    seq_len_i = int(advantages[i].shape[0])
+                    b_i = max(0, min(seq_len_i, int(trow[-1][1])))
+                    te_i = max(0, min(seq_len_i, int(trow[-1][2])))
+                    if te_i > b_i:
+                        ov_rows += 1
+                        ov_tokens += (te_i - b_i)
 
-        # over-turn-length penalty: subtract an absolute P_over from each per-turn-cap
+        # POST-HOC over-turn-length penalty: subtract an absolute P_over from each per-turn-cap
         # truncation tail (the row's LAST segment) BEFORE the std/normalize below, so it is
         # read into the group std and scaled with the rest -- and, unlike the value-based
         # a_I, it does NOT ride the fc/d brake, so it survives a co-truncating group. Scored
         # groups only (no-correct groups already `continue`d), honoring "no penalty there".
-        if overlong_penalty > 0.0 and turn_truncated_per_row is not None:
+        # Skipped in "value" mode (the surcharge is already inside V / the advantage above).
+        if posthoc_overlong:
             for i in idxs:
                 if not turn_truncated_per_row[i]:
                     continue
@@ -469,5 +562,7 @@ def apply_step_level_advantages(
         "step_adv/norm_factor_mean": float(norm_factor_sum / n_scored_groups) if n_scored_groups else 0.0,
         "step_adv/overlong_rows": float(ov_rows),
         "step_adv/overlong_tokens": float(ov_tokens),
+        # 1 = "value" mode folded P_over into V; 0 = post-hoc tail subtraction (or overlong off).
+        "step_adv/overlong_value_mode": float(1.0 if value_overlong else 0.0),
     }
     return advantages, returns, stats
