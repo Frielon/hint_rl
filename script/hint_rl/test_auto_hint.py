@@ -656,6 +656,104 @@ def test_guidance_free_zeros_x0_and_preserves_total():
     assert abs(free["2.1"] - (base["2.0"] + base["2.1"])) < 1e-9
 
 
+# --------------------------------------------------------------------------- #
+# trainer-side step-adv penalty plumbing (hprl_ray_trainer). These import verl
+# transitively, so they SKIP (loudly) where it is absent; in the verl conda env
+# they run for real.
+# --------------------------------------------------------------------------- #
+
+def _import_hprl_trainer():
+    try:
+        from hprl_ray_trainer import HPRLRayPPOTrainer  # noqa: PLC0415
+        return HPRLRayPPOTrainer
+    except Exception as e:  # noqa: BLE001 -- verl not installed in this env
+        print(f"  (skipped: hprl_ray_trainer unimportable outside the verl env: {e})")
+        return None
+
+
+def test_step_adv_penalty_cfg_reads_migrated_reward_node():
+    """Regression: verl's migrate_legacy_reward_impl MOVES custom_reward_function to
+    reward.custom_reward_function and deletes the top-level node. The trainer read only
+    the legacy location, so every step-adv run priced r(h) with the code defaults
+    (1.8/'moderate'/guidance_free=False) instead of the launch kwargs. The getter must
+    read the migrated node first, keep the legacy one as a fallback, and only then
+    fall back to the code defaults."""
+    trainer_cls = _import_hprl_trainer()
+    if trainer_cls is None:
+        return
+    from hint_penalty import DEFAULT_GUIDANCE_DIFFICULTY, DEFAULT_HARD_FACTOR, DEFAULT_TOTAL_PENALTY
+
+    kwargs = {
+        "hint_penalty_total": 1.0,
+        "hint_penalty_hard_factor": 1.5,
+        "hint_guidance_difficulty": "easy",
+        "hint_guidance_free": True,
+    }
+    # (a) the migrated (post-migrate_legacy_reward_impl) shape -- the runtime one.
+    migrated = SimpleNamespace(config={"reward": {"custom_reward_function": {"reward_kwargs": dict(kwargs)}}})
+    assert trainer_cls._step_adv_penalty_cfg(migrated) == (1.0, 1.5, "easy", True)
+    # (b) the legacy top-level shape still works (fallback).
+    legacy = SimpleNamespace(config={"custom_reward_function": {"reward_kwargs": dict(kwargs)}})
+    assert trainer_cls._step_adv_penalty_cfg(legacy) == (1.0, 1.5, "easy", True)
+    # (c) neither present -> the code defaults (guidance_free False).
+    bare = SimpleNamespace(config={})
+    assert trainer_cls._step_adv_penalty_cfg(bare) == (
+        DEFAULT_TOTAL_PENALTY, DEFAULT_HARD_FACTOR, DEFAULT_GUIDANCE_DIFFICULTY, False,
+    )
+    # (d) the migrated node WINS over a stale legacy one.
+    both = SimpleNamespace(config={
+        "reward": {"custom_reward_function": {"reward_kwargs": dict(kwargs)}},
+        "custom_reward_function": {"reward_kwargs": {"hint_penalty_total": 9.9}},
+    })
+    assert trainer_cls._step_adv_penalty_cfg(both)[0] == 1.0
+
+
+_PRUNE_POOL = {"steps": [
+    {"step_id": 1, "hints": [
+        {"hint_id": "1.0", "hint": "g1", "type": "step_guidence_hint"},
+        {"hint_id": "1.1", "hint": "a"},
+        {"hint_id": "1.2", "hint": "b"}]},
+    {"step_id": 2, "hints": [
+        {"hint_id": "2.0", "hint": "g2", "type": "step_guidence_hint"},
+        {"hint_id": "2.1", "hint": "c"}]},
+]}
+
+
+def test_step_adv_penalty_vec_matches_loop_order_under_prune():
+    """Regression: with prune_guidance on, the LOOP indexes step-adv states over the
+    PRUNED pool order (X.0 dropped -- AutoHintAgentLoop._pool), but the trainer built
+    the penalty vector from the RAW pool: every state at/after an X.0 entry read the
+    wrong hint's penalty (with guidance_free, a 0.0 -- a free failed step) and K
+    overshot the loop's terminal state. The vector must be built over the SAME pruned
+    order when the flag is on, and stay raw when it is off."""
+    trainer_cls = _import_hprl_trainer()
+    if trainer_cls is None:
+        return
+    extra_info = {
+        "tools_kwargs": {"request_hint": {"create_kwargs": {"hints": json.dumps(_PRUNE_POOL)}}},
+        "hint_full": _PENALTY_POOL,
+    }
+    # the loop-side canonical order under prune_guidance (what states index against).
+    loop_order = pending_hint_ids(prune_hint_pool(_PRUNE_POOL), [])
+    assert loop_order == ["1.1", "1.2", "2.1"]
+    pens = compute_hint_penalties(_PENALTY_POOL, total_penalty=0.8, hard_factor=1.5, guidance_free=True)
+
+    pv, K = trainer_cls._step_adv_penalty_vec(extra_info, 0.8, 1.5, "easy", True, prune_guidance=True)
+    # state-coordinate parity: same K, and state k prices exactly the loop's k-th hint.
+    assert K == len(loop_order) == 3, (K, loop_order)
+    assert pv == [pens[h] for h in loop_order], (pv, pens)
+    # every pruned state carries a REAL substep weight (no X.0 zero leaked in).
+    assert all(p > 0.0 for p in pv), pv
+    # the pruned weights still sum to the pool total (guidance share redistributed).
+    assert abs(sum(pv) - 0.8) < 1e-9
+
+    # flag off -> the raw order (back-compat for prune_guidance=false runs): K counts
+    # the X.0 entries and index 0 is the (freed) "1.0" -- the misalignment the flag-on
+    # path exists to remove.
+    pv_raw, K_raw = trainer_cls._step_adv_penalty_vec(extra_info, 0.8, 1.5, "easy", True)
+    assert K_raw == 5 and pv_raw[0] == 0.0, (K_raw, pv_raw)
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

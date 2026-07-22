@@ -15,6 +15,141 @@ _(none open — the step-level advantage calculation landed 2026-06-25; see the 
 
 # Done log
 
+## 2026-07-15 — FULLY-ASYNC training mode (disaggregated Rollouter/Trainer pools on verl `fully_async_policy`), flag-gated — new entry point + launch scripts; NOT yet cluster-validated
+
+HPRL can now train on verl's fully-async architecture: the training pods split into a ROLLOUT pool
+(vLLM replicas + the agent loops, STREAMING one prompt-group — a problem's `rollout.n` trajectories,
+one GRPO group under a shared uid — at a time into a MessageQueue) and a TRAINER pool (FSDP actor
+pulling `require_batches × ppo_mini_batch_size` groups per iteration, NCCL-pushing weights back to
+the replicas every `trigger_parameter_sync_step` iterations, sub-second for a 7B), overlapping in
+wall-clock instead of alternating. (The two step-adv pricing bugs in the entry below were found by
+this port's config-level dry run.)
+
+**Why.** The sync trainer is structurally serial AND tail-bound. Measured over all 171 steps of
+`logs/HPRL-AutoHint-Olmo-3-7B-Instruct-SFT-dapo-20260705-095232`: `gen` = **71.6%** of the 318 s
+mean step (227.6 s; update_actor 20.8%, old_log_prob 6.1%) — almost exactly the 70% verl quotes for
+DAPO-32B — and within each gen phase the slowest rollout runs **3.58×** the mean (per-rollout gen
+mean 45.9 s, max 162 s; 8.3 turns/rollout, each waiting on blocking selector calls), so finished
+GPUs idle behind one straggler. Upstream benchmarks: 2.35–2.67× (pure math 7B), **1.55–1.6×** on
+multi-turn ReTool — the closest analog to the hint loop — so ~1.5× is the realistic target here.
+
+**How the pieces map (no verl core edits — the project rule holds).**
+* Trainer: `hprl_fully_async._HPRLFullyAsyncTrainerImpl(HPRLRayPPOTrainer, <FullyAsyncTrainer body>)`
+  — a cooperative-MRO subclass. verl's async trainer inherits `RayPPOTrainer` through
+  `SeparateRayPPOTrainer`, and its `fit_step` template calls `self._update_actor(batch)` AFTER
+  merging GRPO advantages + the reward extras (`acc`/`num_hints`) into the batch — exactly the
+  contract the HPRL `_update_actor` override (verified-prefix mask / step-adv + budget ratchet) and
+  `_log_rollout_data` (raw-token dumps + hint columns) already code against, so both land UNCHANGED.
+  `fit` is re-overridden async (HPRL's sync `fit` would shadow the queue loop; it now guards k-pack
+  and delegates). Ray mechanics: an `@ray.remote`-decorated class cannot be subclassed; the
+  undecorated body is `<ActorClass>.__ray_metadata__.modified_class` (verified subclass+re-decorate
+  on ray 2.55.1) — the one private-API concession, confined to `hprl_fully_async.py`. NB ray's
+  tracing injection wraps every method (`__wrapped__`); identity checks in tests must unwrap.
+* Rollouter: runs STOCK. `HintBudgetDataset` rides `data.custom_cls` (the Rollouter builds datasets
+  via `create_rl_dataset`), the auto-hint rollout rides the per-row `agent_name` (preserved because
+  `multi_turn.enable=True` — `prepare_single_generation_data` only force-overwrites it otherwise),
+  and the streaming reward rides the same `RewardLoopManager` the sync job already used.
+* Agent loop: **zero changes.** `AutoHintAgentLoop` already accumulates `response_logprobs`
+  (padding the injected hint turns) and merges `min/max_global_steps` from the server's
+  extra_fields — exactly what `assemble_batch_from_rollout_samples` requires; and PARTIAL ROLLOUT is
+  invisible to it by design (`FullyAsyncLLMServerClient.generate` re-issues an aborted request with
+  the accumulated tokens; the per-turn `max_tokens` COPY the loop passes composes with the client's
+  decrement-on-resume).
+* Budget ratchet: crosses the actor boundary through the existing shared-FS JSON (atomic
+  `os.replace` writer on the trainer actor, mtime-cached reader in the dataset) — same mechanism as
+  sync, now with the pipeline's bounded staleness lag instead of the step boundary.
+* Off-policy correctness: trajectories train under the ROLLOUT policy's own logprobs
+  (`rollout.calculate_log_probs` + `actor.use_rollout_log_probs` +
+  `algorithm.rollout_correction.bypass_mode`, all base-config defaults), so the PPO ratio accounts
+  for the staleness; `old_log_prob` leaves the trainer's critical path entirely.
+
+**Equivalence bookkeeping.** Defaults `require_batches(1) × ppo_mini(64) × trigger(1)` = 64 prompts
+per weight sync == one sync-job step (`train_prompt_bsz=64`, mini==batch → one optimizer step), so a
+"param version" corresponds 1:1 to a sync global step: `test_freq`/`save_freq`/`total_epochs` and
+checkpoint numbering keep their meanings. Resource split default 2 trainer : 2 rollout nodes (the
+benchmarked 16:16 for a 7B multi-turn job); staleness_threshold 0.5, partial_rollout True. Rebalance
+from `fully_async/{rollouter,trainer}/idle_ratio` in wandb.
+
+**Config quirk.** verl's `fully_async_ppo_trainer.yaml` declares its own `hydra.searchpath`, which
+hydra rejects in any non-primary config — so `config/hprl_fully_async_trainer.yaml` pulls
+`ppo_trainer` directly and INLINES the async block verbatim (re-diff the upstream file on a verl
+bump). The `data.hprl` block mirrors `hprl_trainer.yaml` (keep the two in sync).
+
+**Not supported (guarded loudly at launch, `main_hprl_async._apply_hprl_async_guards` + the run
+script):** k-pack (`HPRL_KPACK_ENABLE=true` → hard error — the probe rewrites `rollout.n` and
+expands the gen batch inside the sync trainer's `_get_gen_batch`, which the queue path never runs)
+and budget-grouped sampling (forced false — streaming has no generation BATCH to keep
+budget-homogeneous; the queue absorbs the per-sample duration variance the sampler existed to
+remove).
+
+**Launch.** `TRAIN_SCRIPT=<...>/run_auto_hint_olmo3_7b_instruct_async.sh bash launch_hprl_cluster.sh`
+(the launcher itself is unchanged; selector pods unaffected — the agent loops reach them over HTTP
+exactly as before). Every auto-hint science knob in the async wrapper is IDENTICAL to the sync one.
+
+**Verification (no cluster run yet — flag honestly).** 27-check harness
+(scratch `test_async_port.py`): MRO resolution (each method unwraps to the intended
+implementation; `super()._update_actor` from HPRL lands on `RayPPOTrainer._update_actor`), full
+hydra compose with the production override set, both guards, the step-adv penalty regression;
+plus `bash -n`, `py_compile`, and an end-to-end dry run of the wrapper that assembled the complete
+`ray job submit` command and failed only at the absent local cluster. First real run should watch:
+the two idle ratios, `fully_async/count/stale_trajectory_processed` / `partial_ratio`, and
+`hprl/budget_mean` continuity vs the sync run.
+
+### Files touched (all NEW; plus the bug fixes logged separately below)
+- `hprl_fully_async.py` — the trainer/task-runner subclasses (the `__ray_metadata__.modified_class` mechanics live here)
+- `main_hprl_async.py` — async entry point (mirrors `fully_async_main.main` + the HPRL guards)
+- `config/hprl_fully_async_trainer.yaml` — ppo_trainer + inlined async defaults + the `data.hprl` mirror
+- `run_hprl_async.sh` — base run script (async fork of `run_hprl_qwen2.5_7b.sh`: node-split + `async_training.*` knobs, `train_batch_size=0`/`gen_batch_size=1`, `hybrid_engine=False`)
+- `run_auto_hint_olmo3_7b_instruct_async.sh` — the Olmo auto-hint launch wrapper (science knobs identical to the sync wrapper)
+
+## 2026-07-15 — step-adv r(h) was DECOUPLED from the reward/loop: two pricing bugs fixed (migrated reward node + pruned-order state parity)
+
+Found while porting HPRL onto verl's fully-async trainer (compose-level dry run of the launch
+config). The step-adv machinery's design invariant is that its per-hint reward `r(h)` equals the
+REWARD's per-hint penalty, indexed in the SAME pool order the LOOP used to record states. Both
+halves of that invariant were silently broken — in **every step-adv run to date**.
+
+**Bug 1 — `_step_adv_penalty_cfg` read a config node that no longer exists at runtime.** verl's
+`migrate_legacy_reward_impl` (run by `main_hprl` BEFORE the trainer is built) MOVES the launch-time
+`custom_reward_function` node to `reward.custom_reward_function` and DELETES the top-level one. The
+getter read only the legacy location → always `None` → **code defaults**
+`(total=1.8, hard_factor=1.5, guidance='moderate', guidance_free=False)` instead of the launch
+kwargs `(1.0, 1.5, 'easy', guidance_free=True)`. Under `normalize=true` the uniform 1.8→1.0 scaling
+washes out (per-group std is scale-invariant), but `guidance_free` changes the RELATIVE weights —
+X.0 hints were FREE in the reward yet PRICED in the value recursion. Fix: read the migrated node
+first, legacy as fallback (the pre-migration shape only exists in the launch argv).
+
+**Bug 2 — with `prune_guidance=true`, the trainer priced states over the UNPRUNED pool order.** The
+loop computes every recorded state (`state_start`/`state_end`, `fail_state = order.index(hid)`, and
+the solving turn's `K`) over the PRUNED order (X.0 dropped — `AutoHintAgentLoop._pool`, 2026-06-2x),
+but `_step_adv_penalty_vec` built `order = pending_hint_ids(pool, [])` from the RAW `extra_info`
+pool. `pending_hint_ids` does NOT filter X.0, so `pv[k]` was the k-th UNPRUNED hint's weight: every
+state at/after an X.0 entry read a WRONG (generally earlier) hint's penalty, and `K` overshot the
+loop's terminal state by #major-steps. The value recursion itself runs in loop (pruned) coordinates
+(`final_states`, `F_k`, `D_k` all consistent; `V` telescopes flat above the loop's max state since
+no fails land there), so the damage was confined to the r(h) ladder — scrambled per-state penalties.
+NASTY INTERACTION: fixing Bug 1 alone makes Bug 2 WORSE — `guidance_free=True` zeroes the X.0 slots
+of the unpruned vector, so a pruned state colliding with an X.0 slot reads `r = 0.0` → failing that
+hint becomes FREE (`a_I = 0`). Fix: `_step_adv_penalty_vec(..., prune_guidance=)` mirrors
+`data.hprl.auto_hint.prune_guidance` and applies `prune_hint_pool` before `pending_hint_ids` — now
+`pv == [pens[h] for h in loop_order]`, `K == len(loop_order)`, and `sum(pv) == total_penalty`
+(guidance share redistributed). Flag off → raw order, byte-identical to before.
+
+**Affected runs.** Bug 1: all step-adv runs. Bug 2: step-adv runs with `prune_guidance=true` — the
+whole Olmo campaign (wrapper defaults BOTH on: 224821, 20260705-095232, 20260714-000914). The
+2026-07-14 root-cause analysis (length-POSITIVE reward) is unaffected: V stays monotone and progress
+stays paid regardless of which weights fill the ladder; only per-state penalty magnitudes shift.
+
+**Tests** (suite 37 → **39/39**): `test_step_adv_penalty_cfg_reads_migrated_reward_node` (migrated
+shape wins over stale legacy; legacy fallback works; bare config → code defaults) and
+`test_step_adv_penalty_vec_matches_loop_order_under_prune` (pruned parity: K and per-state weights
+match the loop order exactly, no X.0 zero leaks in, total preserved; flag-off keeps the raw order).
+Both import the trainer lazily and skip loudly outside the verl env (suite stays dependency-light).
+
+### Files touched
+- `hprl_ray_trainer.py` — `_step_adv_penalty_cfg` reads `reward.custom_reward_function` first (legacy fallback); `_step_adv_penalty_vec(..., prune_guidance=False)` prunes the pool to the loop's order; `_hprl_apply_step_advantage` reads `auto_hint.prune_guidance` and passes it through; import `prune_hint_pool`
+- `test_auto_hint.py` — the two regression tests above (+ `_PRUNE_POOL` fixture, `_import_hprl_trainer` skip helper)
+
 ## 2026-07-14 — over-long penalty: VALUE-INTEGRATED routing (`overlong_penalty_type=post_hoc|value`), flag-gated — RESULT: does NOT arrest the truncation; root cause is a length-POSITIVE reward
 
 A second routing for the over-turn-length surcharge built 2026-07-01. That entry fixed the

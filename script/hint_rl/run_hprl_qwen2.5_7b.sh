@@ -70,9 +70,15 @@ clip_ratio_high=0.28
 loss_agg_mode="token-mean"
 
 # ---- lengths: multi-turn trajectories accumulate tokens across turns ------
-max_prompt_length=2048
+# Env-overridable so a per-model wrapper can shrink them: prompt+response is the
+# vLLM max_model_len budget and must fit the model's max_position_embeddings.
+# The async server pins max_model_len to max_position_embeddings and CLAMPS each
+# request to it, so on a 32k-native model (Qwen3-8B-Base; Olmo3 is 64k yarn) the
+# 2048+32768 default leaves a phantom 2048 the engine can never generate -- the
+# qwen3 wrapper exports max_response_length=30720 to keep the budget real.
+max_prompt_length=${max_prompt_length:-2048}
 # bumped from 8192: prompt + N*(assistant turn + hint tool result).
-max_response_length=28000
+max_response_length=${max_response_length:-32768}
 
 # ---- multi-turn / hint knobs ----------------------------------------------
 # Cap on assistant turns; must be >= the largest per-problem hint budget B_q.

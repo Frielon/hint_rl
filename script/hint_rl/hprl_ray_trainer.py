@@ -37,7 +37,7 @@ from hint_penalty import (
     compute_hint_penalties,
 )
 from kpack_expand import render_variant_rows
-from selector_multi import pending_hint_ids
+from selector_multi import pending_hint_ids, prune_hint_pool
 from step_advantage import apply_step_level_advantages
 
 
@@ -402,6 +402,12 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
         tt_arr = ntb.get("turn_truncated")  # per-turn-cap cut flag (for the overlong penalty)
         extra_arr = ntb.get("extra_info")
         total_penalty, hard_factor, guidance, guidance_free = self._step_adv_penalty_cfg()
+        # STATE-COORDINATE PARITY with the rollout loop: with prune_guidance on, the loop
+        # indexed every recorded state (state_start/state_end/fail_state, and K itself)
+        # over the PRUNED pool order (X.0 guidance hints dropped -- AutoHintAgentLoop._pool).
+        # The penalty vector must be built over the SAME order, or every state past an X.0
+        # entry reads the wrong hint's penalty and K overshoots the loop's state space.
+        prune_g = _truthy(self._auto_hint_cfg().get("prune_guidance", False))
 
         turns_per_row = [self._coerce_turns(_to_py(turns_arr[i])) for i in range(n)]
         correct_per_row = [
@@ -421,7 +427,10 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
             if key in cache:
                 pv, K = cache[key]
             else:
-                pv, K = self._step_adv_penalty_vec(ei, total_penalty, hard_factor, guidance, guidance_free)
+                pv, K = self._step_adv_penalty_vec(
+                    ei, total_penalty, hard_factor, guidance, guidance_free,
+                    prune_guidance=prune_g,
+                )
                 cache[key] = (pv, K)
             penalty_per_row.append(pv)
             K_per_row.append(K)
@@ -463,8 +472,19 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
     def _step_adv_penalty_cfg(self):
         """(total_penalty, hard_factor, guidance_difficulty, guidance_free) from the
         reward kwargs -- the SAME knobs hint_reward.compute_score prices hints with, so
-        the step-adv r(h) equals the reward's per-hint penalty (incl. a free X.0 hint)."""
-        crf = self.config.get("custom_reward_function", None)
+        the step-adv r(h) equals the reward's per-hint penalty (incl. a free X.0 hint).
+
+        verl's migrate_legacy_reward_impl (run by main_hprl / main_hprl_async before
+        the trainer is built) MOVES the launch-time ``custom_reward_function`` node to
+        ``reward.custom_reward_function`` and deletes the top-level one -- reading only
+        the legacy location silently fell back to the code defaults (1.8/'moderate'/
+        guidance_free=False), decoupling the step-adv r(h) from the reward's actual
+        pricing (e.g. a free X.0 hint in the reward but a priced one in the advantage).
+        Read the migrated location first; keep the legacy one as a fallback."""
+        reward_cfg = self.config.get("reward", None)
+        crf = reward_cfg.get("custom_reward_function", None) if reward_cfg is not None else None
+        if crf is None:
+            crf = self.config.get("custom_reward_function", None)
         rkw = crf.get("reward_kwargs", None) if crf is not None else None
         rkw = rkw or {}
         return (
@@ -475,17 +495,28 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
         )
 
     @staticmethod
-    def _step_adv_penalty_vec(extra_info, total_penalty, hard_factor, guidance, guidance_free=False):
+    def _step_adv_penalty_vec(extra_info, total_penalty, hard_factor, guidance, guidance_free=False,
+                              prune_guidance=False):
         """Per-hint penalty weights in POOL ORDER (p[0..K-1]) for a rollout, from its
         extra_info: the selector pool gives the canonical hint order (= the step
         indexing the loop used), hint_full gives the difficulty-weighted penalties.
-        Returns ([], 0) when either is absent."""
+        Returns ([], 0) when either is absent.
+
+        ``prune_guidance`` MUST mirror data.hprl.auto_hint.prune_guidance (the rollout
+        loop's flag): when on, the loop dropped the X.0 step-guidance hints from the
+        pool BEFORE computing its state indices (AutoHintAgentLoop._pool), so the
+        canonical order here must be the SAME pruned one. Reading the raw pool while
+        the loop pruned it shifts every state at/after an X.0 entry onto the wrong
+        hint's penalty (and, with guidance_free, onto a 0.0 -- a free failed step)
+        and inflates K past the loop's terminal state."""
         if not isinstance(extra_info, dict):
             return [], 0
         tk = extra_info.get("tools_kwargs") or {}
         tool = tk.get("request_hint") or {}
         ck = tool.get("create_kwargs") or {}
         pool = ck.get("hints")
+        if prune_guidance and pool is not None:
+            pool = prune_hint_pool(pool)
         order = pending_hint_ids(pool, []) if pool is not None else []
         hint_full = extra_info.get("hint_full")
         pens = (

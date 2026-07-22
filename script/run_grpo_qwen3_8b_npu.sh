@@ -68,8 +68,8 @@ if [ -f "${HINT_RL_HOME}/.envrc" ]; then
 fi
 export WANDB_API_KEY="${WANDB_API_KEY:-${wandb_key:-}}"
 
-project_name='GRPO-Qwen3-8B'
-exp_name="GRPO-Qwen3-8B-dapo-3139-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
+project_name='GRPO-Qwen3-8B-Base'
+exp_name="GRPO-Qwen3-8B-Base-dolci-zero-rl-8192-16-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
 wandb_project=${wandb_project:-"hint_rl"}
 
 adv_estimator=grpo
@@ -84,21 +84,21 @@ kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 max_prompt_length=2048
-max_response_length=16384
+max_response_length=8192
 # GRPO: standard per-token mean over the batch.
 loss_agg_mode="token-mean"
 
 # Cluster: 6 nodes x 8 H100 = 48 GPUs. This requires a Ray cluster spanning
 # all nodes (see the `ray job submit` at the bottom); the job is dispatched
 # across whatever GPUs the cluster actually has.
-NNODES=${NNODES:-4}
+NNODES=${NNODES:-2}
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 
 # No dynamic-sampling oversample here, so the generation batch equals the
 # training batch (the trainer generates train_prompt_bsz prompts per step).
-train_prompt_bsz=128
-n_resp_per_prompt=32
-train_prompt_mini_bsz=32
+train_prompt_bsz=64
+n_resp_per_prompt=8
+train_prompt_mini_bsz=64
 
 # Ray
 VERL_HOME=${VERL_HOME:-"${PROJECT_HOME}/verl"}
@@ -108,16 +108,17 @@ WORKING_DIR=${WORKING_DIR:-"${VERL_HOME}"}
 # can inject secrets/log paths via env_vars; ${VERL_HOME}/recipe/dapo/runtime_env.yaml
 # is the upstream template it mirrors.
 # Paths
-MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Qwen3-8B"}
+MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Qwen3-8B-Base"}
 CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
 # Single-turn, dapo_17k-style prompts (no agent_name column), so every row routes
 # through verl's built-in single_turn_agent -> plain single-turn GRPO, no hint
 # agent loop. Use dapo-3139-hint-verl-mt-clean.parquet (agent_name="hint_agent")
 # only with the HPRL launcher (run_hprl), which registers that loop.
-TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dapo-3139-single-turn.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/Dolci-RL-Zero-Math-7B_dapo_formatted-single-turn.parquet"}
 TEST_FILE=${TEST_FILE:-"${HINT_RL_HOME}/dataset/aime2024.parquet"}
 TEST_FILE2=${TEST_FILE2:-"${HINT_RL_HOME}/dataset/dapo_sample_hard_100.parquet"}
 TEST_FILE3=${TEST_FILE3:-"${HINT_RL_HOME}/dataset/aime2025.parquet"}
+TEST_FILE4=${TEST_FILE4:-"${HINT_RL_HOME}/dataset/hmmt_nov_2025.parquet"}
 
 # Custom reward function (loaded by verl via custom_reward_function.path/.name)
 REWARD_FN_PATH=${REWARD_FN_PATH:-"${HINT_RL_HOME}/reward/custom_reward.py"}
@@ -185,7 +186,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     --address "${RAY_ADDRESS}" \
     -- python3 -m verl.trainer.main_ppo \
     data.train_files="${TRAIN_FILE}" \
-    data.val_files="['${TEST_FILE}','${TEST_FILE2}','${TEST_FILE3}']" \
+    data.val_files="['${TEST_FILE}','${TEST_FILE2}','${TEST_FILE3}','${TEST_FILE4}']" \
     data.prompt_key=prompt \
     data.truncation='left' \
     data.max_prompt_length=${max_prompt_length} \
@@ -254,7 +255,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=True \
     trainer.test_freq=5 \
-    trainer.save_freq=100 \
+    trainer.save_freq=50 \
     `# trainer.max_actor_ckpt_to_keep=1` \
     trainer.total_epochs=100 \
     trainer.default_local_dir="${CKPTS_DIR}" \

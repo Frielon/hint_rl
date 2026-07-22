@@ -47,7 +47,7 @@ fi
 
 # --- config (env-overridable) ---------------------------------------------
 PORT="${PORT:-30000}"
-CONTEXT_LEN="${CONTEXT_LEN:-36864}"   # must be >= MAX_TOKENS + prompt; else vLLM 400-rejects every request
+CONTEXT_LEN="${CONTEXT_LEN:-32768}"   # native Qwen3-8B-Base ctx (rope_scaling=null); must be >= MAX_TOKENS + prompt, else vLLM 400-rejects every request
 MEM_FRAC="${MEM_FRAC:-0.85}"
 TP="${TP:-1}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
@@ -57,9 +57,9 @@ CONCURRENCY="${CONCURRENCY:-192}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-1.0}"
 TOP_K="${TOP_K:--1}"
-MAX_TOKENS="${MAX_TOKENS:-32768}"
+MAX_TOKENS="${MAX_TOKENS:-30720}"       # leave 2048 headroom under CONTEXT_LEN for the prompt
 LIMIT="${LIMIT:-}"
-START_STEP="${START_STEP:-420}"           # skip checkpoints with global_step < this (inclusive; ignored when STEPS is set)
+START_STEP="${START_STEP:-0}"           # skip checkpoints with global_step < this (inclusive; ignored when STEPS is set)
 BASE_URL="http://127.0.0.1:${PORT}/v1"
 
 # --- the runs whose every checkpoint we evaluate ---------------------------
@@ -70,7 +70,9 @@ BASE_URL="http://127.0.0.1:${PORT}/v1"
 RUNS=(
   # "autohint-olmo-512|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Olmo-3-7B-Instruct-SFT/HPRL-AutoHint-Olmo-3-7B-Instruct-SFT-dapo-20260701-220850"
   # "autohint-olmo-512|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Olmo-3-7B-Instruct-SFT/HPRL-AutoHint-Olmo-3-7B-Instruct-SFT-dapo-20260630-224821"
-  "grpo-olmo-512|$HINT_RL_HOME/ckpt/GRPO-Olmo-3-7B-Instruct-SFT/GRPO-Olmo-3-7B-Instruct-SFT-dapo-512-20260702-155352"
+  # "grpo-olmo-512|$HINT_RL_HOME/ckpt/GRPO-Olmo-3-7B-Instruct-SFT/GRPO-Olmo-3-7B-Instruct-SFT-dapo-512-20260702-155352"
+  "hprl-qwen3-base-512|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Qwen3-8B-Base/HPRL-AutoHint-Qwen3-8B-Base-dapo-20260720-235159"
+  "grpo-qwen3-base-11k|$HINT_RL_HOME/ckpt/GRPO-Qwen3-8B-Base/GRPO-Qwen3-8B-Base-dolci-zero-rl-8192-16-20260722-041547"
 )
 
 # --- datasets (all BARE, box-scored like GRPO) -----------------------------

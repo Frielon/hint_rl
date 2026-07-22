@@ -47,7 +47,7 @@ BASE_HOME=${BASE_HOME:-"$(cd "${PROJECT_HOME}/.." && pwd)"}
 RAY_LAUNCH=${RAY_LAUNCH:-"${SCRIPT_DIR}/../ray_cluster_launch.sh"}    # script/ray_cluster_launch.sh
 # TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_auto_hint_qwen2.5_7b.sh"}
 # fork from global_step_140 + seeded budget_state.json (run_auto_hint_qwen2.5_7b_resume140.sh)
-TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_auto_hint_olmo3_7b_instruct.sh"}
+TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_auto_hint_qwen3_8b_base.sh"}
 
 # --- conda env (verl holds BOTH training and the vllm used to serve gpt-oss) -
 CONDA_HOME=${CONDA_HOME:-"${BASE_HOME}/miniconda3"}
@@ -69,7 +69,7 @@ conda activate "${CONDA_ENV}"
 # original behavior); if WORLD_SIZE is unset it is derived as the sum.
 SELECTOR_NNODES=${SELECTOR_NNODES:-2}
 if [ -z "${TRAIN_NNODES:-}" ]; then
-    TRAIN_NNODES=$(( ${WORLD_SIZE:-2} - SELECTOR_NNODES ))
+    TRAIN_NNODES=$(( ${WORLD_SIZE:-6} - SELECTOR_NNODES ))
 fi
 WORLD_SIZE=${WORLD_SIZE:-$((TRAIN_NNODES + SELECTOR_NNODES))}
 if [ "$((TRAIN_NNODES + SELECTOR_NNODES))" -ne "${WORLD_SIZE}" ]; then

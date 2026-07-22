@@ -1,0 +1,143 @@
+# HPRL FULLY-ASYNC trainer config = ppo_trainer + verl's fully-async defaults
+# + the HPRL knobs.
+#
+# The async sibling of hprl_trainer.yaml. It CANNOT compose verl's
+# fully_async_ppo_trainer.yaml directly: that file declares its own
+# hydra.searchpath, which hydra rejects in any non-primary config
+# ("Overriding hydra.searchpath is only supported from the primary config").
+# So this pulls the same base (ppo_trainer) and INLINES the fully-async
+# additions verbatim from
+#   verl/experimental/fully_async_policy/config/fully_async_ppo_trainer.yaml
+# (pinned checkout 4f0b3b69; re-diff that file if verl is ever bumped):
+#   * async_training.*                     -- the pipeline knobs
+#   * rollout.{nnodes,n_gpus_per_node,n,total_rollout_steps} -- the split
+#   * data.gen_batch_size=1                -- streaming (Rollouter asserts)
+#   * rollout.calculate_log_probs=True     -- behavior-policy logprobs
+#   * actor.use_rollout_log_probs=True     -- train with those logprobs
+#   * model.use_remove_padding=True        -- (also set by the run script)
+#   * algorithm.rollout_correction.bypass_mode=True -- old_log_prob := rollout's
+#   * rollout.checkpoint_engine.backend=nccl -- cross-pool weight sync
+#
+# The data.hprl block is a VERBATIM MIRROR of the one in hprl_trainer.yaml (one
+# source of truth per mode; keep the two in sync when adding knobs), with two
+# async-mode restrictions enforced by main_hprl_async.py at launch:
+#   * kpack.enable MUST stay false -- the k-pack probe rewrites rollout.n and
+#     expands the gen batch inside the sync trainer's _get_gen_batch, neither of
+#     which exists on the async queue path (the Rollouter feeds samples).
+#   * budget_sampling.enable is forced false -- the async Rollouter streams
+#     samples one at a time (gen_batch_size=1), so there is no generation BATCH
+#     to keep budget-homogeneous; the straggler problem it solved does not exist
+#     under streaming (the queue absorbs per-sample duration variance).
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# ---- fully-async pipeline (inlined upstream defaults; run script overrides) --
+async_training:
+  # Maximum samples staleness threshold (0 = synchronous streaming).
+  staleness_threshold: 0.1
+  # Trainer iterations between weight pushes to the Rollouter.
+  trigger_parameter_sync_step: 4
+  # ppo_mini_batches the trainer pulls from the queue per iteration.
+  require_batches: 1
+  # Weight sync interrupts + transparently resumes in-flight generation.
+  partial_rollout: True
+  # Validate on hybrid replicas on the trainer GPUs instead of the Rollouter.
+  use_trainer_do_validate: False
+
+# ---- Rollouter resource pool (disjoint from trainer.{nnodes,n_gpus_per_node}) -
+rollout:
+  nnodes: 1
+  n_gpus_per_node: 8
+  # number of responses per prompt (one GRPO group); mirrored by the run script.
+  n: 4
+  # total prompt-groups to stream; null -> len(dataloader) * trainer.total_epochs
+  # (the sync job's epoch semantics). Upstream pins a tiny demo value (100).
+  total_rollout_steps: null
+
+data:
+  # streaming sample production: the Rollouter asserts gen_batch_size == 1
+  # (and train_batch_size == 0, set by the run script).
+  gen_batch_size: 1
+
+  # route every training row through the dynamic-budget dataset (injection side).
+  # The async Rollouter builds its datasets via verl's create_rl_dataset, which
+  # honors data.custom_cls -- same wiring as the sync job.
+  custom_cls:
+    path: ${oc.env:HINT_RL_HOME}/script/hint_rl/hint_dataset.py
+    name: HintBudgetDataset
+
+  # the HPRL dynamic-budget ratchet (see hprl_trainer.yaml for the full docs).
+  # In async mode the ratchet runs on the FullyAsyncTrainer actor after each
+  # local update; the dataset (Rollouter side) re-reads budget_state_path by
+  # mtime, so budgets ratcheted by the trainer reach newly-sampled problems
+  # through the shared-FS JSON exactly as in the sync job -- just with the
+  # pipeline's staleness lag instead of the sync step boundary.
+  hprl:
+    enable: true
+    budget_state_path: ${oc.env:HINT_RL_HOME}/logs/hprl_budget_state.json
+    min_budget: 0
+    decrement: 1
+    default_budget: 8
+    ratchet_mode: adaptive
+    max_budget: 8
+    allow_decrease: true
+    tool_name: request_hint
+    terminate_on_budget_exceeded: true
+    strategy: hint
+    step_exclude_mode: cumulative
+    finalize_incorrect: false
+
+    # k-pack is NOT supported in fully-async mode (see header). Kept so the
+    # config shape matches hprl_trainer.yaml; main_hprl_async.py raises if true.
+    kpack:
+      enable: false
+      k: 2
+      require_successes: 2
+      scale_mini_batch: true
+
+    # meaningless under streaming (see header); forced false at launch.
+    budget_sampling:
+      enable: false
+      shuffle_batch_order: true
+
+    # auto-hint (push-hint) mode -- trainer-side mask / step-adv knobs, read by
+    # HPRLRayPPOTrainer._update_actor which the async trainer inherits verbatim.
+    auto_hint:
+      enable: true
+      fuzzy_threshold: 0.8
+      positive_eps: 0.0
+      prune_guidance: false
+      max_turn_tokens: 0
+      step_adv:
+        enable: false
+        terminal_value: 1.0
+        zero_if_no_correct: true
+        adv_scale: 1.0
+        normalize: false
+        overlong_penalty: 0.0
+        overlong_penalty_type: post_hoc
+        whole_turn: false
+
+actor_rollout_ref:
+  rollout:
+    # Must be enabled: the trained logprobs are the ROLLOUT policy's own.
+    calculate_log_probs: True
+    checkpoint_engine:
+      backend: "nccl"
+  actor:
+    # Train with the rollout logprobs (PPO importance ratio vs the behavior
+    # policy under bounded staleness).
+    use_rollout_log_probs: True
+  model:
+    use_remove_padding: True
+
+# old_log_prob := rollout logprobs directly (no recompute pass on the trainer).
+algorithm:
+  rollout_correction:
+    bypass_mode: True
