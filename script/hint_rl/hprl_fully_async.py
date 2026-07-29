@@ -33,13 +33,24 @@
 #     the async trainer pulls finished rollouts from the queue and never builds
 #     a gen batch (the Rollouter feeds via prepare_single_generation_data).
 #
-# The Rollouter runs STOCK: HintBudgetDataset injection rides data.custom_cls
-# (create_rl_dataset), the auto_hint agent loop rides the per-row agent_name +
-# rollout.agent.agent_loop_config_path, and the streaming reward rides the
-# RewardLoopManager -- none of which need a subclass. The budget state crosses
-# the actor boundary through the shared-FS JSON (atomic os.replace writer on the
-# trainer, mtime-cached reader in the dataset), exactly as it crossed the
-# process boundary in the sync job.
+# The Rollouter needs ONE fix on top of stock: verl's
+# _process_single_sample_streaming REPLACES RolloutSample.full_batch with the
+# agent-loop output (`rollout_sample.full_batch = ret`), where the sync trainer
+# UNIONS the gen output into the dataloader batch. Loop-attached non-tensors
+# (step_adv_turns / acc / applied_hints) survive, but the dataset-side columns
+# -- extra_info (hint pool: hint_full, tools_kwargs), data_source, reward_model
+# -- never reach the trainer. Trainer-side consequences (found 2026-07-23 on
+# the staleness grid): the budget-ratchet block guards on "extra_info" in
+# non_tensor_batch and silently skips, and step-adv prices every row at K=0 so
+# EVERY group is zeroed -- advantages==0, pg_loss==0, the policy never moves.
+# HPRLFullyAsyncRollouter below restores the missing dataset non-tensors onto
+# the agent-loop output before the sample enters the MessageQueue. Everything
+# else rides stock: HintBudgetDataset injection via data.custom_cls
+# (create_rl_dataset), the auto_hint agent loop via the per-row agent_name +
+# rollout.agent.agent_loop_config_path, the streaming reward via the
+# RewardLoopManager. The budget state crosses the actor boundary through the
+# shared-FS JSON (atomic os.replace writer on the trainer, mtime-cached reader
+# in the dataset), exactly as it crossed the process boundary in the sync job.
 #
 # Ray mechanics: FullyAsyncTrainer / FullyAsyncTaskRunner are @ray.remote-
 # decorated AT DEFINITION, and Ray forbids subclassing an ActorClass. The
@@ -57,6 +68,7 @@ import os
 import ray
 
 from verl.experimental.fully_async_policy.fully_async_main import FullyAsyncTaskRunner
+from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
 from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
 from verl.experimental.separation.utils import create_resource_pool_manager
 from verl.trainer.ppo.utils import Role
@@ -69,6 +81,36 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 # The undecorated class bodies behind the @ray.remote wrappers (see header).
 _FULLY_ASYNC_TRAINER_BODY = FullyAsyncTrainer.__ray_metadata__.modified_class
 _FULLY_ASYNC_RUNNER_BODY = FullyAsyncTaskRunner.__ray_metadata__.modified_class
+_FULLY_ASYNC_ROLLOUTER_BODY = FullyAsyncRollouter.__ray_metadata__.modified_class
+
+
+def restore_dataset_non_tensors(src, out):
+    """Copy every non-tensor column of ``src`` (the pre-generation sample batch,
+    which still carries the dataset fields) that is MISSING from ``out`` (the
+    agent-loop output) into ``out``. Returns (out, n_restored).
+
+    Row alignment is trivially safe in the fully-async streaming path: ``src``
+    is ONE dataset sample repeated rollout.n times, so all rows share the same
+    non-tensor values. Columns whose length disagrees with ``out`` are skipped
+    with a warning rather than corrupting the batch. Keys already present in
+    ``out`` (loop-attached fields, and uid which the rollouter re-stamps) are
+    never touched.
+    """
+    if src is None or out is None:
+        return out, 0
+    n = len(out)
+    restored = 0
+    for key, val in src.non_tensor_batch.items():
+        if key in out.non_tensor_batch:
+            continue
+        if len(val) != n:
+            logger.warning(
+                "[HPRL ASYNC] not restoring non-tensor %r: %d rows vs batch %d", key, len(val), n
+            )
+            continue
+        out.non_tensor_batch[key] = val
+        restored += 1
+    return out, restored
 
 
 class _HPRLFullyAsyncTrainerImpl(HPRLRayPPOTrainer, _FULLY_ASYNC_TRAINER_BODY):
@@ -97,14 +139,72 @@ class _HPRLFullyAsyncTrainerImpl(HPRLRayPPOTrainer, _FULLY_ASYNC_TRAINER_BODY):
 HPRLFullyAsyncTrainer = ray.remote(num_cpus=10)(_HPRLFullyAsyncTrainerImpl)
 
 
-class HPRLFullyAsyncTaskRunnerImpl(_FULLY_ASYNC_RUNNER_BODY):
-    """FullyAsyncTaskRunner that builds HPRLFullyAsyncTrainer instead.
+class _HPRLFullyAsyncRollouterImpl(_FULLY_ASYNC_ROLLOUTER_BODY):
+    """FullyAsyncRollouter that restores the dataset non-tensors (extra_info /
+    data_source / reward_model / ...) onto the agent-loop output before each
+    sample is queued -- see the module header for why stock loses them and what
+    that breaks (all-zero step-adv, dead budget ratchet).
 
-    Only _create_trainer is overridden (a verbatim copy of the base body with
-    the trainer class swapped -- the base hardcodes the module-global
-    FullyAsyncTrainer, so there is no narrower hook). The Rollouter, the
-    MessageQueue and the whole run() orchestration are inherited stock.
+    The wrap lives on the manager's ``generate_sequences_single`` -- the single
+    seam between the original batch and ``rollout_sample.full_batch = ret`` --
+    instead of copying the whole ``_process_single_sample_streaming`` body, so
+    upstream edits to the streaming loop (counters, queue put) keep working.
     """
+
+    async def _init_async_rollout_manager(self):
+        await super()._init_async_rollout_manager()
+        mgr = self.async_rollout_manager
+        inner = mgr.generate_sequences_single
+        logged = False
+
+        async def _generate_and_restore(prompts):
+            nonlocal logged
+            out = await inner(prompts)
+            out, restored = restore_dataset_non_tensors(prompts, out)
+            if restored and not logged:
+                logged = True
+                print(
+                    f"[HPRL ASYNC] restoring {restored} dataset non-tensor keys onto agent-loop "
+                    f"outputs (extra_info et al.; logged once per rollouter)"
+                )
+            return out
+
+        mgr.generate_sequences_single = _generate_and_restore
+
+
+HPRLFullyAsyncRollouter = ray.remote(num_cpus=10, max_concurrency=100)(_HPRLFullyAsyncRollouterImpl)
+
+
+class HPRLFullyAsyncTaskRunnerImpl(_FULLY_ASYNC_RUNNER_BODY):
+    """FullyAsyncTaskRunner that builds HPRLFullyAsyncTrainer and
+    HPRLFullyAsyncRollouter instead.
+
+    _create_trainer / _create_rollouter are overridden (verbatim copies of the
+    base bodies with the classes swapped -- the base hardcodes the
+    module-global classes, so there is no narrower hook). The MessageQueue and
+    the whole run() orchestration are inherited stock.
+    """
+
+    def _create_rollouter(self, config) -> None:
+        print("[HPRL ASYNC MAIN] Starting create rollouter (HPRLFullyAsyncRollouter)...")
+        rollouter = HPRLFullyAsyncRollouter.remote(
+            config=config,
+            tokenizer=self.components["tokenizer"],
+            processor=self.components["processor"],
+            device_name=config.trainer.device,
+        )
+
+        # set_hybrid_worker_group must be called BEFORE init_workers() so that
+        # _init_async_rollout_manager can pass the hybrid WG to ALM.create().
+        if "hybrid_worker_group" in self.components:
+            ray.get(rollouter.set_hybrid_worker_group.remote(self.components["hybrid_worker_group"]))
+            print("[HPRL ASYNC MAIN] Hybrid worker group injected into rollouter")
+
+        ray.get(rollouter.init_workers.remote())
+        ray.get(rollouter.set_max_required_samples.remote())
+
+        self.components["rollouter"] = rollouter
+        print("[HPRL ASYNC MAIN] HPRLFullyAsyncRollouter created and initialized successfully")
 
     def _create_trainer(self, config) -> None:
         print("[HPRL ASYNC MAIN] Starting create trainer (HPRLFullyAsyncTrainer)...")

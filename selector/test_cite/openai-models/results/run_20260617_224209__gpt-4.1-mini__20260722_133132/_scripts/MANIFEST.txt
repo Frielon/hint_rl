@@ -1,0 +1,7 @@
+run_openai_selection.py  <-  /share5/users/xutao.ma/project/hint_rl/selector/test_cite/openai-models/run_openai_selection.py
+run_openai_eval.sh  <-  /share5/users/xutao.ma/project/hint_rl/selector/test_cite/openai-models/run_openai_eval.sh
+compare_runs.py  <-  /share5/users/xutao.ma/project/hint_rl/selector/test_cite/openai-models/compare_runs.py
+run_gpt_oss_selection.py  <-  /share5/users/xutao.ma/project/hint_rl/selector/test_cite/gpt_oss_eval/run_gpt_oss_selection.py
+prompt_template_F.py  <-  /share5/users/xutao.ma/project/hint_rl/selector/test_cite/gpt_oss_eval/prompt_template_F.py
+check_citations.py  <-  /share5/users/xutao.ma/project/hint_rl/selector/test_cite/gpt_oss_eval/check_citations.py
+run_hint_selection_model.py  <-  /share5/users/xutao.ma/project/hint_rl/selector/run_hint_selection_model.py

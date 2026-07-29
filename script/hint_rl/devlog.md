@@ -15,6 +15,334 @@ _(none open — the step-level advantage calculation landed 2026-06-25; see the 
 
 # Done log
 
+## 2026-07-29 — post-hint behavior analysis (dolci-10324 sync vs dapo-512): the model DOES use hints; failures are anchoring/thrash/ladder-exhaustion in the max-k tail; from-scratch RESTARTS are a learned drift reaching 98% of post-hint turns
+
+**Question.** `...-dolci-rl-zero-10324-20260724-134554` (sync qwen3-8b-base, 161
+steps/epoch) plateaus after ~2 epochs; suspicion was that the model doesn't use
+injected hints, so hinted rollouts contribute little advantage. Read the
+`rollouts/*.jsonl` dumps directly (per-turn token spans from `step_adv_turns`
+`[start, boundary, end, ...]`; post-hint segments by splitting `output` on the
+injected user turns). Control run for every finding:
+`...-dapo-20260720-235159` (dapo-512, 8 steps/epoch × 40 epochs) — **byte-identical
+training code, flags (`step_adv=true, whole_turn=true`), per-turn cap 8192,
+response 30720; the ONLY delta is the dataset**, which makes it a clean ablation.
+
+**The "ignores hints" hypothesis is FALSE.** Post-hint turns run 2–3.6k tokens
+(≈0% under 200 tok), 97–100% of them reuse the hint's actual content (number
+overlap), and conversion below the budget ceiling is excellent late (dolci s620:
+k=1/2/3 acc .99/1.00/.98; dapo s200: k≤5 acc .88–1.0). Engagement is not the
+problem.
+
+**Where hinted gradient actually dies: the max-budget-k tail.** Failures
+concentrate at the ceiling (dolci k=4@s620 acc .45, k=5 acc .13–.33; dapo k=6
+acc .27–.40, and at s300 k=3/4 acc .65/.56 once budgets ratchet down). Anatomy
+from concrete traces + sweeps:
+- **Anchoring** — the hint is read as confirmation: ~35% of hint boundaries on
+  eventually-wrong rollouts keep the same boxed answer; one trace boxed 47 four
+  consecutive times while the hint ladder built toward gt=43 (the unreachable
+  subset-sum s=1). Same-box-after-first-hint peaks ~55% early in BOTH runs,
+  declining to ~20% late.
+- **Thrash / near-miss, not disengagement** — among late-step failures, 71–75%
+  box ≥3 distinct answers, and ~50% (dolci s620) / 52–59% (dapo) write the
+  ground truth somewhere in post-hint text but never box it (one wrote
+  "totaling 22" [=gt] in a note and boxed 20). Long text ≠ reliable synthesis:
+  case-work wobbles (a trace used "center case = 6" per its hint, then
+  "center case = 2" two turns later) and false verification (a dapo trace
+  "verified" 9=9 against its own mis-assembled equation system).
+- **Ladder exhaustion** — budget ends mid-pool: 4 hints pruned candidates
+  100–110 for gt=111 (outside the pruned set); the model then guessed among
+  survivors with hand-waved arithmetic ("reasonable to conclude 19^29≡1").
+
+**The big learned behavior: full restarts of the solution after every hint.**
+Share of post-hint segments that restate the problem from scratch
+("Alright, I have this problem to solve: ..."), measured per step:
+- dolci: ~2–3% at s1–2 (base-model seed) → 6% (s60) → 15% (s100) → 43% (s240)
+  → 71% (s320) → 88–100% from s360 on (98% at s620). Growth starts in EPOCH 0,
+  on fresh problems, and compounds. Restated turns re-derive the whole prior
+  attempt (post-hint means grow 1.9k→3.4–3.8k tok) and are where earlier
+  verified sub-results get dropped/contradicted.
+- dapo, same seed ~2–3% at s1–2, is then trained BELOW baseline (0.3–0.6%
+  through s40–160, post-hint turns shrink to ~0.8–1.2k tok) while its 40×
+  -revisited problems are being memorized and the winning post-hint style is a
+  short direct fix — and then RE-DEVELOPS the pathology late (1.2%@s200 →
+  17.7%@s300) exactly when memorized problems exit the hinted set
+  (hints/rollout →~2, post-hint tokens back ≥2k) and only the never-solved
+  tail remains. Same compounding rate as dolci's early growth.
+So the small dataset only delays the attractor; restart% and post-hint turn
+length co-move in both runs — restarting and turn-lengthening are one
+length-positive drift.
+
+**Mechanism (verified against code, not inferred).** Both runs run
+`step_adv=true` + `whole_turn=true`; in `hprl_ray_trainer._update_actor` the
+step-advantage path and the verified-prefix `disable_spans` mask are mutually
+exclusive, so the citation boundary gates nothing here. A turn's advantage
+A = V[se+1]+r_se−V[ss] is uniform over ALL its tokens and depends only on the
+selector-judged state transition — restating is NOT required to collect credit
+(and restart rates on ending-solve vs intermediate turns are equal throughout,
+confirming no positional effect). But redundancy is never taxed: every token of
+a positive turn is reinforced equally, so payload-free re-derivation compounds
+once it appears. **Caution for future config changes:** flipping to
+`whole_turn=false` (split a_C/a_I) would make this WORSE, not better — a_C is
+collected only over the span where the selector's citation quotes fuzzy-locate
+IN the current turn's text, so a non-restated continuation that fails again
+forfeits its positive component entirely; split mode actively pays restating.
+
+**Interpretation caveat for the plateau window.** dolci epochs 0–1 trained with
+4.95%/6.51% of applied hints EMPTY plus ~2.3% control-char-corrupted hint text
+(selector-output parser-era bugs — separate issue, fixed in the working tree
+with `test_selector_parse.py` coverage), so the early-epoch signal was not
+clean; the behavior findings above are robust across both pre- and post-fix
+segments.
+
+**Measurement recipes** (scripts in session scratchpad; definitions here for
+re-derivation): turn token lens = `t[2]-t[0]` over `step_adv_turns`; post-hint
+segments = split `output` on `<|im_start|>user\nHere is a hint`; restart =
+regex `I have this (math )?problem|Problem Statement|the problem (is|to
+solve)|restat` in the segment's first 400 chars; anchoring = last `\boxed{}`
+equality across adjacent segments; near-miss = gt regex-present in post-hint
+text but never boxed; per-hint-k conversion = group by `num_hints` × `acc`.
+
+### Files touched
+- `devlog.md` — this entry (analysis only; no code changes)
+
+## 2026-07-23 (c) — qwen3 async CRASH at v17 (context overflow); decision: stay at the native 32768 window (response 30720) — a YaRN accommodation was built, validated, then REVERTED
+
+**The crash (run `...-dolci-rl-zero-10324-20260723-215956`, ended v17/6452, ray job
+"succeeded").** Buried above the teardown noise: `ValueError: Prompt length (32897) leaves
+no room to generate within the model's maximum context length (32768)` (vllm_async_server
+headroom check, via `auto_hint_agent_loop.py:193`). The run had been launched with
+`max_response_length=34768` against the native-32768 window, so the loop's room math
+(`34768 − used`) let one rollout march past what the model holds; the raise propagated
+through the agent-loop `asyncio.gather` → the whole Rollouter exited ("Rollouter fit
+completed") → termination sentinel → trainer drained the queue (v15–17), saved
+`global_step_17`, job reported SUCCEEDED. One bad sample = whole async run, mislabeled
+successful. Otherwise the run was the extra_info-fix cluster smoke and PASSED (restore
+marker line 2047, pg_loss 0.021–0.046 nonzero, step_adv 46–48/64 scored, hprl/* + ratchet
+live, partials resuming, ~29 vph at 1:4 s=1.9 on dolci-10324).
+
+**Resolution.** The wrapper's `max_response_length` default is (back) at **30720** so
+prompt(2048)+response = exactly the native 32768; header now carries the crash as the
+cautionary note. An alternative keeping 34768 was fully built and validated first — a
+conditional YaRN derived dir `Qwen3-8B-Base-hprl-yarn40960` (real config.json with
+`rope_scaling={yarn, factor 1.25, orig 32768}` + mpe 40960, weights symlinked, window
+fail-fast; verl pins vLLM max_model_len to max_position_embeddings at
+vllm_async_server.py:818, transformers AutoConfig load verified) — but the user chose the
+native window, so the yarn build was reverted and the built dir removed; recover the
+mechanism from this entry / session history if an over-32768 budget is ever wanted again.
+Resume note: `global_step_17` of the crashed run remains resumable at 30720 (native rope
+throughout — the yarn config never ran; only the budget shrinks).
+
+### Files touched
+- `run_auto_hint_qwen3_8b_base_async.sh` — response default 34768→30720 (native-window decision), YaRN build added then reverted, header notes the overflow crash
+- `devlog.md` — this entry
+
+## 2026-07-23 (b) — `run_auto_hint_qwen3_8b_base_async.sh`: qwen3-8b-base production async wrapper + FIX: `run_hprl_async.sh` hardcoded the length knobs (every staleness trial ran at 28000, not the exported 30720)
+
+**New wrapper (`run_auto_hint_qwen3_8b_base_async.sh`).** The async sibling of
+`run_auto_hint_qwen3_8b_base.sh`, modeled on the olmo async wrapper: identical science
+knobs (auto-hint, step-adv w/ `HPRL_OVERLONG_PENALTY_TYPE=value`, adaptive raise-only
+ratchet, constant LR, dapo-512, 4 bare val sets), async knobs pinned to the sweep's
+production pick (1 trainer : N−1 rollout, `STALENESS_THRESHOLD=2`, trigger=require=1,
+partial rollout on), kpack/budget-sampling pinned off. **Start policy (per user):**
+default = FRESH run from the pristine base via the eos-derived `Qwen3-8B-Base-hprl`
+build (verbatim sync-wrapper block); `RESUME_FROM_PATH` is a documented OPTION, not a
+default — constraints in the header: the ckpt's saved actor world size must match the
+trainer pool (the sync step-320 shards are world-32 → needs `TRAINER_NNODES=4`), the
+dataloader needs a matching `TRAIN_FILE`; for a mismatched world size, merge the ckpt
+and pass it as `MODEL_PATH` instead (e.g. `eval/merged/hprl-qwen3-base-512-step320`,
+the staleness-grid route). Explicit `MODEL_PATH` skips the derived-dir build.
+Launch: `TRAIN_SCRIPT=<wrapper> bash launch_hprl_cluster_openai_async.sh`. Smoke-tested
+end-to-end to the ray-submit guard: 30720 reaches the base script (ppo token budget
+16384, correctly sized), split/staleness/overlong-type all land, resume defaults to
+`auto`/fresh.
+
+**The fix + finding.** `run_hprl_async.sh` HARDCODED `max_prompt_length`/
+`max_response_length` (unlike the sync script's env-overridable pattern), so
+`staleness_grid.sh`'s `max_response_length=30720` export **was silently ignored in every
+async trial to date** — archived per-trial source snapshots (`hint_rl_src.*`) confirm all
+of 20260722 and today's sweeps (incl. 163430: st1.6/1.8/2.1) ran at the committed
+**28000** (olmo-era value), while the sync baseline ran 30720 via its wrapper. Async-
+internal comparisons are unaffected (same value everywhere); the async-vs-sync vph gap is
+mildly flattered by the ~9% smaller response budget. Now `${max_response_length:-32768}`
+(default preserved from the working tree), so the grid's and the qwen3 wrapper's exports
+take effect.
+
+### Files touched
+- `run_auto_hint_qwen3_8b_base_async.sh` — NEW (see above)
+- `run_hprl_async.sh` — length knobs env-overridable
+- `launch_hprl_cluster_openai_async.sh` — TRAIN_SCRIPT default re-pointed at the qwen3 wrapper (was bare run_hprl_async.sh = olmo defaults), so the platform-submitted launcher IS the qwen3 async run
+- `devlog.md` — this entry
+
+## 2026-07-23 — FIX: fully-async dropped the dataset non-tensors → step-adv zeroed EVERY group (pg_loss≡0, no learning) + dead budget ratchet; staleness grid re-pointed at 2–3
+
+**The bug (found analyzing the 20260722 staleness sweep).** verl's
+`FullyAsyncRollouter._process_single_sample_streaming` REPLACES the sample with the
+agent-loop output (`rollout_sample.full_batch = ret`) where the sync trainer UNIONS the gen
+output into the dataloader batch. Loop-attached non-tensors survive (`step_adv_turns`,
+`acc`, `applied_hints` — all present in the async rollout dumps), but the dataset-side
+columns never reach the trainer: `extra_info` (hint pool `hint_full` + `tools_kwargs`),
+`data_source`, `reward_model`. Consequences with the standard auto-hint config
+(`HPRL_STEP_ADV=true`, the default in `run_hprl_async.sh` AND the olmo async wrapper):
+
+* `_step_adv_penalty_vec` gets no pool → K=0 for every row → **64/64 groups zeroed every
+  step** → `critic/advantages ≡ 0`, `actor/pg_loss ≡ 0` — **the policy never moved in ANY
+  fully-async run to date** (07-20 grid, 20260722 staleness sweep). `entropy_coeff=0`, so
+  there was no gradient at all.
+* The budget-ratchet/metrics block guards on `"extra_info" in non_tensor_batch`
+  (`hprl_ray_trainer.py:226`) → silently skipped → zero `hprl/*` keys in every async run
+  (vs ~40 in sync), budgets frozen at seed values.
+* Evidence chain: async jsonl `step_adv/groups_zeroed=64` + advantages/pg_loss all 0 +
+  no `hprl/*`, while `auto_hint/cite_*` ran (needs only turns) and the 4-node sync run
+  (`…dapo-20260723-100408`) scores 60/64 groups with the full `hprl/*` block.
+* Throughput numbers from those sweeps stay VALID (identical compute) — but weights never
+  changed, so weight-sync pushed identical params and real staleness/partial-rollout
+  behavior under policy drift is still unexercised.
+
+**The fix (`hprl_fully_async.py`, no verl core edit — same `modified_class` pattern).**
+New `_HPRLFullyAsyncRollouterImpl` subclasses the undecorated Rollouter body and, in
+`_init_async_rollout_manager`, wraps the manager's `generate_sequences_single` — the single
+seam between the original batch and the queue put — with
+`restore_dataset_non_tensors(prompts, out)`: copies every non-tensor column present in the
+pre-generation batch but missing from the agent-loop output (present keys, incl. the
+rollouter-restamped `uid`, are never touched; length-mismatched columns are skipped with a
+warning). Row alignment is trivially safe: the streaming path repeats ONE dataset sample
+×rollout.n, so all rows share the same non-tensor values. Wrapping the seam instead of
+copying the streaming-loop body keeps upstream edits (counters, queue put) working.
+`HPRLFullyAsyncTaskRunnerImpl._create_rollouter` override (verbatim base body, class
+swapped — same as the existing `_create_trainer`) builds it.
+
+**Validation.** Unit test on real `DataProto`s (restores `extra_info`+`data_source`,
+leaves present keys, skips misaligned columns) + module wiring import in the verl env +
+`test_auto_hint.py` 39/39. Cluster smoke still pending: on the next async launch check the
+step-1 log for `step-adv: … scored>0 zeroed<64`, nonzero `actor/pg_loss`, and the
+`hprl/*` metric block; the rollouter prints `[HPRL ASYNC] restoring N dataset non-tensor
+keys` once.
+
+**staleness_grid.sh re-pointed at the flatline.** 20260722 sweep results (steady,
+warm-up-excluded): 9.1/10.8/12.8/20.6/22.2 vph at s=0.2/0.5/0.8/1.6/2 on 1:4; trainer pure
+compute is constant ~148–153 s/version ⇒ ~24 vph ceiling, s=2 ≈ 94% of it; generation
+concurrency = s·B exactly. Sync 4-node baseline (steps 321–332 of `…-20260723-100408`):
+388 s/step = 9.3 vph, gen = 83% of the step. Changes: `STALENESS_LIST` default now
+**"2 2.2 2.4 2.6 2.8 3"** (probe the last ~6% and the flatline), `RUN_SYNC` default **0**
+(5-pod cluster hits `512 % 10 != 0` — 5×8 GPUs / sp4 = 10 DP ranks; baseline measured
+separately), and `run_trial` retries ONCE when a trial dies <10 min in (the stale-vLLM
+EADDRINUSE launch race that killed st1.2 at 3 min; first attempt's console kept as
+`*.console.attempt1.log`). DRY_RUN validated. NOTE: post-fix trials really learn, so the
+sweep doubles as the fix's cluster smoke — expect nonzero pg_loss and slightly different
+absolute vph than the pre-fix (frozen-weights) numbers.
+
+### Files touched
+- `hprl_fully_async.py` — `restore_dataset_non_tensors` + `_HPRLFullyAsyncRollouterImpl` (+ runner `_create_rollouter` override; header rewritten)
+- `staleness_grid.sh` — sweep 2–3, `RUN_SYNC=0` default, fast-fail retry guard
+- `launch_hprl_cluster_openai_staleness_grid.sh` — its own exported defaults would have OVERRIDDEN the grid script's (it exports before the head runs TRAIN_SCRIPT): re-pointed to "2 2.2 2.4 2.6 2.8 3" + `RUN_SYNC=0`, header updated
+
+## 2026-07-22 (b) — staleness_grid.sh: SYNC-vs-ASYNC benchmark from the qwen3 step-320 ckpt (sync baseline on all nodes + staleness sweep 0.2–2 at 1:N-1)
+
+Config benchmark driver in the `grid_search_async.sh` mold (TRAIN_SCRIPT slot, sequential
+bounded ray jobs, same results.tsv/vph metrics + ray-job stop + cluster-wide vLLM reap):
+
+* **trial 0 — SYNC baseline**: colocated hybrid engine, ALL `NNODES` pods training, via
+  `run_auto_hint_qwen3_8b_base.sh` (the wrapper that produced the ckpt, so science knobs
+  match by construction).
+* **trials 1..K — FULLY-ASYNC**: fixed **1 trainer : (NNODES−1) rollout** split, sweeping
+  `staleness_threshold` over **0.2 0.5 0.8 1.2 1.6 2** (verl only asserts ≥0; >1 is legal —
+  the rollouter may run (1+s)·B ahead. The 20260720 sweep put the 1:3 knife edge at s≈1.5,
+  so the list brackets it from below and above). Async trials go through
+  `run_hprl_async.sh` with the qwen3 deltas exported (`max_response_length=30720`,
+  `HPRL_OVERLONG_PENALTY_TYPE=value`); partial=True fixed (False is dead at trigger=1).
+
+**Start policy — merged, not resumed.** Every trial starts from
+`ckpt/HPRL-AutoHint-Qwen3-8B-Base/…-20260720-235159/global_step_320`, merged ONCE
+(idempotent) to `eval/merged/hprl-qwen3-base-512-step320` (the ckpt-eval harness's label →
+shared cache) and passed as `MODEL_PATH`. Resume was rejected on a hard constraint: the
+FSDP shards are world-size-locked (`model_world_size_32_rank_*.pt`, 4 nodes × 8) — the
+1-node async trainer (world 8) cannot load them. Merged dir inherits the eos-widened
+generation_config ([151643,151645]) from `actor/huggingface`; the stale
+`max_new_tokens=2048` is stripped (same repair as `eval/run_eval_ckpt.sh`). Fresh
+optimizer/dataloader/budget-state per trial = equal footing for a throughput benchmark;
+each trial re-seeds budgets from the parquet, not the 320-step ratcheted state.
+
+**Sync-script change** (`run_hprl_qwen2.5_7b.sh`): `trainer.{val_before_train,test_freq,
+save_freq,total_epochs}` now env-overridable (defaults unchanged) + NEW
+`trainer.total_training_steps=${TOTAL_TRAINING_STEPS}` with the async script's 0/empty=off
+convention — so a sync trial can be step-bounded exactly like an async one (both count
+64-prompt×8 units → versions/hour directly comparable across modes).
+
+**Platform entry**: `launch_hprl_cluster_openai_staleness_grid.sh` (N≥2 replicas; OpenAI
+selector → no selector pods, every pod trains). Also runs behind the classic selector-pod
+launcher via `TRAIN_SCRIPT=staleness_grid.sh`. DRY_RUN=1 validated: sync@4 nodes + 6 async
+trials at 1:3 with the right env per trial. Step-320 merge pre-run on the dev box.
+
+### Files touched
+- `staleness_grid.sh` — NEW: merge-once + sync baseline + staleness sweep driver
+- `launch_hprl_cluster_openai_staleness_grid.sh` — NEW: platform wrapper
+- `run_hprl_qwen2.5_7b.sh` — env-overridable trainer knobs + `trainer.total_training_steps`
+
+## 2026-07-22 — OPENAI-API selector mode (`SELECTOR_API_MODE=openai`): train with NO selector pods — new launchers for sync + async
+
+The frozen hint selector can now be the **real OpenAI API** instead of the self-hosted
+gpt-oss-20b vLLM pods. Same prompts (single-pick v4_cite + multi-round Template F), same
+tolerant parser, same graceful degradation and `hint_call_failed` accounting — only the
+transport under `HintSelector._complete` changes, so both agent loops (and sync + async
+training) get the mode for free through the one `HintSelector.from_env()` construction site.
+
+**Model choice.** Default `gpt-5-mini` @ `reasoning_effort=low` — the winner of today's
+offline multi-round eval (`selector/test_cite/openai-models`, 266-row benchmark, n=8):
+agree_merged **0.873** / newly_recall **0.869** / citation-verbatim **0.927**, beating the
+gpt-oss-20b reference (0.835 / 0.688 / 0.646) on every metric. `gpt-5.4-mini` (0.850) and
+`gpt-5.4-nano` (0.823) also clear the reference; `SELECTOR_MODEL` swaps them in.
+
+**Mechanics (`hint_selector.py`).**
+* `from_env`: `SELECTOR_API_MODE=openai` → endpoint from `SELECTOR_OPENAI_BASE_URL`
+  (default `https://api.openai.com/v1`; the `SELECTOR_BASE_URL(S)` localhost defaults are
+  ignored), key from `OPENAI_API_KEY` (fallback `SELECTOR_API_KEY`), default model
+  `gpt-5-mini` (+ loud warning if a `gpt-oss*` name leaks into openai mode).
+* Per-model request quirks (validated by the offline eval's `openai_sampler`): reasoning
+  models (`gpt-5*`/`o*`) take `max_completion_tokens` + `reasoning_effort` and REJECT
+  non-default `temperature`/`top_p` (omitted); chat models keep the usual sampling params.
+* `SELECTOR_MAX_CONCURRENCY` (default 16): in-flight cap PER agent-loop worker process,
+  openai mode only — one training step fans out hundreds of concurrent hint calls, which
+  uncapped would trip org-wide 429 bursts; local vLLM keeps its uncapped fan-out
+  (continuous batching wants it). Lazy `asyncio.Semaphore` bound to the worker's loop.
+* Retries back off exponentially (+jitter, 2s base / 30s cap) in openai mode — one shared
+  endpoint, so retry-after-a-beat recovers a rate-limit burst; local mode keeps instant
+  multi-server failover. Cumulative `prompt/completion_tokens` logged every 200 calls per
+  worker (cost proxy; `completion_tokens` includes billed hidden reasoning tokens).
+
+**Launchers (run on EVERY pod, like the originals).**
+* `launch_hprl_cluster_openai.sh` (sync) / `launch_hprl_cluster_openai_async.sh`
+  (async, = TRAIN_SCRIPT→`run_hprl_async.sh`): NO selector/training split — every pod is a
+  training node (`TRAIN_NNODES=WORLD_SIZE`, validated), no vLLM selector bring-up, no
+  endpoint rendezvous, no fabric-NIC advertisement. `OPENAI_API_KEY` from env else
+  `api_keys.sh` (shared FS; fixed a trailing curly-quote that broke `source`). Kept: the
+  per-pod selector-check log (same `logs/selector_check/` layout), the stale-rollout-vLLM
+  reap, and a **fail-fast `/models` probe from every pod** (bad key or no API egress
+  aborts at launch instead of silently degrading every hint call; `OPENAI_PROXY` supported
+  and proxy vars forwarded into the workers' runtime env).
+* `run_hprl_qwen2.5_7b.sh` + `run_hprl_async.sh`: export + forward the new
+  `SELECTOR_API_MODE` / `SELECTOR_OPENAI_BASE_URL` / `SELECTOR_REASONING_EFFORT` /
+  `SELECTOR_MAX_CONCURRENCY` / `OPENAI_API_KEY` (+ conditional proxy lines) through the
+  Ray runtime env. Defaults keep local mode byte-identical.
+
+**Cost.** ~$0.001–0.01/call at gpt-5-mini prices depending on trace length (the prompt
+embeds the full student trace). Watch the per-worker usage lines; the per-call dump
+(`HPRL_SELECTOR_DUMP_DIR`) stays the exact record.
+
+**Validation.** `test_openai_selector.py` (13/13: env plumbing, per-model kwargs,
+concurrency cap ≤ limit under a 10-way fan-out, backoff retry, local-mode invariance);
+existing `test_auto_hint.py` 39/39 unchanged; live smoke: one real `select_multi` against
+gpt-5-mini picked the correct pending hint end-to-end (1597 prompt + 402 completion toks);
+both launchers dry-run to the `ray_cluster_launch` handoff with a stubbed RAY_LAUNCH, and
+a bad key aborts at the probe.
+
+### Files touched
+- `hint_selector.py` — `API_MODE_*`, `is_reasoning_model`, openai branch in `from_env`, `_request_kwargs` / `_concurrency_sem` / `_one_request` / `_note_usage`, backoff in `_complete`
+- `launch_hprl_cluster_openai.sh` — NEW: sync cluster entry, all pods train, API probe
+- `launch_hprl_cluster_openai_async.sh` — NEW: async wrapper (TRAIN_SCRIPT=run_hprl_async.sh)
+- `run_hprl_qwen2.5_7b.sh` / `run_hprl_async.sh` — new SELECTOR_*/OPENAI env + runtime-env forwarding (+ proxy lines)
+- `test_openai_selector.py` — NEW: 13 self-running tests
+- `api_keys.sh` — trailing U+201D → `"` (source was broken)
+
 ## 2026-07-15 — FULLY-ASYNC training mode (disaggregated Rollouter/Trainer pools on verl `fully_async_policy`), flag-gated — new entry point + launch scripts; NOT yet cluster-validated
 
 HPRL can now train on verl's fully-async architecture: the training pods split into a ROLLOUT pool

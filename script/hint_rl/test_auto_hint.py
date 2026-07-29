@@ -24,8 +24,10 @@ from hint_penalty import compute_hint_penalties
 from selector_multi import (
     locate_quote_end,
     pending_hint_ids,
+    pool_hint_texts,
     prune_hint_pool,
     render_hints_with_status,
+    resolve_selected_hint,
 )
 from step_advantage import (
     apply_step_level_advantages,
@@ -752,6 +754,86 @@ def test_step_adv_penalty_vec_matches_loop_order_under_prune():
     # path exists to remove.
     pv_raw, K_raw = trainer_cls._step_adv_penalty_vec(extra_info, 0.8, 1.5, "easy", True)
     assert K_raw == 5 and pv_raw[0] == 0.0, (K_raw, pv_raw)
+
+
+# --------------------------------------------------------------------------- #
+# resolve_selected_hint -- reconciling the selector's (id, text) with the pool
+# actually offered (guards the completed/step-adv/penalty state against
+# mislabeled ids, which caused verbatim duplicate hints in 2.4% of the
+# 20260723 dolci run's hinted rollouts).
+# --------------------------------------------------------------------------- #
+_RES_POOL = {"steps": [
+    {"step_id": "1", "purpose": "p1", "hints": [
+        {"hint_id": "1.1", "hint": "Count 5!=120 permutations for each fixed first digit."},
+        {"hint_id": "1.2", "hint": "Compute the residual rank inside the block: 144-120=24."},
+    ]},
+    {"step_id": "2", "purpose": "p2", "hints": [
+        {"hint_id": "2.1", "hint": "With first digit 2 fixed, count 4!=24 permutations."},
+        {"hint_id": "2.2", "hint": "Since the residual rank is 24, identify it as the last entry."},
+    ]},
+]}
+_RES_PEND = ["1.2", "2.1", "2.2"]
+
+
+def test_pool_hint_texts_walks_all_steps():
+    t = pool_hint_texts(_RES_POOL)
+    assert set(t) == {"1.1", "1.2", "2.1", "2.2"}
+    assert t["2.2"].startswith("Since the residual rank")
+    assert pool_hint_texts("not json {") == {}
+
+
+def test_resolve_passthrough_ok_and_paraphrase():
+    # correct id + verbatim text: untouched, no flags
+    hid, txt, fl = resolve_selected_hint(
+        "2.1", "With first digit 2 fixed, count 4!=24 permutations.", _RES_POOL, _RES_PEND)
+    assert (hid, fl) == ("2.1", []) and txt.startswith("With first digit")
+    # correct offered id + sanctioned rephrasing: NEVER remapped (exact-only rule)
+    hid, txt, fl = resolve_selected_hint(
+        "1.2", "Work out the leftover rank: 144-120 gives 24.", _RES_POOL, _RES_PEND)
+    assert (hid, fl) == ("1.2", [])
+
+
+def test_resolve_exact_text_remaps_mislabeled_id():
+    # the a56f6694ddde case: text is verbatim 2.2, recorded id said 1.2 ->
+    # id follows the text, so 2.2 is excluded from later rounds (no duplicate).
+    hid, txt, fl = resolve_selected_hint(
+        "1.2", "Since the residual rank is 24,  identify it as the last entry.",
+        _RES_POOL, _RES_PEND)
+    assert hid == "2.2" and fl == ["id_remapped"]
+
+
+def test_resolve_out_of_pool_fuzzy_and_keep():
+    # unoffered id + text near-identical to an offered hint -> fuzzy remap
+    hid, txt, fl = resolve_selected_hint(
+        "9.9", "With the first digit 2 fixed, count 4! = 24 permutations.",
+        _RES_POOL, _RES_PEND)
+    assert hid == "2.1" and fl == ["id_remapped"]
+    # unoffered id + text matching nothing offered -> kept, flagged
+    hid, txt, fl = resolve_selected_hint(
+        "9.9", "Try a completely different substitution u = x^2.", _RES_POOL, _RES_PEND)
+    assert hid == "9.9" and fl == ["id_out_of_pool"]
+
+
+def test_resolve_empty_text_from_pool():
+    hid, txt, fl = resolve_selected_hint("2.1", "", _RES_POOL, _RES_PEND)
+    assert txt.startswith("With first digit 2 fixed") and fl == ["text_from_pool"]
+    # empty text + unknown id -> unchanged (placeholder path downstream)
+    hid, txt, fl = resolve_selected_hint("9.9", "", _RES_POOL, _RES_PEND)
+    assert (hid, txt, fl) == ("9.9", "", [])
+
+
+def test_resolve_repeat_delivery_flagged():
+    # selector re-emits an ALREADY-APPLIED id (not offered any more) with its
+    # own text: kept + counted, so the caller can see repeat injections.
+    hid, txt, fl = resolve_selected_hint(
+        "1.1", "Count 5!=120 permutations for each fixed first digit.",
+        _RES_POOL, _RES_PEND, applied_ids=["1.1"])
+    assert hid == "1.1" and "repeat" in fl and "id_out_of_pool" in fl
+
+
+def test_resolve_unparseable_pool_passthrough():
+    hid, txt, fl = resolve_selected_hint("1.1", "whatever", "not json {", _RES_PEND)
+    assert (hid, txt, fl) == ("1.1", "whatever", [])
 
 
 def _run_all():

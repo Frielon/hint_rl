@@ -37,6 +37,12 @@ selector/**/*.json
 
 selector/**/**/*.json
 
+selector/**/**/**/*.json
+
+selector/**/**/**/**/*.json
+
+selector/**/**/**/**/**/*.json
+
 dataset/
 
 custom_data/

@@ -103,6 +103,9 @@ class HintRewardManager(RewardManagerBase):
             "hint_calls_with_box", "hint_pool_exhausted",
             # finalize_incorrect: the WRONG-rollout-as-correct signal + the stuck hint k.
             "finalized_incorrect", "final_hint_step", "final_hint_id", "final_hint_exhausted",
+            # selector (id, text) reconciliation counters (resolve_selected_hint):
+            # remapped/out-of-pool ids, pool-resolved empty texts, repeat deliveries.
+            "hint_id_remapped", "hint_id_out_of_pool", "hint_text_from_pool", "hint_repeat",
         ):
             if k not in extra_info and k in ntb:
                 extra_info[k] = _to_py(ntb.get(k))

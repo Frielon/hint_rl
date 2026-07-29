@@ -53,7 +53,12 @@ from verl.workers.rollout.replica import TokenOutput
 
 from hint_agent_loop import HintAgentLoop, _dump_selector_call
 from hint_selector import build_trace, hint_id_of
-from selector_multi import locate_quote_end, pending_hint_ids, prune_hint_pool
+from selector_multi import (
+    locate_quote_end,
+    pending_hint_ids,
+    prune_hint_pool,
+    resolve_selected_hint,
+)
 from step_advantage import classify_length_cut as _classify_length_cut, prefix_state as _prefix_state
 
 # Same boxed-answer grader the reward uses, so the loop's "is it correct yet?"
@@ -245,6 +250,13 @@ class AutoHintAgentLoop(HintAgentLoop):
         agent_data.extra_fields.setdefault("hint_select_calls", 0)
         agent_data.extra_fields.setdefault("hint_calls_total", 0)
         agent_data.extra_fields.setdefault("hint_calls_with_box", 0)
+        # resolve_selected_hint reconciliation counters -- initialized on EVERY
+        # rollout (DataProto.concat key-consistency, same as the keys above);
+        # incremented flag-wise at the selection site.
+        agent_data.extra_fields.setdefault("hint_id_remapped", 0)
+        agent_data.extra_fields.setdefault("hint_id_out_of_pool", 0)
+        agent_data.extra_fields.setdefault("hint_text_from_pool", 0)
+        agent_data.extra_fields.setdefault("hint_repeat", 0)
         agent_data.extra_fields.setdefault("turn_lens", [])
         agent_data.extra_fields.setdefault("hint_pool_exhausted", 0)
         agent_data.extra_fields.setdefault("finalized_incorrect", 0)
@@ -442,6 +454,44 @@ class AutoHintAgentLoop(HintAgentLoop):
         completed_hints = selection.get("completed_hints")
         if not isinstance(completed_hints, list):
             completed_hints = []
+
+        # Reconcile (id, text) against the pool actually OFFERED this call (the
+        # ``pending`` ids). A mislabeled id poisons ``completed``/step-adv/penalty
+        # state and lets the truly-given hint be re-selected (verbatim duplicate
+        # hints in 2.4% of the 20260723 dolci run's hinted rollouts); an empty
+        # text with a valid id resolves to the pool's authoritative text instead
+        # of the injected placeholder.
+        hid, hint_text, _resolve_flags = resolve_selected_hint(
+            hid, hint_text, pool, pending,
+            applied_ids=[a.get("hint_id") for a in applied],
+        )
+        for _flag in _resolve_flags:
+            _k = "hint_" + _flag  # hint_id_remapped / hint_id_out_of_pool / hint_text_from_pool / hint_repeat
+            agent_data.extra_fields[_k] = agent_data.extra_fields.get(_k, 0) + 1
+            agent_data.metrics[_k] = agent_data.metrics.get(_k, 0) + 1
+
+        # Selector DECLINED: no id and no text even after pool reconciliation
+        # (the "all pending hints already achieved" answer: hint_id "" + hint "").
+        # Before this guard, that answer was injected as the "(the selector
+        # returned an empty hint)" placeholder, charged the per-hint penalty and
+        # appended "" to ``completed``. Treat it like pool-exhaustion instead: a
+        # benign stop -- no injection, no penalty, a zero-advantage no-fail
+        # segment (the selector gave us no failed hint to price).
+        if hid is None and not hint_text:
+            agent_data.metrics["hint_selector_declined"] = (
+                agent_data.metrics.get("hint_selector_declined", 0) + 1
+            )
+            agent_data.extra_fields["hint_selector_declined"] = (
+                agent_data.extra_fields.get("hint_selector_declined", 0) + 1
+            )
+            if self.step_adv_enable:
+                self._record_step_adv_turn(
+                    agent_data, turn_start, turn_end, turn_end, pre_state, pre_state, is_fail=0
+                )
+            self._dump(agent_data, turn_start, turn_end, problem, trace, completed, selection, err,
+                       completed_hints=completed_hints,
+                       selector_raw=_raw, selector_prompt=_prompt)
+            return AgentState.TERMINATED
 
         # Verified-prefix boundary for THIS turn: keep tokens up to the last
         # selector-verified sentence in the turn; disable the (unverified) tail.

@@ -108,6 +108,20 @@ export SELECTOR_TOP_P=${SELECTOR_TOP_P:-1.0}
 export SELECTOR_MAX_TOKENS=${SELECTOR_MAX_TOKENS:-16000}
 export SELECTOR_REQUEST_TIMEOUT_S=${SELECTOR_REQUEST_TIMEOUT_S:-600}
 export SELECTOR_MAX_RETRIES=${SELECTOR_MAX_RETRIES:-3}
+# ---- selector API mode: local vLLM endpoints (default) vs the REAL OpenAI API.
+# SELECTOR_API_MODE=openai (set by launch_hprl_cluster_openai.sh, which also
+# picks SELECTOR_MODEL) sends every hint call to SELECTOR_OPENAI_BASE_URL with
+# OPENAI_API_KEY -- no selector pods at all. The SELECTOR_BASE_URL(S) pair above
+# is ignored in that mode. Reasoning models (gpt-5*/o*) automatically switch to
+# max_completion_tokens + SELECTOR_REASONING_EFFORT and drop temperature/top_p
+# (the API rejects non-default values). SELECTOR_MAX_CONCURRENCY caps in-flight
+# calls PER agent-loop worker process in openai mode only (rate-limit hygiene);
+# local vLLM keeps the uncapped fan-out it wants for continuous batching.
+export SELECTOR_API_MODE=${SELECTOR_API_MODE:-local}
+export SELECTOR_OPENAI_BASE_URL=${SELECTOR_OPENAI_BASE_URL:-"https://api.openai.com/v1"}
+export SELECTOR_REASONING_EFFORT=${SELECTOR_REASONING_EFFORT:-low}
+export SELECTOR_MAX_CONCURRENCY=${SELECTOR_MAX_CONCURRENCY:-16}
+export OPENAI_API_KEY=${OPENAI_API_KEY:-}
 
 # Cluster
 NNODES=${NNODES:-4}
@@ -321,6 +335,15 @@ EXP_LOG_DIR=${EXP_LOG_DIR:-"${LOG_DIR}/${exp_name}"}
 LOG_FILE=${LOG_FILE:-"${EXP_LOG_DIR}/${exp_name}.jsonl"}
 CONSOLE_LOG=${CONSOLE_LOG:-"${EXP_LOG_DIR}/${exp_name}.${RUN_ID}.console.log"}
 mkdir -p "${EXP_LOG_DIR}"
+# Resume-in-place (exp_name pinned to a prior run) re-enters an existing exp
+# dir, and verl's FileLogger opens VERL_FILE_LOGGER_PATH with mode "wb" --
+# which would TRUNCATE the prior segment's metrics. Rotate it aside first
+# (this script runs on the Ray head only, so no cross-pod race); cat the
+# segments in stamp order to rebuild the full curve. Fresh runs never hit
+# this: their stamped exp_name makes a brand-new dir.
+if [ -f "${LOG_FILE}" ]; then
+    mv "${LOG_FILE}" "${LOG_FILE%.jsonl}.pre-${RUN_ID}.jsonl"
+fi
 
 # ---- HPRL dynamic-budget ratchet (paper Section 7) ------------------------
 # Master switch + per-experiment budget-state store (written by the trainer
@@ -448,6 +471,24 @@ if [ "${HPRL_DUMP_SELECTOR}" != "0" ] && [ -z "${HPRL_SELECTOR_DUMP_DIR}" ]; the
   HPRL_SELECTOR_DUMP_DIR="${EXP_LOG_DIR}/selector_calls"
 fi
 
+# Optional HARD step bound (same convention as run_hprl_async.sh: 0/empty = off
+# -> trainer.total_training_steps=null, so the total_epochs bound alone applies).
+# Used by staleness_grid.sh to run short fixed-length benchmark trials.
+if ! [ "${TOTAL_TRAINING_STEPS:-0}" -gt 0 ] 2>/dev/null; then
+    TOTAL_TRAINING_STEPS=null
+fi
+
+# Egress-proxy forwarding (openai selector mode on a fabric that needs one):
+# any proxy var set at submit time is forwarded verbatim into the workers'
+# runtime env. Conditional lines -- injecting an EMPTY proxy var could confuse
+# httpx/vLLM networking in the (default) proxy-less local mode.
+SELECTOR_PROXY_ENV=""
+for _pv in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+    if [ -n "${!_pv:-}" ]; then
+        SELECTOR_PROXY_ENV="${SELECTOR_PROXY_ENV}  ${_pv}: \"${!_pv}\""$'\n'
+    fi
+done
+
 RUNTIME_ENV_RUN=${RUNTIME_ENV_RUN:-"${LOG_DIR}/.runtime_env.${RUN_ID}.yaml"}
 ( umask 077
   cat > "${RUNTIME_ENV_RUN}" <<EOF
@@ -468,7 +509,12 @@ env_vars:
   SELECTOR_MAX_TOKENS: "${SELECTOR_MAX_TOKENS}"
   SELECTOR_REQUEST_TIMEOUT_S: "${SELECTOR_REQUEST_TIMEOUT_S}"
   SELECTOR_MAX_RETRIES: "${SELECTOR_MAX_RETRIES}"
-  HPRL_SELECTOR_DUMP_DIR: "${HPRL_SELECTOR_DUMP_DIR}"
+  SELECTOR_API_MODE: "${SELECTOR_API_MODE}"
+  SELECTOR_OPENAI_BASE_URL: "${SELECTOR_OPENAI_BASE_URL}"
+  SELECTOR_REASONING_EFFORT: "${SELECTOR_REASONING_EFFORT}"
+  SELECTOR_MAX_CONCURRENCY: "${SELECTOR_MAX_CONCURRENCY}"
+  OPENAI_API_KEY: "${OPENAI_API_KEY}"
+${SELECTOR_PROXY_ENV}  HPRL_SELECTOR_DUMP_DIR: "${HPRL_SELECTOR_DUMP_DIR}"
   # make hint_tool.py / hint_reward_manager.py importable in the job env.
   PYTHONPATH: "${TOOL_PYTHONPATH}"
 # NOTE: do NOT add a runtime_env pip block on this air-gapped fabric. mathruler
@@ -607,11 +653,12 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     trainer.experiment_name="${exp_name}" \
     trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \
     trainer.nnodes="${NNODES}" \
-    trainer.val_before_train=True \
-    trainer.test_freq=5 \
-    trainer.save_freq=20 \
+    trainer.val_before_train=${VAL_BEFORE_TRAIN:-True} \
+    trainer.test_freq=${TEST_FREQ:-5} \
+    trainer.save_freq=${SAVE_FREQ:-20} \
     trainer.max_actor_ckpt_to_keep=100 \
-    trainer.total_epochs=40 \
+    trainer.total_epochs=${TOTAL_EPOCHS:-100} \
+    trainer.total_training_steps=${TOTAL_TRAINING_STEPS} \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.rollout_data_dir="${LOG_DIR}/${exp_name}/rollouts" \
     trainer.validation_data_dir="${LOG_DIR}/${exp_name}/val_rollouts" \

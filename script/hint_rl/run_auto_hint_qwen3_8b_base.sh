@@ -114,11 +114,12 @@ export HPRL_PRUNE_GUIDANCE=${HPRL_PRUNE_GUIDANCE:-true}
 #     an under-seeded hard problem ratchets UP on its first zero-correct step). Use
 #     dataset/dapo-3139-auto-hint.parquet for the full pool with (#major-steps) baked
 #     budgets. ---
-export TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dapo-512-auto-hint.parquet"}
+export TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dolci-rl-zero-10324-auto-hint.parquet"}
 
 # --- resume from a prior checkpoint (a .../global_step_N dir); empty = fresh (the
 #     default -- there are no prior Qwen3-8B-Base ckpts to fork). When set, TRAIN_FILE
 #     must match the ckpt's dataset (the resumed dataloader data.pt requires it). ---
+# export RESUME_FROM_PATH=${RESUME_FROM_PATH:-"${HINT_RL_HOME}/ckpt/HPRL-AutoHint-Qwen3-8B-Base/HPRL-AutoHint-Qwen3-8B-Base-dapo-20260720-235159/global_step_320"}
 export RESUME_FROM_PATH=${RESUME_FROM_PATH:-}
 
 # --- validation: the BARE (plain-prompt, no agent_name) eval sets, so eval is
@@ -185,7 +186,7 @@ export HPRL_ALLOW_DECREASE=${HPRL_ALLOW_DECREASE:-false}
 
 # --- distinct run labels in wandb ---------------------------------------------
 export project_name=${project_name:-'HPRL-AutoHint-Qwen3-8B-Base'}
-export exp_name=${exp_name:-"HPRL-AutoHint-Qwen3-8B-Base-dapo-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
+export exp_name=${exp_name:-"HPRL-AutoHint-Qwen3-8B-Base-dolci-rl-zero-10324-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
 
 echo "[run_auto_hint] auto-hint mode ON  (model=${MODEL_PATH})"
 echo "[run_auto_hint]   base-model deltas: eos=[151643,151645] via derived dir, max_response_length=${max_response_length}"

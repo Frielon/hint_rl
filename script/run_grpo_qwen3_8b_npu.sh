@@ -69,7 +69,13 @@ fi
 export WANDB_API_KEY="${WANDB_API_KEY:-${wandb_key:-}}"
 
 project_name='GRPO-Qwen3-8B-Base'
-exp_name="GRPO-Qwen3-8B-Base-dolci-zero-rl-8192-16-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
+# Resume the interrupted run: exp_name is pinned to the existing checkpoint dir
+# so CKPTS_DIR (=trainer.default_local_dir) points at it and resume_mode=auto
+# reads its latest_checkpointed_iteration.txt (global_step_300) and continues.
+# This keeps the same wandb curve, log dir, and checkpoint dir. To start a fresh
+# run instead, restore the timestamped form:
+#   exp_name="GRPO-Qwen3-8B-Base-dolci-zero-rl-8192-16-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
+exp_name="GRPO-Qwen3-8B-Base-dolci-zero-rl-8192-16-20260722-041547"
 wandb_project=${wandb_project:-"hint_rl"}
 
 adv_estimator=grpo

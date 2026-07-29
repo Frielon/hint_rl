@@ -14,9 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import random
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # Offline selector prompt + tolerant <output> parser, vendored locally in
@@ -260,6 +263,48 @@ def build_trace(messages: list[dict]) -> str:
     return trace or "(The student has not written any reasoning yet.)"
 
 
+# --- selector API mode ------------------------------------------------------
+# Which backend serves the selector calls:
+#   API_MODE_LOCAL  -- self-hosted vLLM endpoint(s) (gpt-oss-20b selector pods,
+#                      launch_hprl_cluster.sh); the original and default mode.
+#   API_MODE_OPENAI -- the REAL OpenAI API (api.openai.com): no selector pods at
+#                      all (launch_hprl_cluster_openai.sh). Endpoint from
+#                      SELECTOR_OPENAI_BASE_URL, key from OPENAI_API_KEY, and
+#                      per-model request quirks handled below (reasoning models
+#                      take max_completion_tokens + reasoning_effort and reject
+#                      temperature/top_p -- same handling the offline eval's
+#                      openai_sampler validated).
+API_MODE_LOCAL = "local"
+API_MODE_OPENAI = "openai"
+_OPENAI_MODE_ALIASES = {"openai", "api", "openai_api", "openai-api"}
+OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
+
+# Backoff between RETRIES in openai mode only (rate limits: an immediate re-send
+# mostly burns the attempt). Exponential from base, capped, x[0.5, 1.5) jitter.
+# Local mode keeps the original behavior: instant failover to the next server.
+_RETRY_BACKOFF_BASE_S = 2.0
+_RETRY_BACKOFF_CAP_S = 30.0
+# Log cumulative token usage every N successful calls (openai mode; 0 disables).
+# Per worker process -- sum across processes for the run total; the per-call
+# selector dump (HPRL_SELECTOR_DUMP_DIR) remains the exact record.
+_USAGE_LOG_EVERY = 200
+
+
+def normalize_api_mode(mode) -> str:
+    """Canonicalize an api mode to ``API_MODE_OPENAI`` or, by default, ``API_MODE_LOCAL``."""
+    s = str(mode or "").strip().lower()
+    return API_MODE_OPENAI if s in _OPENAI_MODE_ALIASES else API_MODE_LOCAL
+
+
+def is_reasoning_model(model: str) -> bool:
+    """OpenAI reasoning models (gpt-5*/o1*/o3*/o4*) hide their CoT and take
+    max_completion_tokens / reasoning_effort instead of max_tokens, and reject
+    temperature/top_p overrides (only the defaults are allowed). Same predicate
+    as the offline eval's openai_sampler.is_reasoning_model."""
+    m = str(model or "").lower()
+    return m.startswith(("o1", "o3", "o4", "gpt-5"))
+
+
 class HintSelector:
     """Async client for the frozen selector model on an OpenAI-compatible endpoint."""
 
@@ -273,6 +318,9 @@ class HintSelector:
         max_tokens: int = 16000,
         timeout: float = 600.0,
         max_retries: int = 3,
+        api_mode: str = API_MODE_LOCAL,
+        reasoning_effort: Optional[str] = None,
+        max_concurrency: int = 0,
     ):
         # base_urls: a list, or a comma-separated string -- one entry per
         # INDEPENDENT selector server. Client-side round-robin + failover across
@@ -289,28 +337,80 @@ class HintSelector:
         self.max_tokens = int(max_tokens)
         self.timeout = float(timeout)
         self.max_retries = int(max_retries)
+        self.api_mode = normalize_api_mode(api_mode)
+        self.reasoning_effort = (reasoning_effort or "").strip() or None
+        self.max_concurrency = int(max_concurrency)
         self._clients: dict[str, Any] = {}  # base_url -> AsyncOpenAI (lazy)
+        # In-flight cap (openai mode only; see _concurrency_sem). The semaphore
+        # is created lazily on the running event loop of the calling worker.
+        self._sem: Optional[asyncio.Semaphore] = None
+        self._sem_loop: Any = None
+        # Cumulative API usage of THIS worker process (openai-mode cost visibility).
+        self._n_calls = 0
+        self._usage_prompt_tokens = 0
+        self._usage_completion_tokens = 0
 
     @classmethod
     def from_env(cls) -> "HintSelector":
         """Build from the SELECTOR_* env vars the run script already exports.
 
-        ``SELECTOR_BASE_URLS`` (comma-separated, one per independent selector
-        server) takes precedence over the single ``SELECTOR_BASE_URL``.
+        ``SELECTOR_API_MODE=openai`` switches the backend to the real OpenAI API:
+        the endpoint then comes from ``SELECTOR_OPENAI_BASE_URL`` (NOT from the
+        ``SELECTOR_BASE_URL(S)`` pair, whose localhost defaults are meaningless
+        without selector pods) and the key from ``OPENAI_API_KEY`` (fallback:
+        ``SELECTOR_API_KEY``). In the default local mode ``SELECTOR_BASE_URLS``
+        (comma-separated, one per independent selector server) takes precedence
+        over the single ``SELECTOR_BASE_URL``; the openai-only knobs are inert.
         """
-        urls = os.environ.get("SELECTOR_BASE_URLS") or os.environ.get(
-            "SELECTOR_BASE_URL", "http://localhost:30000/v1"
-        )
-        return cls(
+        api_mode = normalize_api_mode(os.environ.get("SELECTOR_API_MODE", API_MODE_LOCAL))
+        if api_mode == API_MODE_OPENAI:
+            urls = os.environ.get("SELECTOR_OPENAI_BASE_URL") or OPENAI_DEFAULT_BASE_URL
+            api_key = (
+                (os.environ.get("OPENAI_API_KEY") or "").strip()
+                or os.environ.get("SELECTOR_API_KEY", "EMPTY")
+            )
+            model = os.environ.get("SELECTOR_MODEL", "gpt-5-mini")
+            if model.lower().startswith("gpt-oss"):
+                # SELECTOR_MODEL kept its local-serving default; the OpenAI API has
+                # no such model, so every call would 404 (and degrade to no-hint).
+                logger.warning(
+                    "HintSelector: SELECTOR_API_MODE=openai but SELECTOR_MODEL=%r looks "
+                    "like a locally-served model -- set SELECTOR_MODEL to a real OpenAI "
+                    "model (e.g. gpt-5-mini) or every hint call will fail.",
+                    model,
+                )
+        else:
+            urls = os.environ.get("SELECTOR_BASE_URLS") or os.environ.get(
+                "SELECTOR_BASE_URL", "http://localhost:30000/v1"
+            )
+            api_key = os.environ.get("SELECTOR_API_KEY", "EMPTY")
+            model = os.environ.get("SELECTOR_MODEL", "Qwen3.5-27B")
+        selector = cls(
             base_urls=urls,
-            model=os.environ.get("SELECTOR_MODEL", "Qwen3.5-27B"),
-            api_key=os.environ.get("SELECTOR_API_KEY", "EMPTY"),
+            model=model,
+            api_key=api_key,
             temperature=float(os.environ.get("SELECTOR_TEMPERATURE", "0.7")),
             top_p=float(os.environ.get("SELECTOR_TOP_P", "0.95")),
             max_tokens=int(os.environ.get("SELECTOR_MAX_TOKENS", "16000")),
             timeout=float(os.environ.get("SELECTOR_REQUEST_TIMEOUT_S", "600")),
             max_retries=int(os.environ.get("SELECTOR_MAX_RETRIES", "3")),
+            api_mode=api_mode,
+            reasoning_effort=os.environ.get("SELECTOR_REASONING_EFFORT", "low"),
+            max_concurrency=int(os.environ.get("SELECTOR_MAX_CONCURRENCY", "16")),
         )
+        if selector.api_mode == API_MODE_OPENAI:
+            logger.warning(
+                "HintSelector: OPENAI API mode -- model=%s base=%s effort=%s "
+                "max_concurrency=%d retries=%d timeout=%.0fs key=...%s",
+                selector.model,
+                ",".join(selector.base_urls),
+                selector.reasoning_effort,
+                selector.max_concurrency,
+                selector.max_retries,
+                selector.timeout,
+                (api_key[-4:] if api_key and api_key != "EMPTY" else "UNSET"),
+            )
+        return selector
 
     def _get_client(self, base_url: str):
         client = self._clients.get(base_url)
@@ -353,6 +453,89 @@ class HintSelector:
         selection, raw, err = await self._complete(prompt)
         return selection, raw, err, prompt
 
+    def _request_kwargs(self, prompt: str) -> dict[str, Any]:
+        """Chat-completion kwargs for one selector call, per backend/model quirks.
+
+        Local mode (and openai-mode CHAT models like gpt-4.1-mini) sends the
+        usual sampling params. Openai-mode REASONING models (gpt-5*/o*) instead
+        take ``max_completion_tokens`` (which budgets the hidden reasoning
+        tokens too) plus ``reasoning_effort``, and reject any non-default
+        ``temperature`` / ``top_p`` -- so those are omitted entirely.
+        """
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if self.api_mode == API_MODE_OPENAI and is_reasoning_model(self.model):
+            kwargs["max_completion_tokens"] = self.max_tokens
+            if self.reasoning_effort:
+                kwargs["reasoning_effort"] = self.reasoning_effort
+        else:
+            kwargs["temperature"] = self.temperature
+            kwargs["top_p"] = self.top_p
+            kwargs["max_tokens"] = self.max_tokens
+        return kwargs
+
+    def _concurrency_sem(self) -> Optional[asyncio.Semaphore]:
+        """Per-process in-flight cap, OPENAI MODE ONLY (None = uncapped).
+
+        The API enforces org-wide RPM/TPM limits, and one training step can fan
+        out hundreds of concurrent hint calls across the agent-loop workers --
+        uncapped, they'd trip 429s in bursts and burn the retry budget. Local
+        vLLM WANTS the full fan-out (continuous batching), so the cap is never
+        applied there. Lazily bound to the calling worker's running event loop.
+        """
+        if self.api_mode != API_MODE_OPENAI or self.max_concurrency <= 0:
+            return None
+        loop = asyncio.get_running_loop()
+        if self._sem is None or self._sem_loop is not loop:
+            self._sem = asyncio.Semaphore(self.max_concurrency)
+            self._sem_loop = loop
+        return self._sem
+
+    async def _one_request(self, base_url: str, prompt: str):
+        """One chat completion against ``base_url`` (slot-capped in openai mode)."""
+        kwargs = self._request_kwargs(prompt)
+
+        async def _issue():
+            return await asyncio.wait_for(
+                self._get_client(base_url).chat.completions.create(**kwargs),
+                timeout=self.timeout,
+            )
+
+        sem = self._concurrency_sem()
+        if sem is None:
+            return await _issue()
+        async with sem:
+            return await _issue()
+
+    def _note_usage(self, resp) -> None:
+        """Accumulate API token usage; periodically log it in openai mode.
+
+        Per worker process. ``completion_tokens`` includes the hidden reasoning
+        tokens of reasoning models (that's what's billed), so the log line is an
+        honest cost proxy: cost ~ prompt_tokens x input price + completion_tokens
+        x output price for SELECTOR_MODEL.
+        """
+        self._n_calls += 1
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            self._usage_prompt_tokens += int(getattr(usage, "prompt_tokens", 0) or 0)
+            self._usage_completion_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
+        if (
+            self.api_mode == API_MODE_OPENAI
+            and _USAGE_LOG_EVERY > 0
+            and self._n_calls % _USAGE_LOG_EVERY == 0
+        ):
+            logger.warning(
+                "HintSelector[%s]: %d calls this worker -- prompt_tokens=%d "
+                "completion_tokens=%d (sum across workers for the run total)",
+                self.model,
+                self._n_calls,
+                self._usage_prompt_tokens,
+                self._usage_completion_tokens,
+            )
+
     async def _complete(
         self, prompt: str
     ) -> tuple[Optional[dict], Optional[str], Optional[str]]:
@@ -364,23 +547,23 @@ class HintSelector:
         ``max_retries`` >= 2 so a failover attempt is actually made. Shared by
         ``select`` (single-pick prompt) and ``select_multi`` (multi-round prompt);
         the only difference between the two is which prompt template is sent.
+
+        Openai mode adds an exponential backoff (+jitter) before each retry --
+        there is one shared endpoint, so retry-after-a-beat is what recovers a
+        rate-limit burst, not failover. Local mode keeps the original instant
+        failover (no sleeps).
         """
         n = len(self.base_urls)
         start = random.randrange(n)
         last_err = None
         for attempt in range(self.max_retries):
             base_url = self.base_urls[(start + attempt) % n]
+            if attempt > 0 and self.api_mode == API_MODE_OPENAI:
+                delay = min(_RETRY_BACKOFF_BASE_S * (2 ** (attempt - 1)), _RETRY_BACKOFF_CAP_S)
+                await asyncio.sleep(delay * (0.5 + random.random()))
             try:
-                resp = await asyncio.wait_for(
-                    self._get_client(base_url).chat.completions.create(
-                        model=self.model,
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=self.temperature,
-                        top_p=self.top_p,
-                        max_tokens=self.max_tokens,
-                    ),
-                    timeout=self.timeout,
-                )
+                resp = await self._one_request(base_url, prompt)
+                self._note_usage(resp)
                 raw = resp.choices[0].message.content or ""
                 selection, perr = parse_output(raw)
                 if selection is not None:

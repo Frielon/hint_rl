@@ -1,1 +1,1 @@
-export OPENAI_API_KEY="<REDACTED>”
+export OPENAI_API_KEY="<REDACTED>"

@@ -102,8 +102,12 @@ clip_ratio_high=0.28
 loss_agg_mode="token-mean"
 
 # ---- lengths: multi-turn trajectories accumulate tokens across turns ------
-max_prompt_length=2048
-max_response_length=28000
+# Env-overridable like the sync job (they were hardcoded before, which silently
+# ignored staleness_grid.sh's max_response_length export): the qwen3-8b-base
+# async wrapper exports max_response_length=30720 so prompt+response fits that
+# model's native 32768 exactly.
+max_prompt_length=${max_prompt_length:-2048}
+max_response_length=${max_response_length:-32768}
 
 # ---- multi-turn / hint knobs (identical to the sync job) -------------------
 max_turns=${max_turns:-10}
@@ -122,6 +126,18 @@ export SELECTOR_TOP_P=${SELECTOR_TOP_P:-1.0}
 export SELECTOR_MAX_TOKENS=${SELECTOR_MAX_TOKENS:-16000}
 export SELECTOR_REQUEST_TIMEOUT_S=${SELECTOR_REQUEST_TIMEOUT_S:-600}
 export SELECTOR_MAX_RETRIES=${SELECTOR_MAX_RETRIES:-3}
+# ---- selector API mode: local vLLM endpoints (default) vs the REAL OpenAI API.
+# SELECTOR_API_MODE=openai (set by launch_hprl_cluster_openai_async.sh, which
+# also picks SELECTOR_MODEL) sends every hint call to SELECTOR_OPENAI_BASE_URL
+# with OPENAI_API_KEY -- no selector pods at all; the SELECTOR_BASE_URL(S) pair
+# above is ignored. Reasoning models (gpt-5*/o*) switch to max_completion_tokens
+# + SELECTOR_REASONING_EFFORT and drop temperature/top_p. SELECTOR_MAX_CONCURRENCY
+# caps in-flight calls PER agent-loop worker process (openai mode only).
+export SELECTOR_API_MODE=${SELECTOR_API_MODE:-local}
+export SELECTOR_OPENAI_BASE_URL=${SELECTOR_OPENAI_BASE_URL:-"https://api.openai.com/v1"}
+export SELECTOR_REASONING_EFFORT=${SELECTOR_REASONING_EFFORT:-low}
+export SELECTOR_MAX_CONCURRENCY=${SELECTOR_MAX_CONCURRENCY:-16}
+export OPENAI_API_KEY=${OPENAI_API_KEY:-}
 
 # ---- cluster: split the NNODES training pods into the two pools ------------
 # NNODES is the TOTAL training-pod count (what ray_cluster_launch.sh waited
@@ -131,9 +147,9 @@ export SELECTOR_MAX_RETRIES=${SELECTOR_MAX_RETRIES:-3}
 # Rebalance with the fully_async/{trainer,rollouter}/idle_ratio wandb metrics:
 # high rollouter idle + low trainer idle -> shift a node to the trainer pool,
 # and vice versa.
-NNODES=${NNODES:-4}
+NNODES=${NNODES:-5}
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
-ROLLOUT_NNODES=${ROLLOUT_NNODES:-$((NNODES / 2))}
+ROLLOUT_NNODES=${ROLLOUT_NNODES:-4}
 TRAINER_NNODES=${TRAINER_NNODES:-$((NNODES - ROLLOUT_NNODES))}
 if [ "${TRAINER_NNODES}" -lt 1 ] || [ "${ROLLOUT_NNODES}" -lt 1 ]; then
     echo "[run_hprl_async] FATAL: need >=1 trainer node and >=1 rollout node" \
@@ -157,7 +173,7 @@ train_prompt_mini_bsz=64
 # ---- async pipeline knobs ---------------------------------------------------
 # See header for semantics. Defaults: sync-equivalent update cadence (64
 # prompts per weight sync), 0.5 staleness, partial rollout on.
-STALENESS_THRESHOLD=${STALENESS_THRESHOLD:-0.5}
+STALENESS_THRESHOLD=${STALENESS_THRESHOLD:-1.9}
 TRIGGER_PARAMETER_SYNC_STEP=${TRIGGER_PARAMETER_SYNC_STEP:-1}
 REQUIRE_BATCHES=${REQUIRE_BATCHES:-1}
 PARTIAL_ROLLOUT=${PARTIAL_ROLLOUT:-True}
@@ -350,6 +366,17 @@ if [ "${HPRL_DUMP_SELECTOR}" != "0" ] && [ -z "${HPRL_SELECTOR_DUMP_DIR}" ]; the
   HPRL_SELECTOR_DUMP_DIR="${EXP_LOG_DIR}/selector_calls"
 fi
 
+# Egress-proxy forwarding (openai selector mode on a fabric that needs one):
+# any proxy var set at submit time is forwarded verbatim into the workers'
+# runtime env. Conditional lines -- injecting an EMPTY proxy var could confuse
+# httpx/vLLM networking in the (default) proxy-less local mode.
+SELECTOR_PROXY_ENV=""
+for _pv in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+    if [ -n "${!_pv:-}" ]; then
+        SELECTOR_PROXY_ENV="${SELECTOR_PROXY_ENV}  ${_pv}: \"${!_pv}\""$'\n'
+    fi
+done
+
 RUNTIME_ENV_RUN=${RUNTIME_ENV_RUN:-"${LOG_DIR}/.runtime_env.${RUN_ID}.yaml"}
 ( umask 077
   cat > "${RUNTIME_ENV_RUN}" <<EOF
@@ -370,7 +397,12 @@ env_vars:
   SELECTOR_MAX_TOKENS: "${SELECTOR_MAX_TOKENS}"
   SELECTOR_REQUEST_TIMEOUT_S: "${SELECTOR_REQUEST_TIMEOUT_S}"
   SELECTOR_MAX_RETRIES: "${SELECTOR_MAX_RETRIES}"
-  HPRL_SELECTOR_DUMP_DIR: "${HPRL_SELECTOR_DUMP_DIR}"
+  SELECTOR_API_MODE: "${SELECTOR_API_MODE}"
+  SELECTOR_OPENAI_BASE_URL: "${SELECTOR_OPENAI_BASE_URL}"
+  SELECTOR_REASONING_EFFORT: "${SELECTOR_REASONING_EFFORT}"
+  SELECTOR_MAX_CONCURRENCY: "${SELECTOR_MAX_CONCURRENCY}"
+  OPENAI_API_KEY: "${OPENAI_API_KEY}"
+${SELECTOR_PROXY_ENV}  HPRL_SELECTOR_DUMP_DIR: "${HPRL_SELECTOR_DUMP_DIR}"
   # make the HPRL modules importable in every actor of the job.
   PYTHONPATH: "${TOOL_PYTHONPATH}"
 EOF

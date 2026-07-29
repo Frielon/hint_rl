@@ -31,6 +31,7 @@ custom dataset, and a `RayPPOTrainer` subclass — with **no edits to verl core*
 | `main_hprl.py` / `config/hprl_trainer.yaml` | Recipe entry: stock `TaskRunner`/`run_ppo` with the trainer swapped for `HPRLRayPPOTrainer`; config = `ppo_trainer` + the `data.hprl` knobs. |
 | `run_hprl_qwen2.5_7b.sh` | Launch script (multi-turn GRPO + dynamic budget, derived from `script/run_grpo_qwen2.5_7b_npu.sh`). |
 | `launch_hprl_cluster.sh` | 5-node cluster entrypoint (run on every pod): the selector node serves `gpt-oss-20b` via vLLM (DP=8); the other 4 nodes run `ray_cluster_launch.sh` → `run_hprl`. |
+| `launch_hprl_cluster_openai.sh` / `launch_hprl_cluster_openai_async.sh` | Cluster entrypoints with the **OpenAI API as the selector** (`SELECTOR_API_MODE=openai`, default `gpt-5-mini` @ `reasoning_effort=low`): **no selector pods** — every pod is a training node. Key from env or `api_keys.sh`; fail-fast `/v1/models` probe per pod. Sync (`TRAIN_SCRIPT` default = the sync launcher's) / fully-async (`run_hprl_async.sh`) variants. |
 
 ## Hint mechanism: the `<hint_call/>` sentinel
 
@@ -151,6 +152,23 @@ Selector call params (env → `HintSelector.from_env`, forwarded by `run_hprl`):
 (16000), `SELECTOR_REQUEST_TIMEOUT_S` (600), `SELECTOR_MAX_RETRIES` (3). The
 endpoint is published early, so training starts in parallel with model loading;
 hint calls retry and degrade gracefully (unaided) if the selector is slow/down.
+
+### Cluster launch, OpenAI-API selector (no selector pods)
+
+Use `launch_hprl_cluster_openai.sh` (sync) or `launch_hprl_cluster_openai_async.sh`
+(fully-async) as the entrypoint on **every** pod instead. `SELECTOR_API_MODE=openai`
+routes each hint call to `SELECTOR_OPENAI_BASE_URL` (default `api.openai.com/v1`)
+with `OPENAI_API_KEY` (env, else `api_keys.sh`); **all** `WORLD_SIZE` pods form the
+Ray training cluster — no vLLM selector, no endpoint rendezvous. Default model
+`gpt-5-mini` @ `reasoning_effort=low` (best of the offline multi-round eval,
+2026-07-22: agree_merged 0.873 vs gpt-oss-20b's 0.835). Reasoning models
+(`gpt-5*`/`o*`) automatically use `max_completion_tokens` + effort and drop
+`temperature`/`top_p`; `SELECTOR_MAX_CONCURRENCY` (16) caps in-flight calls per
+agent-loop worker for rate-limit hygiene; retries back off exponentially. Every
+pod probes `/v1/models` at launch and aborts on failure (`OPENAI_PROXY` if the
+fabric needs an egress proxy; `SELECTOR_REQUIRE_REACHABLE=0` to downgrade).
+Per-worker token usage is logged every 200 calls; the `HPRL_SELECTOR_DUMP_DIR`
+per-call dump stays the exact record for cost accounting.
 
 ## Dynamic budget ratchet (paper §7) — the HPRL flag
 

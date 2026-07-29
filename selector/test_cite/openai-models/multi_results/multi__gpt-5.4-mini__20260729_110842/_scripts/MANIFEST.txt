@@ -1,0 +1,10 @@
+run_openai_multi_selection.py  <-  /share5/users/xutao.ma/project/hint_rl/selector/test_cite/openai-models/run_openai_multi_selection.py
+run_openai_multi_eval.sh  <-  /share5/users/xutao.ma/project/hint_rl/selector/test_cite/openai-models/run_openai_multi_eval.sh
+compare_multi_runs.py  <-  /share5/users/xutao.ma/project/hint_rl/selector/test_cite/openai-models/compare_multi_runs.py
+openai_sampler.py  <-  /share5/users/xutao.ma/project/hint_rl/selector/test_cite/openai-models/openai_sampler.py
+run_multi_selection.py  <-  /share5/users/xutao.ma/project/hint_rl/selector/test_cite/gpt_oss_eval/multi-cite-gpt-eval/run_multi_selection.py
+prompt_template_multiF_progress.py  <-  /share5/users/xutao.ma/project/hint_rl/selector/test_cite/openai-models/prompt_template_multiF_progress.py
+build_benchmark.py  <-  /share5/users/xutao.ma/project/hint_rl/selector/test_cite/gpt_oss_eval/multi-cite-gpt-eval/build_benchmark.py
+check_citations.py  <-  /share5/users/xutao.ma/project/hint_rl/selector/test_cite/gpt_oss_eval/check_citations.py
+run_hint_selection_model.py  <-  /share5/users/xutao.ma/project/hint_rl/selector/run_hint_selection_model.py
+utils.py  <-  /share5/users/xutao.ma/project/hint_rl/script/hint_rl/utils.py

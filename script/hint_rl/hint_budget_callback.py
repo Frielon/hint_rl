@@ -294,6 +294,18 @@ def hprl_update_budgets(
     metrics["hprl/hint_calls_applied"] = float(applied_total)
     metrics["hprl/hint_calls_failed"] = float(failed_total)
     metrics["hprl/hint_call_failed_frac"] = float(failed_total / call_total) if call_total else 0.0
+    # -------- selector (id, text) reconciliation (resolve_selected_hint) ----
+    # id_remapped: recorded id corrected to the offered hint the delivered text
+    # actually was; id_out_of_pool: selector claimed an unoffered id and the text
+    # matched nothing offered; text_from_pool: empty selector text resolved from
+    # the pool by id (would have been the "(empty hint)" placeholder before);
+    # repeat: a hint delivered twice in one rollout (should stay ~0 now).
+    for _rk in ("hint_id_remapped", "hint_id_out_of_pool", "hint_text_from_pool", "hint_repeat"):
+        _arr = ntb.get(_rk)
+        if _arr is not None:
+            _tot = sum(int(round(float(_to_py(_arr[i]) or 0))) for i in range(len(_arr)))
+            metrics[f"hprl/{_rk}"] = float(_tot)
+            metrics[f"hprl/{_rk}_frac"] = float(_tot / applied_total) if applied_total else 0.0
     # -------- protocol-violation rate: over-budget hint calls ---------------
     # Fraction of rollouts that emitted <hint_call/> after their budget was spent
     # and were floored to budget_exceeded_reward (acc=0, answer ungraded). A rising

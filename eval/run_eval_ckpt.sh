@@ -71,8 +71,11 @@ RUNS=(
   # "autohint-olmo-512|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Olmo-3-7B-Instruct-SFT/HPRL-AutoHint-Olmo-3-7B-Instruct-SFT-dapo-20260701-220850"
   # "autohint-olmo-512|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Olmo-3-7B-Instruct-SFT/HPRL-AutoHint-Olmo-3-7B-Instruct-SFT-dapo-20260630-224821"
   # "grpo-olmo-512|$HINT_RL_HOME/ckpt/GRPO-Olmo-3-7B-Instruct-SFT/GRPO-Olmo-3-7B-Instruct-SFT-dapo-512-20260702-155352"
-  "hprl-qwen3-base-512|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Qwen3-8B-Base/HPRL-AutoHint-Qwen3-8B-Base-dapo-20260720-235159"
-  "grpo-qwen3-base-11k|$HINT_RL_HOME/ckpt/GRPO-Qwen3-8B-Base/GRPO-Qwen3-8B-Base-dolci-zero-rl-8192-16-20260722-041547"
+  # "hprl-qwen3-base-512|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Qwen3-8B-Base/HPRL-AutoHint-Qwen3-8B-Base-dapo-20260720-235159"
+  # "grpo-qwen3-base-11k|$HINT_RL_HOME/ckpt/GRPO-Qwen3-8B-Base/GRPO-Qwen3-8B-Base-dolci-zero-rl-8192-16-20260722-041547"
+  # "hprl-qwen3-base-async|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Qwen3-8B-Base-async/HPRL-AutoHint-Qwen3-8B-Base-async-dolci-rl-zero-10324-20260724-184955"
+  # "hprl-qwen3-base-11k-5.4-mini|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Qwen3-8B-Base/HPRL-AutoHint-Qwen3-8B-Base-dolci-rl-zero-10324-20260727-121836"
+  "dapo-qwen3-base-11k|$HINT_RL_HOME/ckpt/DAPO-Qwen3-8B-Base/DAPO-Qwen3-8B-Base-dolci-zero-rl-8192-16-20260727-223725"
 )
 
 # --- datasets (all BARE, box-scored like GRPO) -----------------------------
@@ -211,6 +214,22 @@ merge_fsdp() {
       [ -f "$actor_dir/huggingface/$f" ] && [ ! -f "$target_dir/$f" ] \
         && cp "$actor_dir/huggingface/$f" "$target_dir/" 2>/dev/null || true
     done
+  fi
+  # Strip the stale max_new_tokens (training default = 2048) from the merged
+  # generation_config.json. vLLM (--generation-config auto) otherwise loads it as
+  # a server-side default max_tokens=2048 that CAPS generation regardless of the
+  # per-request max_tokens we send -> spurious "length" truncation. Keep eos_token_id
+  # so the base model still stops correctly. Runs every invocation to repair
+  # already-merged dirs too.
+  if [ -f "$target_dir/generation_config.json" ]; then
+    "$PYTHON_BIN" - "$target_dir/generation_config.json" <<'PYGC' >&2
+import json, sys
+p = sys.argv[1]
+with open(p) as f: g = json.load(f)
+if g.pop("max_new_tokens", None) is not None or g.pop("max_length", None) is not None:
+    with open(p, "w") as f: json.dump(g, f, indent=2)
+    print(f"[eval] stripped max_new_tokens/max_length from {p}")
+PYGC
   fi
   echo "$target_dir"
 }

@@ -185,6 +185,90 @@ def pending_hint_ids(pool: Any, completed: Iterable[str]) -> list[str]:
     return out
 
 
+def pool_hint_texts(pool: Any) -> dict[str, str]:
+    """{hint_id: hint text} for every hint in the pool. {} on a parse problem."""
+    if isinstance(pool, str):
+        try:
+            pool = json.loads(pool)
+        except Exception:  # noqa: BLE001
+            return {}
+    out: dict[str, str] = {}
+    for st in (pool or {}).get("steps", []):
+        for h in st.get("hints", []):
+            hid = h.get("hint_id")
+            if hid is not None:
+                out[str(hid)] = str(h.get("hint") or "")
+    return out
+
+
+def _norm_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def resolve_selected_hint(
+    hid: Optional[str],
+    hint_text: str,
+    pool: Any,
+    pending: Iterable[str],
+    applied_ids: Iterable[str] = (),
+    fuzzy_threshold: float = 0.85,
+) -> tuple[Optional[str], str, list[str]]:
+    """Reconcile the selector's (hint_id, hint text) against the pool actually
+    OFFERED this call (the ``pending`` ids). Returns (hint_id, hint_text, flags).
+
+    The recorded id is what poisons downstream state -- it is appended to
+    ``completed`` (so a mislabeled id hides the WRONG hint while the truly-given
+    one stays pending and gets re-selected: 2.4% of hinted rollouts in the
+    20260723 dolci run received a verbatim duplicate hint), it prices the
+    step-adv failed state, and it feeds the per-hint penalty. The delivered TEXT
+    is what the student actually sees, so on a conflict the id follows the text:
+
+      * empty text + id present in the pool  -> text resolved FROM the pool
+        ("text_from_pool"); the injected placeholder carried no information.
+      * text equal (whitespace-normalized) to a different OFFERED hint
+        -> id remapped to it ("id_remapped"). Exact equality only, so the
+        selector's sanctioned rephrasings never trigger it.
+      * id not offered this call (completed already, or invented): fuzzy-remap
+        to the best-matching offered text at >= ``fuzzy_threshold``
+        ("id_remapped"), else keep it and flag "id_out_of_pool".
+      * final id already delivered once -> extra flag "repeat" (observability;
+        the caller still injects).
+
+    Pure + stdlib-only, mirroring the other pool helpers here."""
+    flags: list[str] = []
+    texts = pool_hint_texts(pool)
+    if not texts:
+        return hid, hint_text, flags
+    hid_s = str(hid) if hid is not None else None
+    pend = [str(p) for p in (pending or [])]
+    txt = _norm_text(hint_text)
+
+    if not txt and hid_s in texts and _norm_text(texts[hid_s]):
+        flags.append("text_from_pool")
+        hint_text = texts[hid_s]
+        txt = _norm_text(hint_text)
+    elif txt:
+        exact = [p for p in pend if _norm_text(texts.get(p, "")) == txt]
+        if exact and hid_s not in exact:
+            flags.append("id_remapped")
+            hid_s = exact[0]
+        elif hid_s not in pend:
+            best, best_r = None, 0.0
+            for p in pend:
+                r = difflib.SequenceMatcher(None, txt, _norm_text(texts.get(p, ""))).ratio()
+                if r > best_r:
+                    best, best_r = p, r
+            if best is not None and best_r >= fuzzy_threshold:
+                flags.append("id_remapped")
+                hid_s = best
+            else:
+                flags.append("id_out_of_pool")
+
+    if hid_s is not None and hid_s in {str(a) for a in (applied_ids or []) if a is not None}:
+        flags.append("repeat")
+    return (hid_s if hid_s is not None else hid), hint_text, flags
+
+
 def prune_hint_pool(pool: Any) -> Any:
     """Drop step-guidance (``X.0``) hints and the per-hint ``type`` field, leaving
     only substep hints (each ``{"hint_id", "hint"}``).
