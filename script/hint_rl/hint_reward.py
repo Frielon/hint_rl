@@ -361,14 +361,13 @@ def compute_score(
             "hint_calls_with_box": float(hint_calls_with_box or 0),
         }
 
-    # --- length truncation: generation hit the response-length cap -> FLOOR score ---
+    # --- length/box protocol failure -> FLOOR score -------------------------------
     # The agent loop sets extra_info["length_truncated"]=1 when an assistant turn ran
-    # into the hard response-length cap (no EOS -- the answer is cut off mid-stream). We
-    # SHORT-CIRCUIT to the floor (minimum) reward and do NOT grade the boxed answer: a
-    # run-on rollout that never properly finished should be the worst outcome, not an
-    # ordinary failure (and never accidentally rewarded for a stray earlier box). acc=0
-    # so it counts as a failure for GRPO group filtering and the budget ratchet; the
-    # hint penalty / shaping / call-bonus are all bypassed.
+    # into a hard response-length cap, or when an EOS-completed auto-hint turn omitted
+    # a boxed answer (deliberately treated as per-turn overlength). SHORT-CIRCUIT to
+    # the floor reward and do NOT grade any stray box from an earlier turn. acc=0 so
+    # it counts as a failure for GRPO filtering and the budget ratchet; hint penalty,
+    # shaping, and call bonus are bypassed.
     length_truncated = extra_info.get("length_truncated", 0)
     if hasattr(length_truncated, "item"):
         length_truncated = length_truncated.item()

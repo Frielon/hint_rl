@@ -130,6 +130,41 @@ def test_plain_valid_json_unchanged():
     assert err is None and sel["hint_id"] == "1.1" and sel["hint"] == "h"
 
 
+def test_completed_hint_progress_survives_parse():
+    block = (
+        '{"completed_hints": [{"hint_id": "1.1", "quote": "q", "why": "w", '
+        '"progress": "I used \\\\frac{a}{b} correctly."}], '
+        '"hint_id": "1.2", "reasoning_of_hint": "r", "hint": "next"}'
+    )
+    sel, err = parse_output(_wrap(block))
+    assert err is None
+    assert sel["completed_hints"][0]["quote"] == "q"
+    assert sel["completed_hints"][0]["progress"] == r"I used \frac{a}{b} correctly."
+
+
+def test_hard_parse_recovers_completed_hint_progress():
+    raw = _wrap(
+        '{\n'
+        '  "completed_hints": [\n'
+        '    {"hint_id": "1.1", "quote": "student work", "why": "done", '
+        '"progress": "I completed step 1."}\n'
+        '  ],\n'
+        '  "hint_id": "1.2",\n'
+        '  "broken": unquoted,\n'
+        '  "hint": "Use the next identity."\n'
+        '}'
+    )
+    sel, err = parse_output(raw)
+    assert err is None
+    assert sel["hint_id"] == "1.2"
+    assert sel["completed_hints"] == [{
+        "hint_id": "1.1",
+        "quote": "student work",
+        "why": "done",
+        "progress": "I completed step 1.",
+    }]
+
+
 def test_array_coercion_and_garbage():
     sel, _ = parse_output(_wrap('[{"hint_id": "1.1", "hint": "h"}, {"x": 1}]'))
     assert sel == {"hint_id": "1.1", "hint": "h"}

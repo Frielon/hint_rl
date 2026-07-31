@@ -17,6 +17,9 @@ from hint_selector import (
     API_MODE_OPENAI,
     HintSelector,
     OPENAI_DEFAULT_BASE_URL,
+    _is_retryable_openai_error,
+    _is_selector_decline,
+    _response_has_hint_field,
     is_reasoning_model,
     normalize_api_mode,
 )
@@ -85,6 +88,42 @@ def test_is_reasoning_model():
     assert not is_reasoning_model(None)
 
 
+def test_openai_retryable_error_classification():
+    class FakeHTTPError(RuntimeError):
+        def __init__(self, status_code):
+            super().__init__(f"HTTP {status_code}")
+            self.status_code = status_code
+
+    assert not _is_retryable_openai_error(FakeHTTPError(400))
+    assert not _is_retryable_openai_error(FakeHTTPError(401))
+    assert _is_retryable_openai_error(FakeHTTPError(408))
+    assert _is_retryable_openai_error(FakeHTTPError(429))
+    assert _is_retryable_openai_error(FakeHTTPError(500))
+    assert _is_retryable_openai_error(RuntimeError("connection reset"))
+
+
+def test_raw_response_hint_field_detection_is_exact():
+    assert _response_has_hint_field('<output>{"hint": ""}</output>')
+    assert _response_has_hint_field('  "hint" : "Use parity."')
+    assert not _response_has_hint_field(
+        '{"completed_hints": [], "hint_id": "", "reasoning_of_hint": "all done"}'
+    )
+    assert not _response_has_hint_field(None)
+
+
+def test_selector_decline_requires_raw_empty_hint_string():
+    raw = '<output>{"hint_id": "", "hint": ""}</output>'
+    assert _is_selector_decline({"hint_id": "", "hint": ""}, raw)
+    assert _is_selector_decline({"hint_id": "none", "hint": "  "}, raw)
+    assert not _is_selector_decline({"hint_id": "", "hint": "usable text"}, raw)
+    assert not _is_selector_decline({"hint_id": "", "hint": None}, raw)
+    assert not _is_selector_decline({"hint_id": ""}, raw)
+    assert not _is_selector_decline(
+        {"hint_id": "", "hint": ""},
+        '<output>{"hint_id": "", "reasoning_of_hint": "all hints done"}</output>',
+    )
+
+
 # --------------------------------------------------------------------------- #
 # from_env plumbing
 # --------------------------------------------------------------------------- #
@@ -120,6 +159,20 @@ def test_from_env_openai_overrides():
     assert s.api_key == "sk-fallback"
     assert s.reasoning_effort is None
     assert s.max_concurrency == 4
+
+
+def test_from_env_openai_rejects_invalid_reasoning_effort():
+    with _env(
+        SELECTOR_API_MODE="openai",
+        OPENAI_API_KEY="sk-test",
+        SELECTOR_REASONING_EFFORT="low-invalid",
+    ):
+        try:
+            HintSelector.from_env()
+        except ValueError as exc:
+            assert "Invalid SELECTOR_REASONING_EFFORT" in str(exc)
+        else:
+            raise AssertionError("invalid reasoning effort must fail before API calls")
 
 
 def test_from_env_local_mode_unchanged():
@@ -238,6 +291,72 @@ def test_complete_openai_retry_with_backoff():
     assert len(client.calls) == 2
 
 
+def test_complete_openai_retries_selector_decline():
+    declined = '<output>{"hint_id": "", "hint": "", "completed_hints": []}</output>'
+
+    def behavior(n):
+        return _fake_resp(declined if n == 1 else RAW_OK)
+
+    s = HintSelector([OPENAI_DEFAULT_BASE_URL], "gpt-5-mini", api_mode="openai", max_retries=3)
+    client = FakeClient(behavior)
+    _wire(s, client)
+    with _fast_backoff():
+        selection, raw, err = asyncio.run(s._complete("P"))
+    assert err is None and raw == RAW_OK and selection["hint_id"] == "2.1"
+    assert len(client.calls) == 2
+
+
+def test_complete_openai_returns_decline_only_after_all_attempts_decline():
+    declined = '<output>{"hint_id": "", "hint": "", "completed_hints": []}</output>'
+    s = HintSelector([OPENAI_DEFAULT_BASE_URL], "gpt-5-mini", api_mode="openai", max_retries=3)
+    client = FakeClient(lambda _n: _fake_resp(declined))
+    _wire(s, client)
+    with _fast_backoff():
+        selection, raw, err = asyncio.run(s._complete("P"))
+    assert err is None and raw == declined
+    assert selection == {"hint_id": "", "hint": "", "completed_hints": []}
+    assert len(client.calls) == 3
+
+
+def test_complete_openai_final_error_is_not_hidden_by_earlier_decline():
+    declined = '<output>{"hint_id": "", "hint": "", "completed_hints": []}</output>'
+
+    def behavior(n):
+        if n == 1:
+            return _fake_resp(declined)
+        raise RuntimeError("connection reset")
+
+    s = HintSelector([OPENAI_DEFAULT_BASE_URL], "gpt-5-mini", api_mode="openai", max_retries=2)
+    client = FakeClient(behavior)
+    _wire(s, client)
+    with _fast_backoff():
+        selection, raw, err = asyncio.run(s._complete("P"))
+    assert selection is None and raw is None and "connection reset" in err
+    assert len(client.calls) == 2
+
+
+def test_complete_empty_id_with_nonempty_hint_does_not_retry():
+    empty_id = '<output>{"hint_id": "", "hint": "Use parity.", "completed_hints": []}</output>'
+    s = HintSelector([OPENAI_DEFAULT_BASE_URL], "gpt-5-mini", api_mode="openai", max_retries=3)
+    client = FakeClient(lambda _n: _fake_resp(empty_id))
+    _wire(s, client)
+    selection, raw, err = asyncio.run(s._complete("P"))
+    assert err is None and raw == empty_id and selection["hint"] == "Use parity."
+    assert len(client.calls) == 1
+
+
+def test_complete_missing_hint_is_malformed_and_retried():
+    missing_hint = '<output>{"hint_id": "2.1", "completed_hints": []}</output>'
+    s = HintSelector([OPENAI_DEFAULT_BASE_URL], "gpt-5-mini", api_mode="openai", max_retries=2)
+    client = FakeClient(lambda _n: _fake_resp(missing_hint))
+    _wire(s, client)
+    with _fast_backoff():
+        selection, raw, err = asyncio.run(s._complete("P"))
+    assert selection is None and raw is None
+    assert 'response missing explicit "hint" field' in err
+    assert len(client.calls) == 2
+
+
 def test_complete_openai_all_attempts_fail():
     def behavior(n):
         raise RuntimeError("boom")
@@ -250,6 +369,22 @@ def test_complete_openai_all_attempts_fail():
     assert selection is None and raw is None
     assert "boom" in err
     assert len(client.calls) == 2
+
+
+def test_complete_openai_does_not_retry_permanent_400():
+    class FakeBadRequest(RuntimeError):
+        status_code = 400
+
+    def behavior(_n):
+        raise FakeBadRequest("unsupported reasoning_effort")
+
+    s = HintSelector([OPENAI_DEFAULT_BASE_URL], "gpt-5-mini", api_mode="openai", max_retries=5)
+    client = FakeClient(behavior)
+    _wire(s, client)
+    selection, raw, err = asyncio.run(s._complete("P"))
+    assert selection is None and raw is None
+    assert "unsupported reasoning_effort" in err
+    assert len(client.calls) == 1
 
 
 def test_concurrency_cap_openai_mode():

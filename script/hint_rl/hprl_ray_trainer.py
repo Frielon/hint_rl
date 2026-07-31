@@ -399,7 +399,9 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
 
         n = int(bb["advantages"].shape[0])
         acc_arr = ntb.get("acc")
-        tt_arr = ntb.get("turn_truncated")  # per-turn-cap cut flag (for the overlong penalty)
+        # Per-turn cap hit or missing-box turn (the latter is intentionally treated
+        # as overlength by the auto-hint loop).
+        tt_arr = ntb.get("turn_truncated")
         extra_arr = ntb.get("extra_info")
         total_penalty, hard_factor, guidance, guidance_free = self._step_adv_penalty_cfg()
         # STATE-COORDINATE PARITY with the rollout loop: with prune_guidance on, the loop

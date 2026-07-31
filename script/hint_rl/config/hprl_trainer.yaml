@@ -166,6 +166,10 @@ data:
       # min in-order loose-char coverage to accept a completed-hint quote as located in a
       # turn (selector_multi.locate_quote_end); a miss only makes the mask MORE conservative.
       fuzzy_threshold: 0.8
+      # Prefix every injected hint with a numbered list of all progress accumulated
+      # in this rollout: completed_hints[].progress plus previously delivered hint
+      # text. false preserves the original hint-only user message.
+      progress_message: false
       # a rollout counts as positive (-> mask applied) iff its sequence advantage strictly
       # exceeds this. 0.0 == strictly positive ("if the advantage is negative, all tokens").
       positive_eps: 0.0

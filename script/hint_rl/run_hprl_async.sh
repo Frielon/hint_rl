@@ -209,6 +209,10 @@ CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
 # knob docs; each `:=`/`:-` is a default, any exported value wins.
 HPRL_AUTO_HINT=${HPRL_AUTO_HINT:-true}
 HPRL_AUTO_HINT_FUZZY=${HPRL_AUTO_HINT_FUZZY:-0.8}
+# Prefix each new hint with cumulative completed/given progress, interleaved in
+# the original hint-set order. OpenAI launchers default this on; a bare async
+# run remains backward-compatible unless explicitly enabled.
+HPRL_AUTO_HINT_PROGRESS_MESSAGE=${HPRL_AUTO_HINT_PROGRESS_MESSAGE:-false}
 # Prune X.0 step-guidance hints from the pool before the selector sees it
 # (eval/train parity with the offline selector eval).
 HPRL_PRUNE_GUIDANCE=${HPRL_PRUNE_GUIDANCE:-true}
@@ -461,6 +465,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     data.hprl.budget_sampling.enable=${HPRL_BUDGET_SAMPLING} \
     data.hprl.auto_hint.enable=${HPRL_AUTO_HINT} \
     data.hprl.auto_hint.fuzzy_threshold=${HPRL_AUTO_HINT_FUZZY} \
+    data.hprl.auto_hint.progress_message=${HPRL_AUTO_HINT_PROGRESS_MESSAGE} \
     data.hprl.auto_hint.prune_guidance=${HPRL_PRUNE_GUIDANCE} \
     data.hprl.auto_hint.max_turn_tokens=${HPRL_MAX_TURN_TOKENS} \
     data.hprl.auto_hint.step_adv.enable=${HPRL_STEP_ADV} \
@@ -565,7 +570,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     async_training.partial_rollout=${PARTIAL_ROLLOUT} \
     async_training.use_trainer_do_validate=${USE_TRAINER_DO_VALIDATE} \
     trainer.val_before_train=${VAL_BEFORE_TRAIN:-True} \
-    trainer.test_freq=${TEST_FREQ:-5} \
+    trainer.test_freq=${TEST_FREQ:-20} \
     trainer.save_freq=${SAVE_FREQ:-20} \
     trainer.max_actor_ckpt_to_keep=100 \
     trainer.total_epochs=${TOTAL_EPOCHS:-40} \

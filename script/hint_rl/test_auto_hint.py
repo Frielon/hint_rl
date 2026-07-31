@@ -22,12 +22,15 @@ from budget_manager import BudgetManager, compute_adaptive_budget
 from hint_budget_callback import hprl_update_budgets
 from hint_penalty import compute_hint_penalties
 from selector_multi import (
+    TEMPLATE_MULTI_F,
+    format_auto_hint_message,
     locate_quote_end,
     pending_hint_ids,
     pool_hint_texts,
     prune_hint_pool,
     render_hints_with_status,
     resolve_selected_hint,
+    update_progress_state,
 )
 from step_advantage import (
     apply_step_level_advantages,
@@ -166,6 +169,87 @@ def test_pending_hint_ids():
     assert pending_hint_ids(_POOL, ["1.1", "1.2"]) == ["2.1"]
     assert pending_hint_ids(_POOL, ["1.1", "1.2", "2.1"]) == []  # exhausted
     assert pending_hint_ids(json.dumps(_POOL), ["1.1"]) == ["1.2", "2.1"]  # JSON str ok
+
+
+def test_progress_prompt_requests_student_notation_rephrasing():
+    assert '"progress": "<the hint rephrased per step 5' in TEMPLATE_MULTI_F
+    assert "Rephrase each completed hint as achieved progress" in TEMPLATE_MULTI_F
+
+
+def test_cumulative_progress_message_includes_verified_and_prior_hints():
+    state = []
+    update_progress_state(
+        state,
+        [{"hint_id": "1.1", "progress": "I established the first identity."}],
+    )
+    first = format_auto_hint_message("Now prove the bound.", state, include_progress=True)
+    assert "1. I established the first identity." in first
+    assert "Now prove the bound." in first
+
+    # The selected 1.2 hint becomes prior progress only after its own message.
+    update_progress_state(
+        state,
+        selected_hint_id="1.2",
+        selected_hint="Now prove the bound.",
+    )
+    update_progress_state(
+        state,
+        [
+            {"hint_id": "1.3", "progress": "I proved the bound."},
+            # Tolerate a parser/model variant that calls this field ``hint``.
+            {"hint_id": "2.1", "hint": "I introduced the auxiliary variable."},
+        ],
+    )
+    later = format_auto_hint_message("Evaluate the final sum.", state, include_progress=True)
+    assert later.index("1. I established") < later.index("2. Now prove")
+    assert later.index("2. Now prove") < later.index("3. I proved")
+    assert later.index("3. I proved") < later.index("4. I introduced")
+    assert "Here is a hint to help you make progress:\nEvaluate the final sum." in later
+
+
+def test_progress_message_flag_off_preserves_hint_only_format():
+    state = [{"hint_id": "1.1", "text": "I completed step one."}]
+    message = format_auto_hint_message("Try induction.", state, include_progress=False)
+    assert "You have done the following steps correctly" not in message
+    assert message.startswith("Here is a hint to help you make progress:\nTry induction.")
+
+
+def test_progress_state_dedupes_hint_ids():
+    state = []
+    update_progress_state(state, [{"hint_id": "1.1", "progress": "Done once."}])
+    update_progress_state(state, [{"hint_id": "1.1", "progress": "Duplicate."}])
+    assert state == [{"hint_id": "1.1", "text": "Done once."}]
+
+
+def test_progress_state_uses_hint_set_order_across_sources():
+    state = []
+    hint_order = ["intro", "1.3", "1.1", "2.2", "1.2", "2.1"]
+    update_progress_state(
+        state,
+        [
+            {"hint_id": "1.3", "progress": "Done 1.3."},
+            {"hint_id": "1.1", "progress": "Done 1.1."},
+            {"hint_id": "2.2", "progress": "Done 2.2."},
+        ],
+        hint_order=hint_order,
+    )
+    update_progress_state(
+        state,
+        selected_hint_id="2.1",
+        selected_hint="Given 2.1.",
+        hint_order=hint_order,
+    )
+    update_progress_state(
+        state,
+        selected_hint_id="1.2",
+        selected_hint="Given 1.2.",
+        hint_order=hint_order,
+    )
+    assert [item["hint_id"] for item in state] == ["1.3", "1.1", "2.2", "1.2", "2.1"]
+    message = format_auto_hint_message("Next hint.", state, include_progress=True)
+    assert message.index("1. Done 1.3.") < message.index("2. Done 1.1.")
+    assert message.index("3. Done 2.2.") < message.index("4. Given 1.2.")
+    assert message.index("4. Given 1.2.") < message.index("5. Given 2.1.")
 
 
 def test_prune_hint_pool_drops_x0_and_type():

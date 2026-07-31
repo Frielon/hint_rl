@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import random
+import re
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -26,8 +27,8 @@ logger = logging.getLogger(__name__)
 # utils.py (same as hint_tool.py) so there is no cross-folder import dependency.
 from utils import selector_prompt, hint_id_of, parse_output
 
-# Multi-round Template F prompt + status renderer (auto-hint rollout). Defined
-# LOCALLY in selector_multi.py (a self-contained copy; no cross-folder import).
+# Multi-round Template F progress prompt + status renderer (auto-hint rollout).
+# Defined LOCALLY in selector_multi.py (a self-contained copy; no cross-folder import).
 from selector_multi import build_prompt_multi, render_hints_with_status
 
 
@@ -278,6 +279,7 @@ API_MODE_LOCAL = "local"
 API_MODE_OPENAI = "openai"
 _OPENAI_MODE_ALIASES = {"openai", "api", "openai_api", "openai-api"}
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
+OPENAI_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
 
 # Backoff between RETRIES in openai mode only (rate limits: an immediate re-send
 # mostly burns the attempt). Exponential from base, capped, x[0.5, 1.5) jitter.
@@ -288,6 +290,45 @@ _RETRY_BACKOFF_CAP_S = 30.0
 # Per worker process -- sum across processes for the run total; the per-call
 # selector dump (HPRL_SELECTOR_DUMP_DIR) remains the exact record.
 _USAGE_LOG_EVERY = 200
+_HINT_FIELD_RE = re.compile(r'(?<![A-Za-z0-9_])"hint"\s*:')
+
+
+def _is_retryable_openai_error(exc: Exception) -> bool:
+    """Whether an OpenAI request error can plausibly succeed on retry.
+
+    Connection/timeout errors have no HTTP status and remain retryable. Most
+    4xx responses are deterministic request/configuration failures; only the
+    transient timeout/conflict/rate-limit statuses are retried.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        return True
+    return status in {408, 409, 429} or status >= 500
+
+
+def _response_has_hint_field(raw: Any) -> bool:
+    """Whether the raw selector response contains an explicit JSON ``hint`` key."""
+    return isinstance(raw, str) and _HINT_FIELD_RE.search(raw) is not None
+
+
+def _is_selector_decline(selection: Any, raw: Any) -> bool:
+    """Whether a parsed response explicitly says that no hint remains.
+
+    The raw response must contain an explicit top-level-looking ``"hint":`` key;
+    strings such as ``hint_id`` and ``completed_hints`` do not count. Its parsed
+    value must be an empty string with no usable hint id. Missing/non-string hint
+    fields are malformed output, not a semantic decline. An empty id with
+    non-empty hint text is still usable: the rollout can reconcile the text
+    against the offered hint pool.
+    """
+    if not isinstance(selection, dict) or not _response_has_hint_field(raw):
+        return False
+    hint = selection.get("hint")
+    return isinstance(hint, str) and not hint.strip() and hint_id_of(selection) is None
 
 
 def normalize_api_mode(mode) -> str:
@@ -370,6 +411,15 @@ class HintSelector:
                 or os.environ.get("SELECTOR_API_KEY", "EMPTY")
             )
             model = os.environ.get("SELECTOR_MODEL", "gpt-5-mini")
+            reasoning_effort = (
+                os.environ.get("SELECTOR_REASONING_EFFORT", "low").strip().lower()
+            )
+            if reasoning_effort and reasoning_effort not in OPENAI_REASONING_EFFORTS:
+                allowed = ", ".join(sorted(OPENAI_REASONING_EFFORTS))
+                raise ValueError(
+                    "Invalid SELECTOR_REASONING_EFFORT="
+                    f"{reasoning_effort!r}; expected one of: {allowed}"
+                )
             if model.lower().startswith("gpt-oss"):
                 # SELECTOR_MODEL kept its local-serving default; the OpenAI API has
                 # no such model, so every call would 404 (and degrade to no-hint).
@@ -385,6 +435,7 @@ class HintSelector:
             )
             api_key = os.environ.get("SELECTOR_API_KEY", "EMPTY")
             model = os.environ.get("SELECTOR_MODEL", "Qwen3.5-27B")
+            reasoning_effort = os.environ.get("SELECTOR_REASONING_EFFORT", "low")
         selector = cls(
             base_urls=urls,
             model=model,
@@ -395,7 +446,7 @@ class HintSelector:
             timeout=float(os.environ.get("SELECTOR_REQUEST_TIMEOUT_S", "600")),
             max_retries=int(os.environ.get("SELECTOR_MAX_RETRIES", "3")),
             api_mode=api_mode,
-            reasoning_effort=os.environ.get("SELECTOR_REASONING_EFFORT", "low"),
+            reasoning_effort=reasoning_effort,
             max_concurrency=int(os.environ.get("SELECTOR_MAX_CONCURRENCY", "16")),
         )
         if selector.api_mode == API_MODE_OPENAI:
@@ -439,9 +490,10 @@ class HintSelector:
         Renders the WHOLE pool with per-hint ``status`` (completed | pending) -- the
         auto-hint rollout's status-marking mechanism -- so the selector picks the
         next pending hint and also reports, in ``completed_hints``, any pending hint
-        the student newly achieved this round (each with a verbatim ``quote``). Used
-        by the auto-hint rollout (auto_hint_agent_loop). ``pool`` is the FULL hint
-        pool (JSON str or dict); ``completed`` the ids already given/verified.
+        the student newly achieved this round (each with a verbatim ``quote`` and a
+        student-notation ``progress`` statement). Used by the auto-hint rollout
+        (auto_hint_agent_loop). ``pool`` is the FULL hint pool (JSON str or dict);
+        ``completed`` contains ids already given/verified.
 
         Returns (selection_dict, raw_text, err, prompt); selection is None on
         failure. ``prompt`` is the EXACT text sent to the selector (so the rollout
@@ -548,15 +600,26 @@ class HintSelector:
         ``select`` (single-pick prompt) and ``select_multi`` (multi-round prompt);
         the only difference between the two is which prompt template is sent.
 
+        Parsed output must contain a non-empty string ``hint``. An explicit
+        selector decline (empty string ``hint`` and no usable hint id) is retried
+        like a parse failure. If the retry budget ends on another decline, that
+        parsed response is returned so the rollout records a semantic decline
+        rather than an API failure. Missing/non-string hint fields remain
+        malformed output.
+
         Openai mode adds an exponential backoff (+jitter) before each retry --
         there is one shared endpoint, so retry-after-a-beat is what recovers a
-        rate-limit burst, not failover. Local mode keeps the original instant
-        failover (no sleeps).
+        rate-limit burst, not failover. Deterministic OpenAI 4xx errors (bad
+        model/parameter/auth) stop after the first attempt. Local mode keeps
+        the original instant failover (no sleeps).
         """
         n = len(self.base_urls)
         start = random.randrange(n)
         last_err = None
+        last_decline: Optional[tuple[dict, str]] = None
+        last_attempt_declined = False
         for attempt in range(self.max_retries):
+            last_attempt_declined = False
             base_url = self.base_urls[(start + attempt) % n]
             if attempt > 0 and self.api_mode == API_MODE_OPENAI:
                 delay = min(_RETRY_BACKOFF_BASE_S * (2 ** (attempt - 1)), _RETRY_BACKOFF_CAP_S)
@@ -566,9 +629,25 @@ class HintSelector:
                 self._note_usage(resp)
                 raw = resp.choices[0].message.content or ""
                 selection, perr = parse_output(raw)
-                if selection is not None:
-                    return selection, raw, None
-                last_err = f"parse failed: {perr}"
+                if selection is not None and _response_has_hint_field(raw):
+                    hint = selection.get("hint")
+                    if isinstance(hint, str) and hint.strip():
+                        return selection, raw, None
+                    if _is_selector_decline(selection, raw):
+                        last_decline = (selection, raw)
+                        last_attempt_declined = True
+                        last_err = "selector declined: empty string 'hint'"
+                    else:
+                        last_err = "invalid selector output: missing non-empty string 'hint'"
+                elif selection is not None:
+                    last_err = 'invalid selector output: response missing explicit "hint" field'
+                else:
+                    last_err = f"parse failed: {perr}"
             except Exception as e:  # noqa: BLE001
                 last_err = f"{base_url}: {e}"
+                if self.api_mode == API_MODE_OPENAI and not _is_retryable_openai_error(e):
+                    break
+        if last_attempt_declined and last_decline is not None:
+            selection, raw = last_decline
+            return selection, raw, None
         return None, None, last_err

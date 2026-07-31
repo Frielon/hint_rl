@@ -132,7 +132,7 @@ export max_response_length=${max_response_length:-30720}
 # base script's default for a bare head-node launch.
 export TRAINER_NNODES=${TRAINER_NNODES:-1}
 export ROLLOUT_NNODES=${ROLLOUT_NNODES:-$(( ${NNODES:-5} - TRAINER_NNODES ))}
-export STALENESS_THRESHOLD=${STALENESS_THRESHOLD:-1.9}
+export STALENESS_THRESHOLD=${STALENESS_THRESHOLD:-0.1}
 export TRIGGER_PARAMETER_SYNC_STEP=${TRIGGER_PARAMETER_SYNC_STEP:-1}
 export REQUIRE_BATCHES=${REQUIRE_BATCHES:-1}
 export PARTIAL_ROLLOUT=${PARTIAL_ROLLOUT:-True}
@@ -140,6 +140,7 @@ export PARTIAL_ROLLOUT=${PARTIAL_ROLLOUT:-True}
 # --- turn on the auto-hint mechanism (identical to the sync wrapper) -----------
 export HPRL_AUTO_HINT=${HPRL_AUTO_HINT:-true}
 export HPRL_AUTO_HINT_FUZZY=${HPRL_AUTO_HINT_FUZZY:-0.8}
+export HPRL_AUTO_HINT_PROGRESS_MESSAGE=${HPRL_AUTO_HINT_PROGRESS_MESSAGE:-false}
 # Prune X.0 step-guidance hints from the pool before the selector sees it
 # (eval/train parity with the offline selector eval).
 export HPRL_PRUNE_GUIDANCE=${HPRL_PRUNE_GUIDANCE:-true}
@@ -208,5 +209,5 @@ echo "[run_auto_hint_qwen3_async]   TRAIN_FILE=${TRAIN_FILE}"
 echo "[run_auto_hint_qwen3_async]   resume_from=${RESUME_FROM_PATH:-<fresh>}"
 echo "[run_auto_hint_qwen3_async]   split trainer:rollout=${TRAINER_NNODES}:${ROLLOUT_NNODES} nodes  staleness=${STALENESS_THRESHOLD} trigger=${TRIGGER_PARAMETER_SYNC_STEP} require=${REQUIRE_BATCHES} partial_rollout=${PARTIAL_ROLLOUT}"
 echo "[run_auto_hint_qwen3_async]   strategy=${HINT_STRATEGY} call_reward=${HINT_CALL_REWARD} shape=${HINT_SHAPE_COEFF} ratchet=${HPRL_RATCHET_MODE} allow_decrease=${HPRL_ALLOW_DECREASE}"
-echo "[run_auto_hint_qwen3_async]   step_adv=${HPRL_STEP_ADV} step_adv_scale=${HPRL_STEP_ADV_SCALE} step_adv_norm=${HPRL_STEP_ADV_NORM} whole_turn=${HPRL_STEP_ADV_WHOLE_TURN} overlong_penalty=${HPRL_OVERLONG_PENALTY} overlong_type=${HPRL_OVERLONG_PENALTY_TYPE} guidance_free=${HINT_GUIDANCE_FREE} prune_guidance=${HPRL_PRUNE_GUIDANCE} max_turn_tokens=${HPRL_MAX_TURN_TOKENS} lr_sched=${HPRL_LR_SCHEDULER}"
+echo "[run_auto_hint_qwen3_async]   step_adv=${HPRL_STEP_ADV} step_adv_scale=${HPRL_STEP_ADV_SCALE} step_adv_norm=${HPRL_STEP_ADV_NORM} whole_turn=${HPRL_STEP_ADV_WHOLE_TURN} overlong_penalty=${HPRL_OVERLONG_PENALTY} overlong_type=${HPRL_OVERLONG_PENALTY_TYPE} guidance_free=${HINT_GUIDANCE_FREE} prune_guidance=${HPRL_PRUNE_GUIDANCE} progress_message=${HPRL_AUTO_HINT_PROGRESS_MESSAGE} max_turn_tokens=${HPRL_MAX_TURN_TOKENS} lr_sched=${HPRL_LR_SCHEDULER}"
 exec bash "${SCRIPT_DIR}/run_hprl_async.sh" "$@"

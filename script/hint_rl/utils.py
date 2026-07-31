@@ -239,6 +239,70 @@ def _unescape_loose(s: str) -> str:
              .replace("\\t", "\t").replace("\\r", "\r").replace("\x00", "\\"))
 
 
+def _balanced_segment(text: str, start: int, opener: str, closer: str):
+    """Return one balanced JSON-like segment, ignoring delimiters in strings."""
+    if start >= len(text) or text[start] != opener:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        char = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == opener:
+            depth += 1
+        elif char == closer:
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
+def _extract_completed_hints(text: str) -> list[dict]:
+    """Best-effort recovery of ``completed_hints`` for regex-salvaged output.
+
+    The old hard parser recovered only the selected id/text, which discarded
+    the new per-entry ``progress`` field whenever an otherwise useful response
+    had malformed top-level JSON. Prefer a whole-array parse; if that fails,
+    salvage individually balanced entry objects.
+    """
+    best: list[dict] = []
+    for match in re.finditer(r'"completed_hints"\s*:\s*\[', text):
+        start = text.find("[", match.start())
+        segment = _balanced_segment(text, start, "[", "]")
+        if segment is None:
+            continue
+        parsed = _loads_lenient(segment)
+        if isinstance(parsed, list):
+            items = [item for item in parsed if isinstance(item, dict)]
+        else:
+            items = []
+            pos = 0
+            while True:
+                obj_start = segment.find("{", pos)
+                if obj_start < 0:
+                    break
+                obj_segment = _balanced_segment(segment, obj_start, "{", "}")
+                if obj_segment is None:
+                    break
+                item = _loads_lenient(obj_segment)
+                if isinstance(item, dict):
+                    items.append(item)
+                pos = obj_start + len(obj_segment)
+        if len(items) > len(best):
+            best = items
+    return best
+
+
 def _hard_parse(text: str):
     """Field-by-field regex extraction of the selection object, tolerant of any
     JSON the standard parser rejects (the common case: unescaped LaTeX
@@ -257,7 +321,7 @@ def _hard_parse(text: str):
             obj[k] = int(m.group(1))
     # hint_id may be quoted ("1.0") or bare (1.0); keep it as a string either
     # way. Citation entries inside completed_hints carry their own "hint_id"
-    # (immediately followed by their "quote"/"why" key), so classify those out
+    # (immediately followed by "quote"/"why"/"progress"), so classify those out
     # instead of merely deprioritizing them: on a response that never emitted a
     # top-level id (truncation, or the model omitted it), attaching a cited
     # already-achieved id makes the runtime back-fill and inject the WRONG
@@ -274,6 +338,9 @@ def _hard_parse(text: str):
         m = re.search(r'"%s"\s*:\s*"%s"' % (k, _STR_BODY), text, re.DOTALL)
         if m:
             obj[k] = _unescape_loose(m.group(1))
+    completed_hints = _extract_completed_hints(text)
+    if completed_hints:
+        obj["completed_hints"] = completed_hints
     # only count it as a recovery if we got something we can act on: an id to
     # back-fill from the pool, or hint text (the runtime remaps an id-less
     # text onto the offered pool by exact/fuzzy match).
@@ -283,19 +350,19 @@ def _hard_parse(text: str):
     return None
 
 
-# A citation's own "hint_id" is immediately followed by its "quote"/"why" key
-# ({hint_id, quote, why} schema echo); a top-level id is followed by selection
-# keys. Used to classify id occurrences during regex salvage.
-_CITE_NEXT_RE = re.compile(r'\s*,?\s*"(?:quote|why)"\s*:')
+# A citation's own "hint_id" is immediately followed by "quote"/"why"/"progress"
+# ({hint_id, quote, why, progress} schema echo); a top-level id is followed by
+# selection keys. Used to classify id occurrences during regex salvage.
+_CITE_NEXT_RE = re.compile(r'\s*,?\s*"(?:quote|why|progress)"\s*:')
 
 
 def _is_citation_item(d: dict) -> bool:
-    """A ``completed_hints`` entry ({hint_id, quote, why}) masquerading as the
+    """A ``completed_hints`` entry ({hint_id, quote, why, progress}) masquerading as the
     selection. When the full blob is unparseable, the balanced-brace fallback
     can salvage one of these nested objects instead; it carries a plausible
     hint_id, so without this guard it becomes an applied hint with empty text
     (and the cited id gets charged + dropped from future pools)."""
-    return (("quote" in d or "why" in d)
+    return (("quote" in d or "why" in d or "progress" in d)
             and not any(k in d for k in ("hint", "completed_hints",
                                          "reasoning_of_hint", "major_step_id")))
 
@@ -347,6 +414,21 @@ def _postprocess_selection(obj: dict) -> dict:
         if "\n" in v:
             v = _restore_nl_commands(v)
         obj[k] = _CTRL_OR_LONE_SURROGATE_RE.sub("", v)
+    completed_hints = obj.get("completed_hints")
+    if isinstance(completed_hints, list):
+        for item in completed_hints:
+            if not isinstance(item, dict):
+                continue
+            # ``quote`` stays byte-for-byte faithful for citation matching.
+            # ``progress``/``hint`` can reach the policy model, so sanitize them
+            # with the same rules as the selected top-level hint.
+            for k in ("progress", "hint"):
+                v = item.get(k)
+                if not isinstance(v, str):
+                    continue
+                if "\n" in v:
+                    v = _restore_nl_commands(v)
+                item[k] = _CTRL_OR_LONE_SURROGATE_RE.sub("", v)
     return obj
 
 

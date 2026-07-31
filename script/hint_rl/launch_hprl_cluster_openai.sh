@@ -47,6 +47,9 @@
 #                      dolci-rl-zero-10324 run of 2026-07-24; empty = fresh run).
 #   SELECTOR_MODEL     OpenAI model (default gpt-5-mini).
 #   SELECTOR_*         call params (see below).
+#   HPRL_AUTO_HINT_PROGRESS_MESSAGE
+#                      cumulative completed-steps prefix in hint turns
+#                      (default true for this launcher; false restores hint-only).
 #   OPENAI_PROXY       egress proxy URL for api.openai.com (optional).
 # =============================================================================
 set -euo pipefail
@@ -77,7 +80,7 @@ TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_auto_hint_qwen3_8b_base.sh"}
 # it); the wrapper's dolci-rl-zero-10324 default already does. wandb gets a
 # NEW run with the SAME name whose step axis continues at the resume step.
 # Set RESUME_EXP_NAME= (empty) to launch a fresh stamped run as before.
-RESUME_EXP_NAME=${RESUME_EXP_NAME-}
+RESUME_EXP_NAME=${RESUME_EXP_NAME-"HPRL-AutoHint-Qwen3-8B-Base-dolci-rl-zero-10324-20260730-113824"}
 if [ -n "${RESUME_EXP_NAME}" ]; then
     export exp_name="${RESUME_EXP_NAME}"
 fi
@@ -135,6 +138,14 @@ export SELECTOR_API_MODE=openai
 export SELECTOR_OPENAI_BASE_URL=${SELECTOR_OPENAI_BASE_URL:-"https://api.openai.com/v1"}
 export SELECTOR_MODEL=${SELECTOR_MODEL:-"gpt-5-mini"}
 export SELECTOR_REASONING_EFFORT=${SELECTOR_REASONING_EFFORT:-low}
+case "${SELECTOR_REASONING_EFFORT}" in
+    minimal | low | medium | high) ;;
+    *)
+        echo "[launch] FATAL: invalid SELECTOR_REASONING_EFFORT=${SELECTOR_REASONING_EFFORT@Q}." >&2
+        echo "         Expected one of: minimal, low, medium, high." >&2
+        exit 1
+        ;;
+esac
 # temperature/top_p only reach CHAT models (gpt-4.1-* etc.); reasoning models
 # ignore them. 0.3/0.95 = the offline eval's settings.
 export SELECTOR_TEMPERATURE=${SELECTOR_TEMPERATURE:-0.3}
@@ -148,6 +159,10 @@ export SELECTOR_MAX_RETRIES=${SELECTOR_MAX_RETRIES:-5}
 # cluster-wide concurrency ~= this x #agent-loop workers; raise it if rollout
 # stalls on hint calls and the org's RPM/TPM headroom allows.
 export SELECTOR_MAX_CONCURRENCY=${SELECTOR_MAX_CONCURRENCY:-16}
+# This launcher uses the progress-aware selector prompt, so default its matching
+# rollout-message mode on. The generic run script defaults it off for backward
+# compatibility with local-selector experiments.
+export HPRL_AUTO_HINT_PROGRESS_MESSAGE=${HPRL_AUTO_HINT_PROGRESS_MESSAGE:-true}
 
 # --- pre-launch cleanup toggle ----------------------------------------------
 # Reap orphaned vLLM ROLLOUT workers left by a SIGKILLed prior run before this
@@ -193,7 +208,7 @@ slog() {
 }
 
 slog "[launch] rank=${RANK}/${WORLD_SIZE}  selector=OPENAI API (no selector pods)  train_nnodes=${TRAIN_NNODES}  check_log=${SELECTOR_CHECK_LOG}"
-slog "[launch]   model    : ${SELECTOR_MODEL}  (effort=${SELECTOR_REASONING_EFFORT} max_concurrency=${SELECTOR_MAX_CONCURRENCY}/worker)"
+slog "[launch]   model    : ${SELECTOR_MODEL}  (effort=${SELECTOR_REASONING_EFFORT} max_concurrency=${SELECTOR_MAX_CONCURRENCY}/worker progress_message=${HPRL_AUTO_HINT_PROGRESS_MESSAGE})"
 slog "[launch]   endpoint : ${SELECTOR_OPENAI_BASE_URL}  (key=...${OPENAI_API_KEY: -4}${HTTPS_PROXY:+  proxy=${HTTPS_PROXY}})"
 slog "[launch]   resume   : ${RESUME_EXP_NAME:-<fresh run>}"
 

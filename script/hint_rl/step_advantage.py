@@ -374,9 +374,10 @@ def apply_step_level_advantages(
     penalty) is identical; only the per-row token assignment changes.
 
     ``overlong_penalty`` (P_over, raw units, 0 = off) + ``overlong_penalty_type`` select how the
-    per-turn-cap TRUNCATION surcharge is charged (rows with ``turn_truncated_per_row[i]`` truthy;
-    the truncation is the row's LAST turn segment). SCORED groups only either way -- no-correct
-    groups are already zeroed + skipped above, so all-truncate / no-correct groups get NO penalty.
+    per-turn-failure surcharge is charged (rows with ``turn_truncated_per_row[i]`` truthy:
+    a cap hit or a missing box deliberately treated as one; the failure is the row's LAST
+    turn segment). SCORED groups only either way -- no-correct groups are already zeroed +
+    skipped above, so all-truncate / no-correct groups get NO penalty.
 
     * ``"post_hoc"`` (default): subtract P_over from each truncation tail AFTER the advantages
       are assigned, BEFORE the per-group std/normalize. The value-based tail

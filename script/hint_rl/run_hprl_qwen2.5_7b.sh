@@ -153,6 +153,10 @@ CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
 # MUST precede the TRAIN_FILE / HINT_* / HPRL_KPACK_* defaults so these win.
 HPRL_AUTO_HINT=${HPRL_AUTO_HINT:-true}
 HPRL_AUTO_HINT_FUZZY=${HPRL_AUTO_HINT_FUZZY:-0.8}
+# Include all selector-verified progress and previously delivered hints before
+# each new hint. The OpenAI launcher defaults this on; generic/local runs keep
+# the prior hint-only message unless explicitly enabled.
+HPRL_AUTO_HINT_PROGRESS_MESSAGE=${HPRL_AUTO_HINT_PROGRESS_MESSAGE:-false}
 # Prune the X.0 step-guidance hints from each pool before it reaches the selector, so the
 # rollout presents the SAME substep-only pools the offline selector eval (multi-cite-gpt-eval)
 # was built and scored on (eval/train parity). Default off -> the full pool (X.0 included).
@@ -559,6 +563,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     data.hprl.budget_sampling.shuffle_batch_order=${HPRL_BUDGET_SAMPLING_SHUFFLE_ORDER} \
     data.hprl.auto_hint.enable=${HPRL_AUTO_HINT} \
     data.hprl.auto_hint.fuzzy_threshold=${HPRL_AUTO_HINT_FUZZY} \
+    data.hprl.auto_hint.progress_message=${HPRL_AUTO_HINT_PROGRESS_MESSAGE} \
     data.hprl.auto_hint.prune_guidance=${HPRL_PRUNE_GUIDANCE} \
     data.hprl.auto_hint.max_turn_tokens=${HPRL_MAX_TURN_TOKENS} \
     data.hprl.auto_hint.step_adv.enable=${HPRL_STEP_ADV} \

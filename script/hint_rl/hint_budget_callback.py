@@ -316,13 +316,14 @@ def hprl_update_budgets(
         metrics["hprl/hint_budget_exceeded"] = float(be_total)
         metrics["hprl/hint_budget_exceeded_frac"] = float(be_total / n) if n else 0.0
 
-    # -------- truncation rate: rollouts cut at a length cap -----------------
-    # length_truncated covers BOTH cuts -- the auto-hint PER-TURN max_turn_tokens cap
-    # AND the GLOBAL response-length ceiling -- each of which floors the rollout to acc=0.
+    # -------- truncation rate: length cuts plus boxless turns ----------------
+    # length_truncated covers both length cuts plus an EOS-completed auto-hint turn
+    # without a box, which deliberately follows the per-turn-cut path. Each floors
+    # the rollout to acc=0.
     # This is the TRUE truncation ratio, unlike verl's response_length/clip_ratio, which
     # counts only rollouts whose TOTAL multi-turn response filled the whole global budget
     # (a per-turn cut terminates the rollout EARLY, below that, so clip_ratio misses it).
-    # turn_truncated is the per-turn-cap SUBSET (0 when max_turn_tokens is off).
+    # turn_truncated is the per-turn-failure subset: a cap hit or a missing box.
     lt_arr = ntb.get("length_truncated")
     if lt_arr is not None:
         lt_total = sum(int(round(float(_to_py(lt_arr[i]) or 0))) for i in range(len(lt_arr)))

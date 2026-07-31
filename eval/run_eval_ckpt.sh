@@ -59,7 +59,7 @@ TOP_P="${TOP_P:-1.0}"
 TOP_K="${TOP_K:--1}"
 MAX_TOKENS="${MAX_TOKENS:-30720}"       # leave 2048 headroom under CONTEXT_LEN for the prompt
 LIMIT="${LIMIT:-}"
-START_STEP="${START_STEP:-0}"           # skip checkpoints with global_step < this (inclusive; ignored when STEPS is set)
+START_STEP="${START_STEP:-290}"           # skip checkpoints with global_step < this (inclusive; ignored when STEPS is set)
 BASE_URL="http://127.0.0.1:${PORT}/v1"
 
 # --- the runs whose every checkpoint we evaluate ---------------------------
@@ -74,8 +74,9 @@ RUNS=(
   # "hprl-qwen3-base-512|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Qwen3-8B-Base/HPRL-AutoHint-Qwen3-8B-Base-dapo-20260720-235159"
   # "grpo-qwen3-base-11k|$HINT_RL_HOME/ckpt/GRPO-Qwen3-8B-Base/GRPO-Qwen3-8B-Base-dolci-zero-rl-8192-16-20260722-041547"
   # "hprl-qwen3-base-async|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Qwen3-8B-Base-async/HPRL-AutoHint-Qwen3-8B-Base-async-dolci-rl-zero-10324-20260724-184955"
-  # "hprl-qwen3-base-11k-5.4-mini|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Qwen3-8B-Base/HPRL-AutoHint-Qwen3-8B-Base-dolci-rl-zero-10324-20260727-121836"
-  "dapo-qwen3-base-11k|$HINT_RL_HOME/ckpt/DAPO-Qwen3-8B-Base/DAPO-Qwen3-8B-Base-dolci-zero-rl-8192-16-20260727-223725"
+  "hprl-qwen3-base-11k-5.4-mini|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Qwen3-8B-Base/HPRL-AutoHint-Qwen3-8B-Base-dolci-rl-zero-10324-20260727-121836"
+  # "hprl-qwen3-base-11k-5-mini|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Qwen3-8B-Base/HPRL-AutoHint-Qwen3-8B-Base-dolci-rl-zero-10324-20260727-121836"
+  # "dapo-qwen3-base-11k|$HINT_RL_HOME/ckpt/DAPO-Qwen3-8B-Base/DAPO-Qwen3-8B-Base-dolci-zero-rl-8192-16-20260727-223725"
 )
 
 # --- datasets (all BARE, box-scored like GRPO) -----------------------------

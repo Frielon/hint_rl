@@ -1,7 +1,7 @@
 # Copyright 2026
 #
-# Multi-round (Template-F-multi) selector prompt + a fuzzy quote LOCATOR for the
-# AUTO-HINT rollout (auto_hint_agent_loop).
+# Multi-round (Template-F-multi) selector prompt + progress-message helpers + a
+# fuzzy quote LOCATOR for the AUTO-HINT rollout (auto_hint_agent_loop).
 #
 # SELF-CONTAINED: everything here is a LOCAL copy (stdlib-only deps) -- there is NO
 # runtime import from anywhere outside ``script/hint_rl``. The content was copied
@@ -15,9 +15,11 @@
 #      earlier rounds are ``completed`` and never re-selected; the selector picks
 #      the next ``pending`` hint and ALSO reports, in ``completed_hints``, any
 #      pending hint the student newly achieved THIS round -- each with a verbatim
-#      ``quote`` from the student's trace. The auto-hint loop uses those quotes to
-#      decide the verified-prefix gradient boundary (see locate_quote_end).
-#      Verbatim copy of prompt_template_multiF.TEMPLATE_MULTI_F + render/build.
+#      ``quote`` from the student's trace and a student-notation ``progress``
+#      statement. The auto-hint loop uses the quotes to decide the verified-prefix
+#      gradient boundary and the progress text in cumulative user messages.
+#      Verbatim copy of prompt_template_multiF_progress.TEMPLATE_MULTI_F +
+#      render/build.
 #
 #   2. ``locate_quote_end`` -- where in a piece of student text a cited quote ends
 #      (a CHARACTER offset), via the same notation-insensitive ``loose`` /
@@ -33,9 +35,9 @@ import re
 from typing import Any, Iterable, Optional
 
 # --------------------------------------------------------------------------- #
-# Multi-round Template F prompt (verbatim from prompt_template_multiF.py)
+# Multi-round Template F prompt (verbatim from prompt_template_multiF_progress.py)
 # --------------------------------------------------------------------------- #
-TEMPLATE_MULTI_F = r"""You are an expert math tutor helping a student over multiple rounds. In earlier rounds some hints were already given to the student and verified as achieved; those are marked `status: "completed"`. Your task is to choose the first hint that the student has not yet achieved, considering only the hints still marked `status: "pending"`, based on the student's reasoning trace.
+TEMPLATE_MULTI_F = r"""You are an expert math tutor helping a student over multiple rounds. In earlier rounds some hints were already given to the student and verified as achieved; those are marked `status: "completed"`. Your task is to choose the first hint that the student has not yet achieved, considering only the hints still marked `status: "pending"`, based on the student's reasoning trace. For every pending hint the student newly achieved this round, you also restate it as progress already made, in the student's notation, so the student can be told what they have accomplished.
 
 # Inputs
 
@@ -105,11 +107,20 @@ Select the earliest `pending` substep hint, in order, whose mathematical idea is
      - `hint_id`: the hint's id.
      - `quote`: the exact quote from the student's trace that demonstrates achievement.
      - `why`: a one-line explanation of why this quote demonstrates that the student achieved the hint.
+     - `progress`: the hint rephrased as progress already made, according to the following step 5.
    * Do not include any `completed`-status hint in `completed_hints` (those were already given in earlier rounds).
    * For example, if the selected hint is "3.2" and hints "1.1" and "1.2" are already `status: "completed"`, then `completed_hints` contains the `pending` hints among "2.1", "2.2", and "3.1" that the student has achieved this round, but no `completed`-status hints and nothing from "3.2" or later.
 
+5. Rephrase each completed hint as achieved progress:
+
+   * The `progress` field will be shown to the student to tell them what they have already accomplished.
+   * Rephrase the hint into the student's notation: reuse the variable names and symbols from the student's trace where they differ from the hint's wording.
+   * Keep the mathematical content of the original hint unchanged.
+   * Do not reveal solution content beyond what the original hint already contains.
+   * If the hint's notation already matches the student's, a minimal rewording into achieved-progress form is enough.
+
 # Output format
-Return a single JSON object wrapped in <output> tags. The output must contains four fields: `hint_id` is the id of the selected pending hint (e.g., "2.1" or "2.2"), `hint` is its text, rephrased per step 3 if necessary, `completed_hints` is a list of the pending hints that were achieved this round, and `reasoning_of_hint` is an explanation of why this hint was selected.
+Return a single JSON object wrapped in <output> tags. The output must contains four fields: `hint_id` is the id of the selected pending hint (e.g., "2.1" or "2.2"), `hint` is its text, rephrased per step 3 if necessary, `completed_hints` is a list of the pending hints that were achieved this round — each carrying its `progress` rephrasing per step 5 — and `reasoning_of_hint` is an explanation of why this hint was selected.
 
 <output>
 {
@@ -117,7 +128,8 @@ Return a single JSON object wrapped in <output> tags. The output must contains f
 {
 "hint_id": "<id of a pending substep_hint achieved this round, before the selected hint_id, e.g. "2.1">",
 "quote": "<a string copied character-for-character from the student's trace — LaTeX markup preserved exactly, no Unicode conversion, no paraphrase; must be findable by exact search in the trace>",
-"why": "<one line, in your own words, explaining why this excerpt carries out this substep>"
+"why": "<one line, in your own words, explaining why this excerpt carries out this substep>",
+"progress": "<the hint rephrased per step 5 into the student's notation, stated as progress already made — this is shown to the student>"
 } ## One entry for EACH pending hint achieved this round before the selected hint; use [] if none
 ],
 "hint_id": "<hint_id of the selected pending hint>",
@@ -136,7 +148,7 @@ def render_hints_with_status(pool: Any, completed: Iterable[str]) -> str:
     this keeps every hint and only flips its status -- the multi-round prompt is
     built to reason over completed + pending together. ``completed`` is the set of
     hint ids already given/verified in earlier rounds. On any parse problem the
-    pool string is returned unchanged. (Verbatim from prompt_template_multiF.)
+    pool string is returned unchanged. (Verbatim from prompt_template_multiF_progress.)
     """
     done = {str(h) for h in (completed or [])}
     if isinstance(pool, str):
@@ -199,6 +211,117 @@ def pool_hint_texts(pool: Any) -> dict[str, str]:
             if hid is not None:
                 out[str(hid)] = str(h.get("hint") or "")
     return out
+
+
+def update_progress_state(
+    state: list[dict],
+    completed_hints: Iterable[Any] = (),
+    *,
+    selected_hint_id: Optional[str] = None,
+    selected_hint: Optional[str] = None,
+    hint_order: Iterable[str] = (),
+) -> list[dict]:
+    """Add selector-reported progress to the rollout-local cumulative state.
+
+    Incremental ``completed_hints`` entries contribute their ``progress`` text
+    (falling back to ``hint`` for tolerant parser/model variants). A selected
+    hint is added separately *after* its user message is built, so it appears as
+    previously given progress starting with the next round. Records are deduped
+    by hint id and, when ``hint_order`` is supplied, kept in the hint set's
+    original traversal order.
+    """
+    if not isinstance(state, list):
+        state = []
+
+    entries: list[tuple[Optional[str], Any]] = []
+    for item in completed_hints or ():
+        if not isinstance(item, dict):
+            continue
+        raw_id = item.get("hint_id")
+        hint_id = str(raw_id).strip() if raw_id is not None else None
+        text = item.get("progress")
+        if not isinstance(text, str) or not text.strip():
+            text = item.get("hint")
+        entries.append((hint_id or None, text))
+    if selected_hint is not None:
+        hint_id = str(selected_hint_id).strip() if selected_hint_id is not None else None
+        entries.append((hint_id or None, selected_hint))
+
+    for hint_id, text in entries:
+        if not isinstance(text, str) or not text.strip():
+            continue
+        body = text.strip()
+        existing = next(
+            (
+                record
+                for record in state
+                if isinstance(record, dict)
+                and (
+                    (hint_id is not None and str(record.get("hint_id") or "") == hint_id)
+                    or (
+                        hint_id is None
+                        and record.get("hint_id") is None
+                        and str(record.get("text") or "").strip() == body
+                    )
+                )
+            ),
+            None,
+        )
+        if existing is None:
+            state.append({"hint_id": hint_id, "text": body})
+        elif not str(existing.get("text") or "").strip():
+            existing["text"] = body
+    # Completed progress and previously given hints enter this state through
+    # separate calls. Re-sort both sources together by the authoritative hint
+    # set order; unknown/id-less records stay at the end in arrival order.
+    indexed = list(enumerate(state))
+    order_index = {str(hint_id): i for i, hint_id in enumerate(hint_order or ())}
+
+    def _order(item):
+        index, record = item
+        raw_id = record.get("hint_id") if isinstance(record, dict) else None
+        hint_id = str(raw_id) if raw_id is not None else None
+        if hint_id in order_index:
+            return (0, order_index[hint_id], index)
+        return (1, index, index)
+
+    state[:] = [record for _, record in sorted(indexed, key=_order)]
+    return state
+
+
+def format_auto_hint_message(
+    hint_text: str,
+    progress_state: Iterable[Any] = (),
+    *,
+    include_progress: bool = False,
+) -> str:
+    """Build the injected user turn, optionally with all cumulative progress."""
+    body = hint_text or "(the selector returned an empty hint)"
+    progress_lines = []
+    if include_progress:
+        for item in progress_state or ():
+            text = item.get("text") if isinstance(item, dict) else None
+            if isinstance(text, str) and text.strip():
+                progress_lines.append(f"{len(progress_lines) + 1}. {text.strip()}")
+
+    prefix = "Your previous boxed answer is incorrect and is no longer valid.\n\n"
+    if progress_lines:
+        prefix = (
+            "Your previous boxed answer is incorrect and is no longer valid.\n\n" 
+            + "You have done the following verified progress correctly:\n"
+            + "\n".join(progress_lines)
+            + "\n\n"
+        )
+        return (prefix
+            + f"Here is a hint to help you make further progress:\n{body}\n\n"
+            + "Using this hint, continue your reasoning from the verified progress and give your final boxed answer."
+                )
+    
+    return (
+        prefix
+        + f"Here is a hint to help you make progress:\n{body}\n\n"
+        + "Using this hint, continue your reasoning and give your final boxed answer."
+    )
 
 
 def _norm_text(s: str) -> str:

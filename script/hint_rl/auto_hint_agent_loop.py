@@ -9,12 +9,14 @@
 # hint:
 #
 #   1. generate one answer turn (terminated by EOS);
-#   2. grade its boxed answer with the SAME grader the reward uses;
-#   3. if CORRECT -> terminate (this is the ending turn);
-#   4. if WRONG and fewer than B_q hints have been injected -> ask the frozen
+#   2. require this turn to contain a boxed answer; otherwise terminate through
+#      the same floor-reward path as a per-turn length-cap truncation;
+#   3. grade its boxed answer with the SAME grader the reward uses;
+#   4. if CORRECT -> terminate (this is the ending turn);
+#   5. if WRONG and fewer than B_q hints have been injected -> ask the frozen
 #      selector (MULTI-ROUND Template F, selector_multi) for the next hint, inject
 #      it as the next USER message, and continue from step 1;
-#   5. stop when correct, when the budget B_q is spent, or when the pool of pending
+#   6. stop when correct, when the budget B_q is spent, or when the pool of pending
 #      hints is exhausted.
 #
 # Hints injected this way are recorded into ``applied_hints`` -- the SAME state key
@@ -52,12 +54,14 @@ from verl.utils.profiler import simple_timer
 from verl.workers.rollout.replica import TokenOutput
 
 from hint_agent_loop import HintAgentLoop, _dump_selector_call
-from hint_selector import build_trace, hint_id_of
+from hint_selector import _is_selector_decline, build_trace, hint_id_of
 from selector_multi import (
+    format_auto_hint_message,
     locate_quote_end,
     pending_hint_ids,
     prune_hint_pool,
     resolve_selected_hint,
+    update_progress_state,
 )
 from step_advantage import classify_length_cut as _classify_length_cut, prefix_state as _prefix_state
 
@@ -116,6 +120,16 @@ class AutoHintAgentLoop(HintAgentLoop):
         self.prune_guidance = str(
             ah.get("prune_guidance", os.environ.get("HPRL_PRUNE_GUIDANCE", "false"))
         ).strip().lower() in {"1", "true", "yes", "on"}
+        # CUMULATIVE PROGRESS user messages. The selector reports newly verified
+        # steps incrementally, so the rollout persists their ``progress`` text plus
+        # every previously delivered selector ``hint``. When enabled, each later
+        # hint turn first lists all of that accumulated progress.
+        self.progress_message = str(
+            ah.get(
+                "progress_message",
+                os.environ.get("HPRL_AUTO_HINT_PROGRESS_MESSAGE", "false"),
+            )
+        ).strip().lower() in {"1", "true", "yes", "on"}
         # PER-TURN generation-length cap (data.hprl.auto_hint.max_turn_tokens; env
         # HPRL_MAX_TURN_TOKENS). When > 0, each turn's generation is bounded to
         # min(max_turn_tokens, remaining global room) via the per-request max_tokens --
@@ -138,10 +152,11 @@ class AutoHintAgentLoop(HintAgentLoop):
             )
         logger.warning(
             "AutoHintAgentLoop: auto-hint rollout active (fuzzy_threshold=%.2f, step_adv=%s, "
-            "prune_guidance=%s, max_turn_tokens=%d)",
+            "prune_guidance=%s, progress_message=%s, max_turn_tokens=%d)",
             self.auto_hint_fuzzy_threshold,
             self.step_adv_enable,
             self.prune_guidance,
+            self.progress_message,
             self.max_turn_tokens,
         )
 
@@ -181,8 +196,8 @@ class AutoHintAgentLoop(HintAgentLoop):
     async def _handle_generating_state(
         self, agent_data, sampling_params: dict[str, Any], ignore_termination: bool = False
     ) -> AgentState:
-        """Generate one answer turn (EOS-terminated), then decide: correct -> stop;
-        wrong & budget remains -> go inject a hint (PROCESSING_TOOLS); else stop."""
+        """Generate one answer turn (EOS-terminated), then decide: no box -> truncate;
+        correct -> stop; wrong & budget remains -> inject a hint; else stop."""
         # (1) EOS only -- no tool/stop tokens injected (the policy is unaware of hints).
         # PER-TURN length cap: ``room`` = global response tokens left BEFORE this turn;
         # classify_length_cut (below) uses it with the per-turn cap to label how the turn
@@ -230,26 +245,27 @@ class AutoHintAgentLoop(HintAgentLoop):
         #     loss mask under POSITIVE advantage (the verified-prefix mask).
         #   * auto_hint_completed -- hint ids already given/verified this rollout, for
         #     the multi-round selector's completed|pending status rendering.
+        #   * auto_hint_progress  -- cumulative {hint_id,text} records used by the
+        #     optional progress-aware user message.
         agent_data.extra_fields.setdefault("applied_hints", [])
         agent_data.extra_fields.setdefault("hint_call_failed", 0)
         agent_data.extra_fields.setdefault("hint_budget_exceeded", 0)
-        # Per-rollout flag: set to 1 when the assistant generation ran into the hard
-        # response-length cap (truncated mid-answer, no EOS). The reward short-circuits
-        # to the floor (minimum) score on this flag, same as hint_budget_exceeded, so a
-        # run-on rollout that never emits a boxed answer is scored as the worst outcome
-        # rather than an ordinary (and sometimes accidentally-boxed) failure.
+        # Per-rollout flag: set to 1 when the assistant generation ran into a hard
+        # response-length cap OR ended a turn without a boxed answer. The reward
+        # short-circuits to the floor (minimum) score on this flag, same as
+        # hint_budget_exceeded.
         agent_data.extra_fields.setdefault("length_truncated", 0)
-        # Per-rollout flag: 1 when this rollout ended on a PER-TURN length-cap cut
-        # (max_turn_tokens hit with global budget remaining) -- the subset of
-        # length_truncated attributable to the per-turn cap rather than the global
-        # ceiling. Surfaced (vs an agent_data.metrics counter, which AgentLoopMetrics
-        # drops) so hint_budget_callback can report hprl/turn_truncated_frac. Initialized
-        # on every rollout for the DataProto.concat key-consistency reason as applied_hints.
+        # Per-rollout flag: 1 when this rollout ended on a PER-TURN failure:
+        # max_turn_tokens was hit with global budget remaining, or an EOS-completed turn
+        # omitted a boxed answer. Both cases are deliberately trained as exceeding the
+        # turn length. Surfaced (vs an agent_data.metrics counter, which AgentLoopMetrics
+        # drops) so hint_budget_callback can report hprl/turn_truncated_frac.
         agent_data.extra_fields.setdefault("turn_truncated", 0)
         agent_data.extra_fields.setdefault("hint_select_time", 0.0)
         agent_data.extra_fields.setdefault("hint_select_calls", 0)
         agent_data.extra_fields.setdefault("hint_calls_total", 0)
         agent_data.extra_fields.setdefault("hint_calls_with_box", 0)
+        agent_data.extra_fields.setdefault("hint_selector_declined", 0)
         # resolve_selected_hint reconciliation counters -- initialized on EVERY
         # rollout (DataProto.concat key-consistency, same as the keys above);
         # incremented flag-wise at the selection site.
@@ -265,6 +281,7 @@ class AutoHintAgentLoop(HintAgentLoop):
         agent_data.extra_fields.setdefault("final_hint_exhausted", 0)
         agent_data.extra_fields.setdefault("disable_spans", [])
         agent_data.extra_fields.setdefault("auto_hint_completed", [])
+        agent_data.extra_fields.setdefault("auto_hint_progress", [])
         # STEP-LEVEL advantage segments: per turn, a [turn_start, boundary, turn_end,
         # state_start, state_end, is_fail] record (response-relative token coords +
         # the states the turn moved between). Consumed by step_advantage.py when
@@ -302,19 +319,7 @@ class AutoHintAgentLoop(HintAgentLoop):
         #     global-cap case (b) -- which hardcodes pre_state 0 -- to any turn/state. Then
         #     terminate WITHOUT a selector call or hint injection.
         if cut == "per_turn":
-            agent_data.extra_fields["length_truncated"] = 1
-            agent_data.extra_fields["turn_truncated"] = 1
-            if self.step_adv_enable:
-                turn_end = len(agent_data.response_mask)
-                turn_start = turn_end - len(agent_data.response_ids)
-                order = pending_hint_ids(self._pool(agent_data), [])
-                pre_state = _prefix_state(
-                    order, agent_data.extra_fields.get("auto_hint_completed", [])
-                )
-                self._record_step_adv_turn(
-                    agent_data, turn_start, turn_start, turn_end, pre_state, pre_state, is_fail=1
-                )
-            return AgentState.TERMINATED
+            return self._terminate_turn_as_truncated(agent_data)
         # (b) GLOBAL response-length ceiling bound the turn (no per-turn cap, or the
         #     remaining room was STRICTLY smaller than max_turn_tokens so the turn ran out
         #     of TOTAL budget, not its own step cap). Flag length_truncated; in step-adv a
@@ -330,6 +335,14 @@ class AutoHintAgentLoop(HintAgentLoop):
                     agent_data, turn_start, turn_start, turn_end, 0, 0, is_fail=1
                 )
             return AgentState.TERMINATED
+
+        # A normally EOS-completed turn still violates the answer protocol if it does
+        # not contain \boxed{...}. Do not spend a hint on a formatless turn: terminate
+        # it through the exact same floor-reward / step-adv path as a per-turn cap hit.
+        text = self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
+        if _extract_boxed(text) == "None":
+            return self._terminate_turn_as_truncated(agent_data)
+
         if self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns:
             return AgentState.TERMINATED
         if self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
@@ -337,10 +350,9 @@ class AutoHintAgentLoop(HintAgentLoop):
 
         # Record this turn so the selector's build_trace + grading see it (the base
         # loop tracks turns only as tokens; build_trace reads messages).
-        text = self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
         agent_data.messages.append({"role": "assistant", "content": text})
 
-        # (2) grade -> (3)/(4) continuation decision.
+        # (3) grade -> (4)/(5) continuation decision.
         if self._is_correct(agent_data):
             if self.step_adv_enable:
                 # SOLVING turn: the whole turn is verified progress to the final state
@@ -385,6 +397,7 @@ class AutoHintAgentLoop(HintAgentLoop):
         pool = self._pool(agent_data)
         applied = agent_data.extra_fields.setdefault("applied_hints", [])
         completed = agent_data.extra_fields.setdefault("auto_hint_completed", [])
+        hint_order = pending_hint_ids(pool, [])
 
         # span of the turn that just ended (wrong) -- response-relative token coords.
         turn_len = len(agent_data.response_ids)
@@ -395,7 +408,7 @@ class AutoHintAgentLoop(HintAgentLoop):
         # STEP-ADV: the pool's full hint order + the state the rollout was at BEFORE
         # this turn (state_start). A spent budget makes this a TERMINAL label (query the
         # selector for the failed step, but give no hint and charge no penalty).
-        order = pending_hint_ids(pool, []) if self.step_adv_enable else []
+        order = hint_order if self.step_adv_enable else []
         pre_state = _prefix_state(order, completed) if self.step_adv_enable else 0
         terminal = self.step_adv_enable and len(applied) >= budget
 
@@ -454,6 +467,13 @@ class AutoHintAgentLoop(HintAgentLoop):
         completed_hints = selection.get("completed_hints")
         if not isinstance(completed_hints, list):
             completed_hints = []
+        progress_state = agent_data.extra_fields.setdefault("auto_hint_progress", [])
+        progress_state = update_progress_state(
+            progress_state,
+            completed_hints,
+            hint_order=hint_order,
+        )
+        agent_data.extra_fields["auto_hint_progress"] = progress_state
 
         # Reconcile (id, text) against the pool actually OFFERED this call (the
         # ``pending`` ids). A mislabeled id poisons ``completed``/step-adv/penalty
@@ -477,7 +497,7 @@ class AutoHintAgentLoop(HintAgentLoop):
         # appended "" to ``completed``. Treat it like pool-exhaustion instead: a
         # benign stop -- no injection, no penalty, a zero-advantage no-fail
         # segment (the selector gave us no failed hint to price).
-        if hid is None and not hint_text:
+        if _is_selector_decline(selection, _raw):
             agent_data.metrics["hint_selector_declined"] = (
                 agent_data.metrics.get("hint_selector_declined", 0) + 1
             )
@@ -565,8 +585,19 @@ class AutoHintAgentLoop(HintAgentLoop):
                    boundary=boundary, completed_hints=completed_hints,
                    selector_raw=_raw, selector_prompt=_prompt)
 
-        # Inject the hint as a user turn (masked 0 -- never trained).
-        hint_message = {"role": "user", "content": self._format_hint(hint_text)}
+        # Inject the hint as a user turn (masked 0 -- never trained). The current
+        # selected hint is not called "done" in this message; persist it only after
+        # formatting so it joins the completed list starting next round.
+        hint_message = {
+            "role": "user",
+            "content": self._format_hint(hint_text, progress_state),
+        }
+        update_progress_state(
+            progress_state,
+            selected_hint_id=hid,
+            selected_hint=hint_text,
+            hint_order=hint_order,
+        )
         agent_data.messages.append(hint_message)
         response_ids = await self.apply_chat_template([hint_message], remove_system_prompt=True)
         if len(agent_data.response_mask) + len(response_ids) >= self.response_length:
@@ -581,6 +612,27 @@ class AutoHintAgentLoop(HintAgentLoop):
     # ------------------------------------------------------------------ #
     # helpers
     # ------------------------------------------------------------------ #
+    def _terminate_turn_as_truncated(self, agent_data) -> AgentState:
+        """Terminate the current turn as a per-turn overlength failure.
+
+        Used both for a real ``max_turn_tokens`` cut and for an EOS-completed turn
+        with no boxed answer, which intentionally receives identical reward and
+        step-level-advantage treatment.
+        """
+        agent_data.extra_fields["length_truncated"] = 1
+        agent_data.extra_fields["turn_truncated"] = 1
+        if self.step_adv_enable:
+            turn_end = len(agent_data.response_mask)
+            turn_start = turn_end - len(agent_data.response_ids)
+            order = pending_hint_ids(self._pool(agent_data), [])
+            pre_state = _prefix_state(
+                order, agent_data.extra_fields.get("auto_hint_completed", [])
+            )
+            self._record_step_adv_turn(
+                agent_data, turn_start, turn_start, turn_end, pre_state, pre_state, is_fail=1
+            )
+        return AgentState.TERMINATED
+
     def _record_step_adv_turn(
         self, agent_data, turn_start: int, boundary: int, turn_end: int,
         state_start: int, state_end: int, *, is_fail: int,
@@ -616,8 +668,7 @@ class AutoHintAgentLoop(HintAgentLoop):
         frac = min(1.0, end_char / max(1, len(turn_text)))
         return turn_start + int(round(frac * turn_len))
 
-    @staticmethod
-    def _format_hint(hint_text: str) -> str:
+    def _format_hint(self, hint_text: str, progress_state=()) -> str:
         """Wrap the selector hint as a user turn that asks the model to continue.
 
         Deliberately contains NO literal ``\\boxed{}``: the reward extracts the final
@@ -625,10 +676,10 @@ class AutoHintAgentLoop(HintAgentLoop):
         turns), so a ``\\boxed{}`` here could be mistaken for the answer. The system
         prompt already mandates the boxed final answer.
         """
-        body = hint_text or "(the selector returned an empty hint)"
-        return (
-            f"Here is a hint to help you make progress:\n{body}\n\n"
-            "Using this hint, continue your reasoning and give your final boxed answer."
+        return format_auto_hint_message(
+            hint_text,
+            progress_state,
+            include_progress=self.progress_message,
         )
 
     def _dump(self, agent_data, turn_start, turn_end, problem, trace, completed,
@@ -672,6 +723,8 @@ class AutoHintAgentLoop(HintAgentLoop):
                 "selector_prompt": selector_prompt,
                 "selection": selection if isinstance(selection, dict) else None,
                 "completed_hints": completed_hints,
+                "progress_message_enabled": self.progress_message,
+                "progress_state": list(agent_data.extra_fields.get("auto_hint_progress", [])),
                 "selector_raw": selector_raw,
                 "selector_err": err,
             }

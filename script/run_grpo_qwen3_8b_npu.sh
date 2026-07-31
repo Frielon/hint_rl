@@ -74,8 +74,8 @@ project_name='GRPO-Qwen3-8B-Base'
 # reads its latest_checkpointed_iteration.txt (global_step_300) and continues.
 # This keeps the same wandb curve, log dir, and checkpoint dir. To start a fresh
 # run instead, restore the timestamped form:
-#   exp_name="GRPO-Qwen3-8B-Base-dolci-zero-rl-8192-16-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
-exp_name="GRPO-Qwen3-8B-Base-dolci-zero-rl-8192-16-20260722-041547"
+exp_name="GRPO-Qwen3-8B-Base-dolci-zero-rl-8192-16-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
+# exp_name="GRPO-Qwen3-8B-Base-dolci-zero-rl-8192-16-20260722-041547"
 wandb_project=${wandb_project:-"hint_rl"}
 
 adv_estimator=grpo
@@ -260,7 +260,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=True \
-    trainer.test_freq=5 \
+    trainer.test_freq=20 \
     trainer.save_freq=50 \
     `# trainer.max_actor_ckpt_to_keep=1` \
     trainer.total_epochs=100 \

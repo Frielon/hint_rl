@@ -2,16 +2,12 @@
 set -xeuo pipefail
 
 # ---------------------------------------------------------------------------
-# Plain GRPO variant for Olmo-3-7B-Instruct. This is a copy of
-# run_grpo_qwen3_8b_npu.sh with the model swapped to Olmo-3-7B-Instruct
-# (${BASE_HOME}/model/Olmo-3-7B-Instruct); everything else (algorithm, lr
-# schedule, batch sizes, n, lengths, sp_size, offload, gpu-mem, dynamic bsz,
-# gradient checkpointing, logging, ckpt) is kept identical so the only
-# difference vs. the Qwen3-8B run is the base model.
-#
-# NOTE: Olmo3's HF config only exposes `attention_dropout` (no embd_pdrop /
-# resid_pdrop like the Qwen models), so the override_config block below only
-# zeroes attention_dropout.
+# Plain GRPO variant for Qwen3-8B. This is a copy of
+# run_grpo_qwen2.5_7b_npu.sh with the model swapped to Qwen3-8B
+# (${BASE_HOME}/model/Qwen3-8B); everything else (algorithm, lr schedule,
+# batch sizes, n, lengths, sp_size, offload, gpu-mem, dynamic bsz, gradient
+# checkpointing, logging, ckpt) is kept identical so the only difference vs.
+# the Qwen2.5-7B run is the base model.
 #
 # Standard GRPO with the clip-higher (asymmetric clip) trick and NO KL penalty,
 # WITHOUT the two Dr. GRPO unbiased-estimator fixes:
@@ -32,11 +28,11 @@ set -xeuo pipefail
 # mounted anywhere. Expected layout (relative positions must be preserved):
 #
 #   <base>/
-#     miniconda3/                       -> CONDA_HOME
-#     model/Olmo-3-7B-Instruct/         -> MODEL_PATH
+#     miniconda3/                 -> CONDA_HOME
+#     model/Qwen3-8B/             -> MODEL_PATH
 #     project/
-#       verl/                           -> VERL_HOME
-#       hint_rl/                        -> HINT_RL_HOME
+#       verl/                     -> VERL_HOME
+#       hint_rl/                  -> HINT_RL_HOME
 #         script/<this script>
 #         dataset/ reward/ ckpt/
 #
@@ -72,8 +68,14 @@ if [ -f "${HINT_RL_HOME}/.envrc" ]; then
 fi
 export WANDB_API_KEY="${WANDB_API_KEY:-${wandb_key:-}}"
 
-project_name='GRPO-Olmo-3-7B-Base-RL'
-exp_name="GRPO-Olmo-3-7B-Base-RL-dapo-512-dataset-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
+project_name='GRPO-Qwen3-8B-Base'
+# Resume the interrupted run: exp_name is pinned to the existing checkpoint dir
+# so CKPTS_DIR (=trainer.default_local_dir) points at it and resume_mode=auto
+# reads its latest_checkpointed_iteration.txt (global_step_300) and continues.
+# This keeps the same wandb curve, log dir, and checkpoint dir. To start a fresh
+# run instead, restore the timestamped form:
+#   exp_name="GRPO-Qwen3-8B-Base-dolci-zero-rl-8192-16-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
+exp_name="GRPO-Qwen3-8B-Base-dolci-zero-rl-8192-16-20260722-041547"
 wandb_project=${wandb_project:-"hint_rl"}
 
 adv_estimator=grpo
@@ -112,67 +114,13 @@ WORKING_DIR=${WORKING_DIR:-"${VERL_HOME}"}
 # can inject secrets/log paths via env_vars; ${VERL_HOME}/recipe/dapo/runtime_env.yaml
 # is the upstream template it mirrors.
 # Paths
-# --- base model: Olmo-3-1025-7B via the derived -hprl dir ---------------------
-# The pristine base ckpt ships NO chat template (no chat_template.jinja, none in
-# tokenizer_config.json) -- verl's agent-loop init dies in apply_chat_template --
-# and its bare generation_config.json stops only on <|endoftext|>, so vLLM would
-# run every turn to the length cap past <|im_end|>. Idempotently build
-# ${BASE_HOME}/model/Olmo-3-1025-7B-hprl: per-file symlinks to the pristine dir
-# plus TWO real files -- tokenizer_config.json (pristine + the Olmo-3-7B-Instruct
-# chat template baked in) and generation_config.json (eos_token_id
-# [100265, 100257] = <|im_end|>, <|endoftext|>, as the instruct sibling ships).
-# Pristine dir untouched; same pattern as run_auto_hint_qwen3_8b_base.sh.
-# Skipped entirely when MODEL_PATH is already set (you then own the fix).
-if [ -z "${MODEL_PATH:-}" ]; then
-    OLMO_SRC_DIR=${OLMO_SRC_DIR:-"${BASE_HOME}/model/Olmo-3-1025-7B"}
-    OLMO_TPL_FILE=${OLMO_TPL_FILE:-"${BASE_HOME}/model/Olmo-3-7B-Instruct/chat_template.jinja"}
-    OLMO_HPRL_DIR=${OLMO_HPRL_DIR:-"${BASE_HOME}/model/Olmo-3-1025-7B-hprl"}
-    if [ ! -f "${OLMO_SRC_DIR}/config.json" ] || [ ! -f "${OLMO_TPL_FILE}" ]; then
-        echo "[run_grpo_olmo3] ERROR: pristine model dir or instruct chat template missing" >&2
-        echo "  need ${OLMO_SRC_DIR}/config.json and ${OLMO_TPL_FILE}" >&2
-        exit 1
-    fi
-    mkdir -p "${OLMO_HPRL_DIR}"
-    # Symlink every pristine file except the two we replace; re-run safe (links
-    # already pointing at the right target are left untouched), and a file added
-    # upstream later gets linked on the next launch.
-    for f in "${OLMO_SRC_DIR}"/*; do
-        b="$(basename "${f}")"
-        if [ "${b}" = "generation_config.json" ] || [ "${b}" = "tokenizer_config.json" ]; then
-            continue
-        fi
-        if [ "$(readlink "${OLMO_HPRL_DIR}/${b}" 2>/dev/null || true)" != "${f}" ]; then
-            ln -sfn "${f}" "${OLMO_HPRL_DIR}/${b}"
-        fi
-    done
-    python3 - "${OLMO_SRC_DIR}/tokenizer_config.json" "${OLMO_TPL_FILE}" \
-        "${OLMO_HPRL_DIR}/tokenizer_config.json" <<'EOF'
-import json, os, sys
-src, tpl, dst = sys.argv[1:4]
-with open(src) as f:
-    cfg = json.load(f)
-with open(tpl) as f:
-    cfg["chat_template"] = f.read()
-with open(dst + ".tmp", "w") as f:
-    json.dump(cfg, f, indent=2, ensure_ascii=False)
-os.replace(dst + ".tmp", dst)
-EOF
-    cat > "${OLMO_HPRL_DIR}/generation_config.json.tmp" <<'EOF'
-{
-  "_from_model_config": true,
-  "eos_token_id": [100265, 100257],
-  "transformers_version": "4.57.0"
-}
-EOF
-    mv -f "${OLMO_HPRL_DIR}/generation_config.json.tmp" "${OLMO_HPRL_DIR}/generation_config.json"
-    MODEL_PATH="${OLMO_HPRL_DIR}"
-fi
+MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Qwen3-8B-Base"}
 CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
 # Single-turn, dapo_17k-style prompts (no agent_name column), so every row routes
 # through verl's built-in single_turn_agent -> plain single-turn GRPO, no hint
 # agent loop. Use dapo-3139-hint-verl-mt-clean.parquet (agent_name="hint_agent")
 # only with the HPRL launcher (run_hprl), which registers that loop.
-TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dapo-512-single-turn.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/Dolci-RL-Zero-Math-7B_dapo_formatted-single-turn.parquet"}
 TEST_FILE=${TEST_FILE:-"${HINT_RL_HOME}/dataset/aime2024.parquet"}
 TEST_FILE2=${TEST_FILE2:-"${HINT_RL_HOME}/dataset/dapo_sample_hard_100.parquet"}
 TEST_FILE3=${TEST_FILE3:-"${HINT_RL_HOME}/dataset/aime2025.parquet"}
@@ -272,6 +220,8 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     +actor_rollout_ref.model.override_config.attention_dropout=0. \
+    +actor_rollout_ref.model.override_config.embd_pdrop=0. \
+    +actor_rollout_ref.model.override_config.resid_pdrop=0. \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
@@ -310,7 +260,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=True \
-    trainer.test_freq=10 \
+    trainer.test_freq=5 \
     trainer.save_freq=50 \
     `# trainer.max_actor_ckpt_to_keep=1` \
     trainer.total_epochs=100 \
