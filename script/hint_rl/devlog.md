@@ -15,6 +15,178 @@ _(none open — the step-level advantage calculation landed 2026-06-25; see the 
 
 # Done log
 
+## 2026-07-31 — clip-low ablation CONFIRMS the bypass-clip rectifier: `clip_ratio_low=0.8` (bypass mode kept ON, staleness 1.9) extinguishes the `assistant` tic to sync levels and holds through s430 — past the twins' re-ignition window — with BETTER score/val; residual = rare single-group in-context flares that now get punished, not amplified
+
+**Setup.** Run `...-async-...-20260731-020431`: the negative-side-clip arm of the
+2026-07-30 entry's alternatives. Config verified from the console dump —
+`clip_ratio_low` 0.2→**0.8** (suppression dead zone pushed from r<0.8 to r<0.2),
+everything else at the collapsing regime: `bypass_mode=True` (NOT the decoupled
+flip; `ROLLOUT_CORR_BYPASS` untouched), staleness 1.9, partial True, trigger 1,
+clip_high 0.28, grpo, lr 1e-6, same parquet. Attribution vs the twins:
+`progress_message=True` here AND in async-0729 (which still collapsed with it —
+the progress-recap seam change is thereby EXONERATED as an anti-tic factor, and
+vs 0729 the clip is the single operative delta); vs 0724/0723
+(`progress_message` predates, effectively off) the run is double-delta.
+
+**Result: extinct, and it stays extinct.** Same detector as 2026-07-30 (bare
+`assistant`, not `<|im_start|>`-prefixed), 25-step buckets, % of 512 rollouts:
+
+| run | s0 | s25 | s50 | s100 | s200 | s250 | s300 | s325 | s350 | s375 | s400 | s425 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| cliplow08 | 12.0 | 1.2 | 0.14 | 0.05 | 0.03 | 0.05 | 0.07 | 0.06 | 0.09 | 0.19 | 0.09 | **0.04** |
+| async-0729 | 14.2 | 2.9 | 0.52 | 0.39 | 1.02 | 1.12 | 1.94 | 7.17 | 9.88 | 12.85 | 12.0 | — |
+| async-0724 | 12.5 | 2.5 | 0.39 | 0.66 | 1.18 | 1.12 | 2.54 | 6.52 | 7.53 | 8.25 | 10.4 | →27% s750 |
+
+Aggregate ≥s60 = 0.05% (sync band 0.03–0.08%; collapsed twins 12%). Suppression
+is FASTER than the twins' (s25 bucket 1.2 vs 2.5–2.9) and the async signature
+~1% floor never forms — which was the twins' launching pad: their re-ignition
+grew FROM the floor at s300–325. cliplow08 crosses that whole window flat and
+the mild s375 wave RECEDES (0.19→0.09→0.04) instead of compounding.
+
+**Residual anatomy (why the late blips are not regrowth).** The s336/s393
+spikes are SINGLE-GROUP events: s336 = 5 hits all in one problem's group (5/8
+rollouts), s393 = 8/8 of one max-budget problem (5 hints each) + 2 singletons —
+in-context priming on seam-dense contexts, not policy-wide drift (twins' floor
+was spread across dozens of groups with growing ≥3-occurrence chains). Net
+within-group advantage of tic rollouts is negative at every spike step (−0.32..
+−0.44), rescue-with-positive-adv ≤1/step, and with the wide low clip those
+negative gradients now LAND (dead zone only below r<0.2) — flares get punished
+the same step instead of persisting. In-context pressure remains (ratcheting
+budgets keep growing seam density) but the policy-level amplification loop is
+dead.
+
+**Health: no visible cost, actually ahead.** vs 0729 at matched steps:
+score/mean 0.70/0.72/0.75 over s100–240 vs 0.66/0.63/0.63 (twin already
+sagging); s240–330 window 0.749 vs 0.656, aime2024 0.287 vs 0.173, math_dapo
+0.076 vs 0.036; response length 6.0k vs 5.8k (no inflation); ppo_kl lower. The
+entropy-collapse worry about an aggressive global low clip hasn't materialized
+in 430 steps — but it's a LONG-horizon risk (unaided-discovery over later
+epochs), still open.
+
+**Verdict + watch items.** The 2026-07-30 mechanism is confirmed causally:
+widening exactly the parameter the rectifier story says is binding restores
+extinction under otherwise-collapsing conditions. Watch: (a) flare FREQUENCY of
+8/8-group events around s500–600 (would signal in-context priming outpacing
+per-step suppression — the aggregate % is the wrong metric for this), (b)
+late-epoch exploration/unaided-solve vs the sync baseline, (c) the decoupled-
+mode arm (`ROLLOUT_CORR_BYPASS=False`) remains unlaunched — clip-widening is
+now a validated alternative with one fewer forward pass/step.
+
+### Files touched
+- `devlog.md` — this entry (analysis only; no code changes)
+
+## 2026-07-30 — ASYNC-ONLY reasoning collapse via bare-`assistant` emission: suppressed by s50 in ALL runs, but async can't hold it extinct (bypass-mode off-policy clip is a one-way rectifier) → regrows from a ~1% floor to 20–27% and self-dialogue loops; mitigation: `ROLLOUT_CORR_BYPASS=False` (decoupled mode) in the qwen3 async wrapper
+
+**Question.** The three async dolci runs (`...-async-...-20260723-232147/-20260724-184955/
+-20260729-201823`) start with ~10% of rollouts containing `assistant:`-style text,
+suppress it within ~100 steps, then it returns and becomes common, ending in
+reasoning collapse. The sync twins (`...-20260724-134554`, `...-20260727-121836`,
+identical science knobs — same reward, `step_adv=true`+`whole_turn=true`, clip
+0.2/0.28, model, data; only the architecture differs) never show the relapse. Why?
+
+**Measurement.** Scanned every `rollouts/*.jsonl` of all five runs. Detector:
+occurrences of `assistant` NOT immediately preceded by `<|im_start|>` (those are
+the loop's injected hint-turn markers). Fraction of rollouts with ≥1 bare hit,
+25-step buckets:
+
+| run | s0 | s25 | s50–s275 | s300 | s325 | later |
+|---|---|---|---|---|---|---|
+| async-0729 | 14.2 | 2.9 | 0.3–1.2 floor | 1.9 | 7.2 | 9.9→12.9 (s400) |
+| async-0724 | 12.5 | 2.5 | 0.3–1.4 floor | 2.5 | 6.5 | 7.5→**20–27%** (s500–800) |
+| async-0723 | 13.2 | 2.9 | 0.4–1.1 floor | 1.6 | 2.7 (killed s335) | — |
+| sync-0727 | 10.2 | 1.0 | 0.0–0.1 | 0.1 | 0.0 | 0.1 |
+| sync-0724 | 12.0 | 1.1 | 0.0–0.1 | 0.0 | 0.0 | 0.0 (thru s664) |
+
+Aggregate steps ≥60: sync 0.032% / 0.075% of rollouts — extinct; async-0724
+**12.0%**. So the observed "suppressed then returns" is precisely: async bottoms
+at a ~1% floor (never sync's ~0.05%), holds it ~250 steps, re-ignites ~s300.
+
+**What the behavior is.** Early hits (s5–30) are system-prompt echo ("helpful
+assistant") on failing rollouts — base-model babble, killed fast in BOTH modes.
+The RE-EMERGENT form is different: after `\boxed{ans}`, emit `assistant\n` and
+open a fake next turn — `…\boxed{6}\].assistant\nAlright, let's clarify and
+finalize…`, `…\boxed{100000000}\]\n\nAssistant: assistant\nCorrect! …` (plays
+both roles). That is the injected seam `<|im_end|>\n<|im_start|>user…
+<|im_start|>assistant\n` minus the specials (`<|im_end|>` is un-mimickable — it's
+EOS), continuously re-primed in-context: the tic concentrates in heavily-hinted
+rollouts (mean hints 4.7 vs 1.2 for clean ones late; the raise-only ratchet keeps
+seam density growing). Payoff niche: ~30% of late correct-with-tic rollouts are
+answer RESCUES (wrong boxed pre-tic, correct final boxed — the self-restart fixes
+the answer and mathruler grades the last box) in hard low-mean groups → large
+positive advantage. Escalated form = the collapse: 50+ rollouts/step with ≥3
+occurrences, 20k-char self-dialogue restart chains.
+
+**Smoking gun: it grows AGAINST the advantage signal.** Within-group advantage
+(score − group mean) of tic rollouts, async-0724: net mass NEGATIVE every
+sampled step (−14.6 at s5; −2.1/−6.5/−9.4 at s330/500/790; only 23–32% of tic
+rollouts positive), score 0.12–0.35 vs 0.56–0.77 for clean — yet count grows 4×
+from the floor. Sync sees the same net-negative signal at s5–30 (−11.7/−13.6)
+and extinguishes permanently. The reward isn't the difference; the update is.
+
+**Mechanism.** Async trains in bypass mode (`algorithm.rollout_correction
+.bypass_mode=True`, defaulted by `fully_async_ppo_trainer.yaml` and mirrored in
+`config/hprl_fully_async_trainer.yaml`): `old_log_probs` := the stale vLLM
+sampling-time logprobs, so the PPO ratio r = π_θ/π_rollout(θ−s) starts ≠1
+whenever the trainer has moved since the weight push. Clip quadrants: for a rare
+token being actively suppressed, π_θ ≪ π_rollout → r < 1−ε_low=0.8 → the
+pessimistic max picks the CONSTANT branch on negative-advantage instances →
+**zero gradient** (suppression rate-limited to −20%/version, then dead); the
+positive-advantage side stays unclipped until r > 1+ε_high=1.28 (DAPO
+clip-higher widens it) and never enters its dead zone while r<1. One-way
+rectifier: integrated over versions, up-moves execute in full, down-moves are
+truncated → floor equilibrium (up-push is r-scaled ∝ π_θ, hence the SLOW
+regrowth) → rescue niche tips it upward → in-context self-amplification →
+runaway. Early suppression works in both modes because at 10–20% frequency
+ratios sit near 1 (both directions live); the asymmetry only bites once rare.
+Sync (`bypass_mode=False`) recomputes `old_log_probs` on-policy each step —
+r≡1, full-strength both directions, extinct stays extinct. Token-averaged
+metrics are blind to all this (tic ≈ 1 token in ~6k: `pg_clipfrac` ~0.002,
+`ppo_kl` ~0.001 throughout).
+
+**Exculpated.** (a) Partial rollouts: resume is token-level (`FullyAsyncLLM
+ServerClient.generate` re-submits `prompt_ids+partial`), no re-templated seam;
+`partial_ratio` flat ~25% from s0 while the tic only regrows after s300. (b) The
+2026-07-23 extra_info fix: all three runs post-date it (step-adv groups score
+normally). (c) Config drift: sync/async wrappers verified knob-identical apart
+from the async block.
+
+**Mitigation (shipped).** New env knob `ROLLOUT_CORR_BYPASS` in
+`run_hprl_async.sh` (default `True` = stock, olmo/grid wrappers unchanged),
+passed as `algorithm.rollout_correction.bypass_mode=${ROLLOUT_CORR_BYPASS}`;
+`run_auto_hint_qwen3_8b_base_async.sh` defaults it **False** → decoupled mode:
+trainer recomputes `old_log_probs` as on-policy proximal anchor (r starts at 1;
+`actor/entropy` metric returns) and staleness is corrected separately via
+sequence-level truncated-IS weights vs `rollout_log_probs` (clamp 2.0,
+`RolloutCorrectionConfig` defaults; `compute_rollout_correction_and_add_to_
+batch` → `rollout_is_weights` consumed by the vanilla clip loss via
+`workers/utils/losses.py`). Verified `actor.use_rollout_log_probs` has NO
+consumer in this verl — `bypass_mode` alone is operative. Cost: one extra actor
+forward pass/step on the (1-node) trainer pool. Next launch checks: echo shows
+`rollout_corr_bypass=False`, config dump `'bypass_mode': False`, `rollout_corr/*`
++ `actor/entropy` present, and the bare-`assistant` curve should extinguish to
+sync levels (~0.05%). CONFOUND note: the wrapper's `STALENESS_THRESHOLD` default
+is now 0.1 (collapsed runs ran 1.9) — for clean attribution run bypass-off at
+staleness 1.9. Alternatives weighed: widening `clip_ratio_low` to shrink the
+dead zone (rejected as primary — global blunt instrument, accelerates entropy
+collapse; keep as ablation ≤0.3–0.4); a targeted reward penalty on bare
+role-marker emission (good complement — flips the rescue niche negative, and
+most floor instances sit at r≈1 where gradient is live).
+
+**Measurement recipes** (scripts were session-scratchpad; definitions for
+re-derivation): bare detector = regex `assistant` with `out[m.start()-12:
+m.start()] != '<|im_start|>'`; per-step fraction = rollouts with ≥1 hit / 512;
+within-group advantage = score − mean(score) over rows sharing `input[:200]`;
+rescue = `acc==1` and last `\boxed{}` before first hit ≠ last overall; form
+split = next char (`:`/`\n`/space) + preceding 12 chars (`helpful `/
+`<|im_end|>`/period); seam-priming covariate = `num_hints` of tic vs clean rows.
+
+### Files touched
+- `run_hprl_async.sh` — `ROLLOUT_CORR_BYPASS` knob (default True) + submit line
+  `algorithm.rollout_correction.bypass_mode=${ROLLOUT_CORR_BYPASS}`
+- `run_auto_hint_qwen3_8b_base_async.sh` — exports `ROLLOUT_CORR_BYPASS=False`
+  (decoupled mode) + echo line
+- `devlog.md` — this entry
+
 ## 2026-07-29 — post-hint behavior analysis (dolci-10324 sync vs dapo-512): the model DOES use hints; failures are anchoring/thrash/ladder-exhaustion in the max-k tail; from-scratch RESTARTS are a learned drift reaching 98% of post-hint turns
 
 **Question.** `...-dolci-rl-zero-10324-20260724-134554` (sync qwen3-8b-base, 161

@@ -154,9 +154,9 @@ CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
 HPRL_AUTO_HINT=${HPRL_AUTO_HINT:-true}
 HPRL_AUTO_HINT_FUZZY=${HPRL_AUTO_HINT_FUZZY:-0.8}
 # Include all selector-verified progress and previously delivered hints before
-# each new hint. The OpenAI launcher defaults this on; generic/local runs keep
-# the prior hint-only message unless explicitly enabled.
-HPRL_AUTO_HINT_PROGRESS_MESSAGE=${HPRL_AUTO_HINT_PROGRESS_MESSAGE:-false}
+# each new hint. On by default everywhere (the v2 recap injection eliminates the
+# post-hint restart drift); set =false to restore the prior hint-only message.
+HPRL_AUTO_HINT_PROGRESS_MESSAGE=${HPRL_AUTO_HINT_PROGRESS_MESSAGE:-true}
 # Prune the X.0 step-guidance hints from each pool before it reaches the selector, so the
 # rollout presents the SAME substep-only pools the offline selector eval (multi-cite-gpt-eval)
 # was built and scored on (eval/train parity). Default off -> the full pool (X.0 included).
@@ -631,7 +631,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     actor_rollout_ref.rollout.val_kwargs.top_p=${top_p} \
     actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.rollout.val_kwargs.n=4 \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=-1 \
@@ -659,7 +659,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=${VAL_BEFORE_TRAIN:-True} \
-    trainer.test_freq=${TEST_FREQ:-5} \
+    trainer.test_freq=${TEST_FREQ:-20} \
     trainer.save_freq=${SAVE_FREQ:-20} \
     trainer.max_actor_ckpt_to_keep=100 \
     trainer.total_epochs=${TOTAL_EPOCHS:-100} \

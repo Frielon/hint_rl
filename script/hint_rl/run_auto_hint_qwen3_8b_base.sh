@@ -102,8 +102,8 @@ export max_response_length=${max_response_length:-30720}
 # --- turn on the auto-hint mechanism (identical to the olmo wrapper) ----------
 export HPRL_AUTO_HINT=${HPRL_AUTO_HINT:-true}
 export HPRL_AUTO_HINT_FUZZY=${HPRL_AUTO_HINT_FUZZY:-0.8}
-# Optional cumulative "steps done correctly" prefix before each new hint.
-export HPRL_AUTO_HINT_PROGRESS_MESSAGE=${HPRL_AUTO_HINT_PROGRESS_MESSAGE:-false}
+# Cumulative "steps done correctly" prefix before each new hint (on by default).
+export HPRL_AUTO_HINT_PROGRESS_MESSAGE=${HPRL_AUTO_HINT_PROGRESS_MESSAGE:-true}
 # Prune X.0 step-guidance hints from the pool before the selector sees it (eval/train
 # parity with the offline selector eval). On by default, as in the olmo wrapper.
 export HPRL_PRUNE_GUIDANCE=${HPRL_PRUNE_GUIDANCE:-true}
@@ -116,13 +116,13 @@ export HPRL_PRUNE_GUIDANCE=${HPRL_PRUNE_GUIDANCE:-true}
 #     an under-seeded hard problem ratchets UP on its first zero-correct step). Use
 #     dataset/dapo-3139-auto-hint.parquet for the full pool with (#major-steps) baked
 #     budgets. ---
-export TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dolci-rl-zero-10324-auto-hint.parquet"}
+export TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dolci-rl-zero-9517-auto-hint.parquet"}
 
 # --- resume from a prior checkpoint (a .../global_step_N dir); empty = fresh (the
 #     default -- there are no prior Qwen3-8B-Base ckpts to fork). When set, TRAIN_FILE
 #     must match the ckpt's dataset (the resumed dataloader data.pt requires it). ---
-# export RESUME_FROM_PATH=${RESUME_FROM_PATH:-"${HINT_RL_HOME}/ckpt/HPRL-AutoHint-Qwen3-8B-Base/HPRL-AutoHint-Qwen3-8B-Base-dapo-20260720-235159/global_step_320"}
-export RESUME_FROM_PATH=${RESUME_FROM_PATH:-}
+export RESUME_FROM_PATH=${RESUME_FROM_PATH:-"${HINT_RL_HOME}/ckpt/HPRL-AutoHint-Qwen3-8B-Base/HPRL-AutoHint-Qwen3-8B-Base-dolci-rl-zero-10324-20260724-134554/global_step_340"}
+# export RESUME_FROM_PATH=${RESUME_FROM_PATH:-}
 
 # --- validation: the BARE (plain-prompt, no agent_name) eval sets, so eval is
 #     prompt-matched to auto-hint training (single-turn, unaided) -- NOT the

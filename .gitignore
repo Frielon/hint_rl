@@ -18,6 +18,9 @@ wandb/
 # --- dataset backups (keep the real parquets, drop the .bak copies) ---
 *.bak
 
+stephint/result/*
+stephint/*.parquet
+stephint_data/*.parquet
 # --- python ---
 __pycache__/
 *.py[cod]

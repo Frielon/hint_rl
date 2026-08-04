@@ -1,0 +1,11 @@
+# StepHint custom agent-loop registry (verl rollout.agent.agent_loop_config_path).
+#
+# Registers the solution-prefix rollout under agent_name "stephint_agent". The
+# rows are NOT tagged in the dataset: stephint_fully_async's rollouter wrap
+# stamps agent_name="stephint_agent" (plus the per-rollout stephint_prefix
+# columns) onto every training prompt-group after prepare_single_generation_data
+# -- validation batches bypass the wrap and keep the plain single_turn_agent.
+# The _target_ is imported from PYTHONPATH (= script/stephint_baseline, exported
+# by the run script's runtime env), so no verl core edit is needed.
+- name: stephint_agent
+  _target_: stephint_agent_loop.StepHintAgentLoop

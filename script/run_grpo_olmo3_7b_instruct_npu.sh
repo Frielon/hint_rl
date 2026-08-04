@@ -72,8 +72,9 @@ if [ -f "${HINT_RL_HOME}/.envrc" ]; then
 fi
 export WANDB_API_KEY="${WANDB_API_KEY:-${wandb_key:-}}"
 
-project_name='GRPO-Olmo-3-7B-Base-RL'
-exp_name="GRPO-Olmo-3-7B-Base-RL-dapo-512-dataset-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
+project_name='GRPO-Olmo-3-7B-dpo-dolci-7k'
+# exp_name="GRPO-Olmo-3-7B-dpo-dolci-7k-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
+exp_name="GRPO-Olmo-3-7B-dpo-dolci-7k-20260731-161520"
 wandb_project=${wandb_project:-"hint_rl"}
 
 adv_estimator=grpo
@@ -88,7 +89,7 @@ kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 max_prompt_length=2048
-max_response_length=8192
+max_response_length=16384
 # GRPO: standard per-token mean over the batch.
 loss_agg_mode="token-mean"
 
@@ -108,6 +109,7 @@ train_prompt_mini_bsz=64
 VERL_HOME=${VERL_HOME:-"${PROJECT_HOME}/verl"}
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 WORKING_DIR=${WORKING_DIR:-"${VERL_HOME}"}
+MODEL_PATH="${BASE_HOME}/model/Olmo-3-7B-Instruct-DPO"
 # The Ray runtime env is generated per-run just before submit (see below), so we
 # can inject secrets/log paths via env_vars; ${VERL_HOME}/recipe/dapo/runtime_env.yaml
 # is the upstream template it mirrors.
@@ -172,7 +174,7 @@ CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
 # through verl's built-in single_turn_agent -> plain single-turn GRPO, no hint
 # agent loop. Use dapo-3139-hint-verl-mt-clean.parquet (agent_name="hint_agent")
 # only with the HPRL launcher (run_hprl), which registers that loop.
-TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dapo-512-single-turn.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dolci-instruct-rl-6762-auto-hint-ex-hard100-single-turn.parquet"}
 TEST_FILE=${TEST_FILE:-"${HINT_RL_HOME}/dataset/aime2024.parquet"}
 TEST_FILE2=${TEST_FILE2:-"${HINT_RL_HOME}/dataset/dapo_sample_hard_100.parquet"}
 TEST_FILE3=${TEST_FILE3:-"${HINT_RL_HOME}/dataset/aime2025.parquet"}

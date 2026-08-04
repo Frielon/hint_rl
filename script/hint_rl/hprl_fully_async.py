@@ -32,6 +32,10 @@
 #   * HPRLRayPPOTrainer._get_gen_batch (k-pack expansion) is dead code here:
 #     the async trainer pulls finished rollouts from the queue and never builds
 #     a gen batch (the Rollouter feeds via prepare_single_generation_data).
+#   * _compute_old_log_prob (decoupled rollout correction, bypass_mode=False):
+#     stock brackets the recompute with fsdp2/megatron-only CPU snapshots that
+#     assert on our fsdp1 trainer; the snapshot is dead weight at
+#     trigger_parameter_sync_step=1, so the override below skips it.
 #
 # The Rollouter needs ONE fix on top of stock: verl's
 # _process_single_sample_streaming REPLACES RolloutSample.full_batch with the
@@ -71,6 +75,7 @@ from verl.experimental.fully_async_policy.fully_async_main import FullyAsyncTask
 from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
 from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
 from verl.experimental.separation.utils import create_resource_pool_manager
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.utils import Role
 
 from hprl_ray_trainer import HPRLRayPPOTrainer
@@ -134,6 +139,34 @@ class _HPRLFullyAsyncTrainerImpl(HPRLRayPPOTrainer, _FULLY_ASYNC_TRAINER_BODY):
         # Unbound call through the async body (super() from here would resolve
         # to HPRLRayPPOTrainer.fit, the sync one we are shadowing).
         return await _FULLY_ASYNC_TRAINER_BODY.fit(self)
+
+    def _compute_old_log_prob(self, batch):
+        # The module-header skip of stock FullyAsyncTrainer's CPU param
+        # snapshots. At trigger_parameter_sync_step=1, local_trigger_step stays
+        # 1 forever (_fit_update_local_step resets, never increments), so the
+        # stock save_model_to_cpu(1) is written every step and NEVER read back
+        # -- and its handler is fsdp2-only (fsdp2_sharded_save_to_cpu asserts
+        # "No DTensor-type parameters found" on this job's fsdp1 trainer). Go
+        # straight to RayPPOTrainer's snapshot-free recompute, unbound like the
+        # fit() delegation above: super(_FULLY_ASYNC_TRAINER_BODY, self) would
+        # NOT work -- ray's modified_class is a SUBCLASS of the stock
+        # FullyAsyncTrainer, which therefore sits once more on the MRO right
+        # after the body, snapshot wrapper included.
+        if self.trigger_parameter_sync_step == 1:
+            return RayPPOTrainer._compute_old_log_prob(self, batch)
+        # trigger > 1 genuinely needs the version-1 snapshot (old_log_prob is
+        # anchored to the last-synced params across local steps); upstream only
+        # implements it for fsdp2/megatron, so fail fast with the fix instead
+        # of the DTensor assert three actors deep.
+        if self.config.actor_rollout_ref.actor.strategy == "fsdp":
+            raise NotImplementedError(
+                "async_training.trigger_parameter_sync_step > 1 requires the CPU "
+                "param snapshots in stock _compute_old_log_prob, whose handlers "
+                "are fsdp2/megatron-only (fsdp1 has no DTensor params). Set "
+                "actor_rollout_ref.actor.strategy=fsdp2 (mind ckpt-format "
+                "compatibility on resume) or keep trigger_parameter_sync_step=1."
+            )
+        return super()._compute_old_log_prob(batch)
 
 
 HPRLFullyAsyncTrainer = ray.remote(num_cpus=10)(_HPRLFullyAsyncTrainerImpl)

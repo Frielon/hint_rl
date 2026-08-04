@@ -19,7 +19,6 @@
 #   START_STEP           skip checkpoints with global_step < this (inclusive; ignored when STEPS is set)
 #   PORT CONTEXT_LEN MEM_FRAC MAX_NUM_SEQS                 (server)
 #   N CHUNK CONCURRENCY TEMPERATURE TOP_P TOP_K MAX_TOKENS LIMIT   (eval)
-#   WANDB_PROJECT WANDB_ENTITY WANDB_REPORT               (wandb; key via .envrc)
 #   CONDA_ROOT CONDA_ENV PYTHON_BIN                        (env)
 # ---------------------------------------------------------------------------
 set -eo pipefail
@@ -60,26 +59,8 @@ TOP_P="${TOP_P:-1.0}"
 TOP_K="${TOP_K:--1}"
 MAX_TOKENS="${MAX_TOKENS:-30720}"       # leave 2048 headroom under CONTEXT_LEN for the prompt
 LIMIT="${LIMIT:-}"
-START_STEP="${START_STEP:-340}"           # skip checkpoints with global_step < this (inclusive; ignored when STEPS is set)
+START_STEP="${START_STEP:-0}"           # skip checkpoints with global_step < this (inclusive; ignored when STEPS is set)
 BASE_URL="http://127.0.0.1:${PORT}/v1"
-
-# --- wandb reporting -------------------------------------------------------
-# Same setup as the training scripts (run_grpo_olmo3_7b_instruct_npu_async.sh
-# et al., launched via ray_cluster_launch_olmo3_7b_instruct_async.sh): the API
-# key is loaded from $HINT_RL_HOME/.envrc (exports `wandb_key`) and the
-# project comes from `wandb_project` (training uses hint_rl; eval defaults to
-# hint_rl_eval). Each run ckpt dir becomes ONE wandb run whose exp name = the
-# ckpt dir basename (e.g. StepHint-GRPO-...-20260802-220824); every evaluated
-# global_step logs its per-dataset eval metrics against `global_step`, so the
-# curves line up across checkpoints. Disable with WANDB_REPORT=0 (or
-# WANDB_MODE=offline/disabled).
-if [ -f "$HINT_RL_HOME/.envrc" ]; then
-  source "$HINT_RL_HOME/.envrc"
-fi
-export WANDB_API_KEY="${WANDB_API_KEY:-${wandb_key:-}}"
-wandb_project=${wandb_project:-"hint_rl_eval"}
-WANDB_PROJECT="${WANDB_PROJECT:-$wandb_project}"
-WANDB_REPORT="${WANDB_REPORT:-1}"
 
 # --- the runs whose every checkpoint we evaluate ---------------------------
 # Each entry: "<label-prefix>|<absolute run ckpt dir>". Every global_step_*/actor
@@ -101,8 +82,8 @@ RUNS=(
   # "hprl-qwen3-4b-instruct-2507|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Qwen3-4B-Instruct-2507-async/HPRL-AutoHint-Qwen3-4B-Instruct-2507-async-dolci-instruct-6762-20260801-024403"
   # "agrpo-qwen3-4b-instruct-492|$HINT_RL_HOME/ckpt/GRPO-Qwen3-4B-Instruct-2507-dolci-492-async/GRPO-Qwen3-4B-Instruct-2507-dolci-492-async-20260802-000744"
   # "hprl-async-qwen3-4b-instruct-492|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Qwen3-4B-Instruct-2507-async/HPRL-AutoHint-Qwen3-4B-Instruct-2507-async-dolci-instruct-492-20260802-000856"
-  # "stephint|$HINT_RL_HOME/ckpt/StepHint-GRPO-Qwen3-4B-Instruct-2507-dolci-481-async/StepHint-GRPO-Qwen3-4B-Instruct-2507-dolci-481-async-20260802-220824"
-  "hprl-agrpo-olmo-7b-sft-2180|$HINT_RL_HOME/ckpt/GRPO-Olmo-3-7B-sft-dolci-2180-async/GRPO-Olmo-3-7B-sft-dolci-2180-async-20260802-222339"
+  "agrpo-olmo3-sft-1773|$HINT_RL_HOME/ckpt/GRPO-Olmo-3-7B-sft-dolci-1773-async/GRPO-Olmo-3-7B-sft-dolci-1773-async-20260802-000819"
+  "hprl-async-olmo3-sft-1773|$HINT_RL_HOME/ckpt/HPRL-AutoHint-Olmo-3-7B-Instruct-sft-async/HPRL-AutoHint-Olmo-3-7B-Instruct-sft-async-dolci-instruct-1773-20260802-000625"
 )
 
 # --- datasets (all BARE, box-scored like GRPO) -----------------------------
@@ -204,7 +185,6 @@ echo " server      : ctx=$CONTEXT_LEN mem=$MEM_FRAC max_num_seqs=$MAX_NUM_SEQS p
 echo " eval        : n=$N chunk=$CHUNK concurrency=$CONCURRENCY temp=$TEMPERATURE top_p=$TOP_P max_tokens=$MAX_TOKENS${LIMIT:+ limit=$LIMIT}"
 echo " datasets    : ${EVAL_SETS[*]}"
 echo " out dir     : $OUT_BASE"
-echo " wandb       : report=$WANDB_REPORT project=$WANDB_PROJECT${WANDB_ENTITY:+ entity=$WANDB_ENTITY} api_key=$([ -n "${WANDB_API_KEY:-}" ] && echo set || echo MISSING)"
 echo "=================================================================="
 
 # --- helpers ---------------------------------------------------------------
@@ -312,76 +292,6 @@ eval_one() {
       "${extra[@]}"
 }
 
-# report one checkpoint's _summary.json files to wandb. One wandb run per
-# ckpt dir (exp name = ckpt dir basename, deterministic run id -> re-runs and
-# START_STEP resumes append to the same run). Metrics are keyed
-# eval/<dataset>/<metric> and plotted against global_step. Best-effort: any
-# wandb failure warns but never kills the eval sweep.
-# args: run_name label_prefix global_step label_out_dir run_ckpt_dir
-report_wandb() {
-  local run_name="$1" prefix="$2" step="$3" label_dir="$4" run_dir="$5"
-  [ "${WANDB_REPORT:-1}" = "1" ] || return 0
-  "$PYTHON_BIN" - "$run_name" "$prefix" "$step" "$label_dir" "$run_dir" \
-      "$WANDB_PROJECT" "${WANDB_ENTITY:-}" <<'PYWB'
-import glob, json, os, re, sys
-
-run_name, prefix, step_s, label_dir, run_dir, project, entity = sys.argv[1:8]
-step = int(step_s)
-try:
-    import wandb
-except Exception as e:  # noqa: BLE001
-    print(f"[wandb] WARN: wandb unavailable ({type(e).__name__}: {e}); skipping report", file=sys.stderr)
-    sys.exit(0)
-
-summaries = sorted(glob.glob(os.path.join(label_dir, "*", "_summary.json")))
-if not summaries:
-    print(f"[wandb] WARN: no _summary.json under {label_dir}; nothing to log", file=sys.stderr)
-    sys.exit(0)
-
-metrics = {"global_step": step}
-config = {"ckpt_dir": run_dir, "label_prefix": prefix}
-accs = []
-for sp in summaries:
-    try:
-        with open(sp) as f:
-            d = json.load(f)
-    except Exception as e:  # noqa: BLE001
-        print(f"[wandb] WARN: unreadable summary {sp}: {e}", file=sys.stderr)
-        continue
-    ds = re.sub(r"\.parquet$", "", d.get("dataset_name") or os.path.basename(os.path.dirname(sp)))
-    m = {
-        "acc_mean": d.get("acc_mean"),
-        "acc_box_only_mean": d.get("acc_box_only_mean"),
-        "format_rate": d.get("format_rate"),
-        "truncation_rate": d.get("truncation_rate"),
-        "hint_call_rate": d.get("hint_call_rate"),
-        "mean_completion_tokens": (d.get("timing") or {}).get("mean_completion_tokens"),
-    }
-    m.update(d.get("pass_at_k") or {})
-    metrics.update({f"eval/{ds}/{k}": v for k, v in m.items() if v is not None})
-    if d.get("acc_mean") is not None:
-        accs.append(d["acc_mean"])
-    config.setdefault("n", d.get("n_requested_per_problem"))
-    config.setdefault("sampling", d.get("sampling"))
-if accs:
-    metrics["eval/mean/acc_mean"] = sum(accs) / len(accs)
-
-init_kwargs = dict(
-    project=project, name=run_name,
-    id=re.sub(r"[^a-zA-Z0-9._-]", "-", run_name)[:120],
-    resume="allow", group=prefix, job_type="eval", config=config,
-)
-if entity:
-    init_kwargs["entity"] = entity
-run = wandb.init(**init_kwargs)
-run.define_metric("*", step_metric="global_step")
-run.log(metrics)
-url = getattr(run, "url", None)
-run.finish()
-print(f"[wandb] logged step {step} ({len(accs)} datasets) -> {url or run_name}")
-PYWB
-}
-
 # eval every checkpoint of one run. args: label_prefix run_ckpt_dir
 eval_run() {
   local prefix="$1" run_dir="$2"
@@ -410,8 +320,7 @@ eval_run() {
   echo "=================================================================="
   echo " RUN: $prefix   steps: ${steps[*]}"
   echo "=================================================================="
-  local run_name step ACTOR_DIR LABEL SERVED_NAME HF_DIR ds
-  run_name="$(basename "$run_dir")"          # wandb exp name = ckpt dir name
+  local step ACTOR_DIR LABEL SERVED_NAME HF_DIR ds
   for step in "${steps[@]}"; do
     ACTOR_DIR="$run_dir/global_step_${step}/actor"
     LABEL="${prefix}-step${step}"
@@ -430,8 +339,6 @@ eval_run() {
       eval_one "$SERVED_NAME" "$LABEL" "$ds" "$OUT_BASE/$LABEL/$(basename "${ds%.parquet}")"
     done
     stop_server
-    report_wandb "$run_name" "$prefix" "$step" "$OUT_BASE/$LABEL" "$run_dir" \
-      || echo "[eval] WARN: wandb report failed for $LABEL (continuing)" >&2
   done
 }
 

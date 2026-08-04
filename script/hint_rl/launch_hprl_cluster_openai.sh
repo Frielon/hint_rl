@@ -80,7 +80,7 @@ TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_auto_hint_qwen3_8b_base.sh"}
 # it); the wrapper's dolci-rl-zero-10324 default already does. wandb gets a
 # NEW run with the SAME name whose step axis continues at the resume step.
 # Set RESUME_EXP_NAME= (empty) to launch a fresh stamped run as before.
-RESUME_EXP_NAME=${RESUME_EXP_NAME-"HPRL-AutoHint-Qwen3-8B-Base-dolci-rl-zero-10324-20260730-113824"}
+RESUME_EXP_NAME=${RESUME_EXP_NAME-}
 if [ -n "${RESUME_EXP_NAME}" ]; then
     export exp_name="${RESUME_EXP_NAME}"
 fi
@@ -160,8 +160,8 @@ export SELECTOR_MAX_RETRIES=${SELECTOR_MAX_RETRIES:-5}
 # stalls on hint calls and the org's RPM/TPM headroom allows.
 export SELECTOR_MAX_CONCURRENCY=${SELECTOR_MAX_CONCURRENCY:-16}
 # This launcher uses the progress-aware selector prompt, so default its matching
-# rollout-message mode on. The generic run script defaults it off for backward
-# compatibility with local-selector experiments.
+# rollout-message mode on. The run scripts now default it on as well; the export
+# here is kept so an explicit =false override still flows through unchanged.
 export HPRL_AUTO_HINT_PROGRESS_MESSAGE=${HPRL_AUTO_HINT_PROGRESS_MESSAGE:-true}
 
 # --- pre-launch cleanup toggle ----------------------------------------------

@@ -97,8 +97,8 @@ use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.0
-clip_ratio_low=0.2
-clip_ratio_high=0.28
+clip_ratio_low=${clip_ratio_low:-0.2}
+clip_ratio_high=${clip_ratio_high:-0.28}
 loss_agg_mode="token-mean"
 
 # ---- lengths: multi-turn trajectories accumulate tokens across turns ------
@@ -166,9 +166,13 @@ fi
 # train_batch_size MUST be 0 and gen_batch_size MUST be 1 in fully-async mode
 # (the Rollouter asserts both): samples are streamed, not stepped. The PPO
 # update geometry is unchanged from the sync job -- ppo_mini_batch_size prompts
-# x rollout.n responses per optimizer step.
-n_resp_per_prompt=8
-train_prompt_mini_bsz=64
+# x rollout.n responses per optimizer step. n_resp_per_prompt /
+# train_prompt_mini_bsz / actor_lr are env-overridable so per-run wrappers can
+# pin them without editing this file; queue sizing / staleness math
+# (required_samples etc.) derive from them downstream.
+n_resp_per_prompt=${n_resp_per_prompt:-8}
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-64}
+actor_lr=${actor_lr:-1e-6}
 
 # ---- async pipeline knobs ---------------------------------------------------
 # See header for semantics. Defaults: sync-equivalent update cadence (64
@@ -178,6 +182,19 @@ TRIGGER_PARAMETER_SYNC_STEP=${TRIGGER_PARAMETER_SYNC_STEP:-1}
 REQUIRE_BATCHES=${REQUIRE_BATCHES:-1}
 PARTIAL_ROLLOUT=${PARTIAL_ROLLOUT:-True}
 USE_TRAINER_DO_VALIDATE=${USE_TRAINER_DO_VALIDATE:-False}
+# Off-policy ratio anchor (algorithm.rollout_correction.bypass_mode):
+#   True  (stock fully-async default) -- old_log_probs := the ROLLOUT policy's
+#         sampling-time logprobs; PPO clips against the stale behavior policy.
+#         Caveat: for a rare token the trainer is suppressing, ratio<1-eps_low
+#         from the start -> negative-advantage grad clips to ZERO while the
+#         positive side stays live (one-way rectifier; 'assistant'-tic
+#         resurgence, devlog 2026-07-30).
+#   False (decoupled mode) -- the trainer RECOMPUTES old_log_probs as an
+#         on-policy proximal anchor (ratio starts at 1, both grad directions
+#         at full strength) and corrects staleness separately via seq-level
+#         truncated-IS weights vs rollout_log_probs (rollout_corr/* metrics).
+#         Costs one extra actor forward pass per step on the trainer pool.
+ROLLOUT_CORR_BYPASS=${ROLLOUT_CORR_BYPASS:-True}
 
 # Optional HARD step bound, in PARAM VERSIONS (== sync global steps at the
 # defaults above). 0/empty = off (the total_epochs bound alone applies). The
@@ -210,9 +227,9 @@ CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
 HPRL_AUTO_HINT=${HPRL_AUTO_HINT:-true}
 HPRL_AUTO_HINT_FUZZY=${HPRL_AUTO_HINT_FUZZY:-0.8}
 # Prefix each new hint with cumulative completed/given progress, interleaved in
-# the original hint-set order. OpenAI launchers default this on; a bare async
-# run remains backward-compatible unless explicitly enabled.
-HPRL_AUTO_HINT_PROGRESS_MESSAGE=${HPRL_AUTO_HINT_PROGRESS_MESSAGE:-false}
+# the original hint-set order. On by default everywhere (the v2 recap injection
+# eliminates the post-hint restart drift); set =false for hint-only messages.
+HPRL_AUTO_HINT_PROGRESS_MESSAGE=${HPRL_AUTO_HINT_PROGRESS_MESSAGE:-true}
 # Prune X.0 step-guidance hints from the pool before the selector sees it
 # (eval/train parity with the offline selector eval).
 HPRL_PRUNE_GUIDANCE=${HPRL_PRUNE_GUIDANCE:-true}
@@ -498,6 +515,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.rollout.calculate_log_probs=True \
+    algorithm.rollout_correction.bypass_mode=${ROLLOUT_CORR_BYPASS} \
     actor_rollout_ref.rollout.multi_turn.enable=True \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=${max_turns} \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=${max_turns} \
@@ -512,7 +530,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     +actor_rollout_ref.model.override_config.embd_pdrop=0. \
     +actor_rollout_ref.model.override_config.resid_pdrop=0. \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.lr=${actor_lr} \
     actor_rollout_ref.actor.optim.lr_warmup_steps=1 \
     actor_rollout_ref.actor.optim.lr_scheduler_type=${HPRL_LR_SCHEDULER:-constant} \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
@@ -534,7 +552,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     actor_rollout_ref.rollout.val_kwargs.top_p=${top_p} \
     actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.rollout.val_kwargs.n=4 \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=-1 \
@@ -571,7 +589,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     async_training.use_trainer_do_validate=${USE_TRAINER_DO_VALIDATE} \
     trainer.val_before_train=${VAL_BEFORE_TRAIN:-True} \
     trainer.test_freq=${TEST_FREQ:-20} \
-    trainer.save_freq=${SAVE_FREQ:-20} \
+    trainer.save_freq=${SAVE_FREQ:-50} \
     trainer.max_actor_ckpt_to_keep=100 \
     trainer.total_epochs=${TOTAL_EPOCHS:-40} \
     trainer.default_local_dir="${CKPTS_DIR}" \
