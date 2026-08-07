@@ -2,8 +2,6 @@
 data_pipeline/
 
 # --- secrets ---
-.envrc
-*.env
 
 # --- training artifacts / generated outputs ---
 logs/
