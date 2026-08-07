@@ -123,6 +123,9 @@ data:
         normalize: false
         overlong_penalty: 0.0
         overlong_penalty_type: post_hoc
+        # absolute -P_over on truncation tails INSIDE zeroed (no-correct) groups
+        # (raw, unnormalized); default on -- see step_advantage overlong_zeroed.
+        overlong_zeroed: true
         whole_turn: false
 
 actor_rollout_ref:

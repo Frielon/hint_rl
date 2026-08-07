@@ -34,7 +34,7 @@ HINT_RL_HOME=${HINT_RL_HOME:-"$(cd "${SCRIPT_DIR}/../.." && pwd)"}
 BASE_HOME=${BASE_HOME:-"$(cd "${HINT_RL_HOME}/../.." && pwd)"}
 
 # --- base model: Olmo-3-7B-Instruct ------------------------------------------
-export MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Olmo-3-7B-Instruct-SFT"}
+export MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Olmo-3-7B-Instruct"}
 
 # --- turn on the auto-hint mechanism + its verified-prefix gradient mask -----
 export HPRL_AUTO_HINT=${HPRL_AUTO_HINT:-true}
@@ -178,8 +178,8 @@ export HPRL_RATCHET_MODE=${HPRL_RATCHET_MODE:-adaptive}
 export HPRL_ALLOW_DECREASE=${HPRL_ALLOW_DECREASE:-false}
 
 # --- distinct run labels in wandb --------------------------------------------
-export project_name=${project_name:-'HPRL-AutoHint-Olmo-3-7B-Instruct-SFT'}
-export exp_name=${exp_name:-"HPRL-AutoHint-Olmo-3-7B-Instruct-SFT-dapo-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
+export project_name=${project_name:-'HPRL-AutoHint-Olmo-3-7B-Instruct'}
+export exp_name=${exp_name:-"HPRL-AutoHint-Olmo-3-7B-Instruct-dapo-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
 
 echo "[run_auto_hint] auto-hint mode ON  (model=${MODEL_PATH})"
 echo "[run_auto_hint]   TRAIN_FILE=${TRAIN_FILE}"

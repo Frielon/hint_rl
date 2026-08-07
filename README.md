@@ -4,9 +4,9 @@ RL training with hint injection for math reasoning, built as flag-gated extensio
 [verl](https://github.com/volcengine/verl) fork. Training runs as multi-node Ray jobs; a hint
 *selector* (a served model such as gpt-oss-20b, or an OpenAI-API model) injects hints into rollouts.
 
-This README documents the **directory-layout contract**: everything this repo needs that lives
-*outside* the repo (conda, the verl fork, model checkpoints) is found by **relative position**, not
-by hardcoded paths. Reproduce the layout below and the launch scripts work from any location.
+Everything this repo needs that lives *outside* the repo (conda, the verl fork, model checkpoints)
+is found by **relative position**, not by hardcoded paths. Reproduce the layout below and the
+launch scripts work from any location. Full setup walkthrough in [Setup](#setup).
 
 ## Directory layout (the contract)
 
@@ -33,7 +33,7 @@ Only the *relative* positions matter, and only these three:
 3. `model/` is **two levels above** the repo (`hint_rl/../../model`).
 
 Datasets (`dataset/*.parquet`), reward functions (`reward/`), checkpoints (`ckpt/`), and logs
-(`logs/`) all live *inside* the repo — nothing to set up for those.
+(`logs/`) all live *inside* the repo — nothing outside to configure for those.
 
 ## How the scripts find things
 
@@ -70,36 +70,130 @@ A few run scripts pin `MODEL_PATH` internally (e.g. the Qwen3-base and Olmo scri
 `<name>-hprl` wrapper dir under `${BASE_HOME}/model/` with fixed eos/chat-template config); they
 still only need the *source* checkpoint present under `model/`.
 
-## Setting up from a fresh clone
+## Setup
+
+The easiest path is the **release bundle** — five files (on our cluster:
+`/share5/users/xutao.ma/project/dist/`; verify with `sha256sum -c SHA256SUMS`):
+
+| File | Contents |
+|---|---|
+| `hint_rl-src-<commit>.tar.gz` | this repo, with full git history |
+| `hint_rl-data.tar.gz` | `dataset/`, `custom_data/`, `stephint_data/` (not tracked in git) |
+| `verl-hprl-src-<commit>.tar.gz` | the verl fork, with full git history |
+| `verl-env.tar.gz` | the complete `verl` conda env ([conda-pack](https://conda.github.io/conda-pack/), relocatable) |
+| `claude-memory.tar.gz` | *(optional)* Claude Code project memory — see step 8 |
+| `SHA256SUMS` | checksums for the tarballs |
+
+All steps below assume `BASE=/your/base` — any path visible to **all** cluster nodes.
+
+### 1. Unpack the source code
 
 ```bash
-BASE=/path/of/your/choice
+BASE=/your/base
 mkdir -p "$BASE/project" "$BASE/model"
 
-git clone <this-repo>  "$BASE/project/hint_rl"
-git clone <verl-fork>  "$BASE/project/verl"
+tar -xzf hint_rl-src-*.tar.gz    -C "$BASE/project"   # -> $BASE/project/hint_rl
+tar -xzf verl-hprl-src-*.tar.gz  -C "$BASE/project"   # -> $BASE/project/verl (sibling!)
+```
 
-# 1. conda: install INTO $BASE/miniconda3 (a fresh install here needs no relocation shim)
+(If you got this repo from GitHub instead, `git clone` it to `$BASE/project/hint_rl` and clone the
+verl fork next to it — same result.)
+
+### 2. Unpack the data
+
+The training/val parquets are not in git; extract them **into the repo root**:
+
+```bash
+tar -xzf hint_rl-data.tar.gz -C "$BASE/project/hint_rl"
+# -> $BASE/project/hint_rl/{dataset,custom_data,stephint_data}/
+```
+
+Every run script's default `TRAIN_FILE` points into `dataset/`.
+
+### 3. Install conda + the packed env
+
+Install a fresh miniconda at `$BASE/miniconda3` (a fresh install here has correct baked paths, so
+the relocation shim below never matters), then unpack the prebuilt `verl` env into it:
+
+```bash
 bash Miniconda3-latest-Linux-x86_64.sh -b -p "$BASE/miniconda3"
+
+mkdir -p "$BASE/miniconda3/envs/verl"
+tar -xzf verl-env.tar.gz -C "$BASE/miniconda3/envs/verl"
+
+source "$BASE/miniconda3/etc/profile.d/conda.sh"
+conda activate verl
+conda-unpack        # rewrites the env's baked paths; run ONCE after extracting
+```
+
+<details>
+<summary>No <code>verl-env.tar.gz</code>? Build the env from scratch</summary>
+
+```bash
 source "$BASE/miniconda3/etc/profile.d/conda.sh"
 conda create -n verl python=3.12 -y && conda activate verl
-# ...install training deps (torch, vllm, ray, ...) into this env, then:
-pip install -e "$BASE/project/verl"
-
-# 2. models: place HF checkpoints under $BASE/model/ using the names listed above
-#    (or export MODEL_PATH / SELECTOR_MODEL_PATH to point elsewhere)
-
-# 3. secrets (git-ignored): wandb key read by the run scripts
-echo 'wandb_key=YOUR_KEY' > "$BASE/project/hint_rl/.envrc"
+# install the training stack (torch, vllm, ray, transformers, ...) per verl's docs,
+# then continue with step 4 (drop the --no-deps flag there so pip pulls verl's deps).
 ```
+</details>
+
+### 4. Install verl into the env (editable)
+
+```bash
+pip install -e "$BASE/project/verl" --no-deps --no-build-isolation
+```
+
+The packed env deliberately does **not** contain verl — an editable install records an absolute
+path, so it must be (re)done on *your* checkout. The flags make it work offline (the env already
+has all dependencies). Re-run this any time you move the `verl/` directory.
+
+### 5. Model checkpoints
+
+Place HuggingFace-format checkpoints under `$BASE/model/` using the exact names from the layout
+diagram above — you only need the models your runs use: the policy model of your chosen
+`run_*.sh`, plus `gpt-oss-20b` if you use the served-selector launchers. (Or point
+`MODEL_PATH` / `SELECTOR_MODEL_PATH` anywhere you like.)
+
+### 6. Secrets
+
+```bash
+echo 'wandb_key=YOUR_KEY' > "$BASE/project/hint_rl/.envrc"   # git-ignored; read by run scripts
+```
+
+### 7. Sanity check
+
+```bash
+source "$BASE/miniconda3/etc/profile.d/conda.sh" && conda activate verl
+python -c "import verl, torch, vllm, ray; print('env OK')"
+ls "$BASE/project/hint_rl/dataset" | head -3                  # data in place
+ls "$BASE/model"                                              # checkpoints in place
+```
+
+### 8. (Optional) Claude Code project memory
+
+The bundle may include `claude-memory.tar.gz`: ~50 notes accumulated while building this project
+(bug post-mortems, mechanism explanations, experiment results), indexed by `memory/MEMORY.md`.
+If you use [Claude Code](https://claude.com/claude-code), install them as *your* project memory —
+Claude Code keys memory to `~/.claude/projects/<slug>/`, where `<slug>` is your hint_rl checkout's
+absolute path with every non-alphanumeric character replaced by `-`:
+
+```bash
+cd "$BASE/project/hint_rl"
+SLUG=$(pwd | sed 's/[^a-zA-Z0-9]/-/g')      # e.g. -home-alice-work-hint-rl
+mkdir -p ~/.claude/projects/"$SLUG"
+tar -xzf claude-memory.tar.gz -C ~/.claude/projects/"$SLUG"   # -> .../$SLUG/memory/
+```
+
+From the next session started in that checkout, Claude loads `memory/MEMORY.md` as its index and
+pulls individual notes on demand. The notes are plain markdown, so they also work as
+human-readable docs (start at `MEMORY.md`). They reference our cluster's internals — treat them
+as team-internal and don't commit or publish them.
 
 Notes:
 
-- **`pip install -e` records an absolute path.** If you later move `verl/`, re-run
-  `pip install -e` (training itself still works via Ray's `--working-dir`, but any direct
-  `import verl` from the env — e.g. the eval/merge tooling — resolves through the stale path).
 - **All Python deps must already be in the conda env.** The Ray runtime env does not
   `pip install` anything at job start (our cluster nodes have no internet access).
+- **`pip install -e` records an absolute path** — step 4 is per-machine, per-location.
 
 ## Launching
 
@@ -119,10 +213,12 @@ job spec, so remember to update it if you relocate the tree.
 ## Conda is not relocatable (`CONDA_INSTALL_PREFIX`)
 
 Conda bakes its absolute install prefix into `etc/profile.d/conda.sh` and into every entry-point
-shebang (`ray`, `pip`, ...). If you install conda fresh at `$BASE/miniconda3` you can ignore this
-section. If you instead **reuse a conda tree that was installed at a different path** (copied, or
-the same share mounted at a different mount point), those baked paths must still resolve. The
-scripts contain a shim for the mount-point case:
+shebang (`ray`, `pip`, ...). The recommended setup above avoids the problem entirely: a fresh
+miniconda at `$BASE/miniconda3` has correct baked paths, and `conda-unpack` fixes the packed env's.
+
+If you instead **reuse a whole conda tree that was installed at a different path** (copied, or the
+same share mounted at a different mount point), those baked paths must still resolve. The scripts
+contain a shim for the mount-point case:
 
 ```bash
 CONDA_INSTALL_PREFIX=${CONDA_INSTALL_PREFIX:-<path that contained miniconda3 at install time>}

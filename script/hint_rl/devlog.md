@@ -9,11 +9,445 @@ entry once it lands.
 
 # TODO / Planned (not yet done)
 
-_(none open — the step-level advantage calculation landed 2026-06-25; see the Done log.)_
+- **Restart mode follow-ups** (v0 landed 2026-08-04 — see the Done entry; cluster smoke pending):
+  - **Leak-gate the restart recap.** The recap is a new gt-leak channel (96% of pools put the
+    literal gt in last-step hints); training-side progress injection is currently ungated (parity
+    with multi-turn v2 — kept identical for the A/B). Port the offline eval's quote-location gate to
+    `format_restart_hint_message` once the A/B baseline is in.
+  - Optional: tighten `max_response_length` (28672 → ~8192 = the per-segment cap) to shrink train
+    tensors ~3.5× — costs val-generation room/comparability, so decide after the smoke run.
 
 ---
 
 # Done log
+
+## 2026-08-04 — TERMINATE-AND-RESTART hint delivery (segment-chain mode) IMPLEMENTED, v0 "final-segment row": `RestartHintAgentLoop` restarts each failed attempt from a fresh problem+recap+hint prompt (per-segment live context ≤ 4096+8192 tok vs 20–40k chains); step_adv/whole_turn COMPATIBLE via zero-span phantom fail records (numeric restart↔multi-turn value-parity proven); activation = registry swap, same parquet, flag-off path byte-identical; SEGMENT-ROW TRAINING landed same-day (train_segments=all: EVERY turn gets gradient, A_i = r+V[se+1]-V[ss] per its own row); 11+3 tests green; smoke #1's registry-clobber crash fixed; re-smoke 20260804-202718 HEALTHY (v0 semantics) and rollout_viewer taught the restart form
+
+**Motivation (see the moved TODO / 2026-08-04 stats).** In run `...-20260731-020431`,
+t≥5 rollouts are 16.6% of samples with 20–40k contexts and ~half of all failures;
+marginal per-hint conversion is flat ~27–31% through t5 — deep hints pull weight but
+their context is the expensive, pathology-bearing part (replay dup-lines ramp with
+turn depth; async post-hint effort collapse; truncation spiral). Recap-v2 proved the
+progress summary is a sufficient statistic (restart drift 0–3% once injected), so
+restart stops fighting the model's fresh-start prior and makes it the mechanism.
+
+**Mechanism (`restart_agent_loop.RestartHintAgentLoop`, subclass of AutoHint loop).**
+On wrong + budget remaining: multi-round selector picks the next hint (protocol,
+resolve/decline/exhausted/terminal branches 1:1 with the parent), then instead of
+appending a user turn the loop ENDS the segment and rebuilds the live context
+wholesale: `prompt_ids` := fresh `[system, user(problem + block)]`, response
+state reset, → GENERATING. The block (`selector_multi.format_restart_hint_message`)
+keeps the v2 recap list + hint framing; the WITH-progress opener is the single
+merged sentence (wording pinned by user, 2026-08-04 — no explicit boxed-answer
+invalidation: with the failed attempt out of context there is no visible answer
+to invalidate):
+
+    You have attempted this problem before and you made the following verified
+    progress, which is correct:
+    1. <progress, student notation, hint-set order>
+
+    Here is a hint to help you make further progress:
+    <hint>
+
+    Using this hint, continue your reasoning from the verified progress and give
+    your final boxed answer.
+
+A progress-FREE restart (typically the first hint, nothing verified yet) is
+JUST the hint block — no preamble (wording revised by user 2026-08-04; it
+briefly carried the boxed-answer invalidation sentence): "Here is a hint to
+help you make progress:" + the hint + "reason step by step from the beginning".
+Viewer grouping matches on EITHER block opener (`_RESTART_BLOCK_RE`
+alternation), so old- and new-wording dumps both collapse hinted prompts onto
+their problem.
+
+**POOL WORDING knob (`HPRL_RESTART_POOL_WORDING`, default TRUE in restart
+mode).** The recap lines and the delivered hint use the hint set's ORIGINAL
+sentences instead of the selector's rephrasings: the selector's student-notation
+adaptation exists to splice into a live reasoning trace, and a fresh restart
+prompt has no trace in context. Selection/verification is untouched (the
+selector still picks the hint, marks completed ones, and its `quote`s still
+drive boundaries/cites); only the delivered TEXT changes — recap rebuilt from
+the authoritative completed set (prior + this round's newly, minus the selected
+hint) in pool order via `pool_hint_texts`; `applied_hints[].hint` records what
+was actually delivered. `=false` restores selector wording (multi-turn parity
+arm). KNOB CHANNEL: env, forwarded to the agent-loop workers by a new
+conditional `HPRL_RESTART_ENV` block in run_hprl_async.sh's Ray runtime-env
+(same pattern as the proxy vars; absent → non-restart runs' runtime env
+byte-identical). This is the ONLY worker-reaching channel: registry-yaml extra
+keys are LOST after the first rollout (the registry re-pin keeps only
+`_target_` — never put knobs in the yaml), and the forwarding also un-deadens
+the previously env-only `HPRL_RESTART_ARCHIVE_IDS`.
+
+Correct / no-box / per-turn cap / pool-exhausted / selector-fail / decline /
+budget-spent all TERMINATE exactly as before — the chain ends on the current
+segment. `agent_data.messages` deliberately keeps the FULL transcript (attempts +
+injected blocks): it feeds only `build_trace`/`_is_correct`/dumps, so the selector
+sees the identical conversation it sees in multi-turn mode (controlled variable in
+the A/B) and last-box-wins grading is unchanged.
+
+**Row semantics (v0 — final segment only).** verl's agent loop emits one row per
+rollout; `run()` finalizes prompt/response from `prompt_ids`/`response_mask`, so
+after the resets the row is (fresh recap+hint prompt, final attempt) — and
+`rollout_log_probs` stay aligned by construction. `applied_hints` accumulate across
+segments → `hint_reward.compute_score` prices the whole chain on its final row;
+GRPO groups (n chains/problem), budget ratchet, and dumps run UNCHANGED. Earlier
+segments are archived-and-reset into `extra_fields.restart_segments` (seg_index,
+n_tokens, pred, state_start/end from the achieved-hint set, boundary, next_hint_id,
+next_user_message, response text, per-segment turn_lens/step_adv_turns/
+disable_spans; exact token ids only under `HPRL_RESTART_ARCHIVE_IDS`) — spliced
+into the rollout JSONL by the trainer, so plot tooling sees every attempt. The
+final row's per-segment metadata describes only its own segment: archived spans are
+never inherited (`disable_spans` empty by design → the verified-prefix mask is a
+structural no-op on restart rows). Expanding archived segments into their own
+state-priced rows is the TODO.
+
+**step_adv/whole_turn COMPATIBLE via PHANTOM fail records** (initially shipped
+with step_adv pinned off on a "final segments would misprice states" argument —
+half right: reading `step_advantage.py`, D_k survives (from `final_states`,
+chain-level via acc + the terminal-label record) but F_k is fit from the row's
+`step_adv_turns` fail entries, and archiving earlier segments would hide their
+failures → F_k undercounted → V too flat). Fix: at each restart the loop keeps a
+ZERO-TOKEN-SPAN record `[0,0,0,ss,se,1]` in the live list (`_archive_segment`
+moves real records to the archive, preserves phantoms; the tail appends the new
+one). `assign_row_advantages` paints nothing for an empty span, but the record
+enters `fail_states_list`/`final_states` — the group fit sees the SAME (H_i,
+V_i) as a multi-turn row, V is identical, and since the restart chain walks the
+identical state trajectory (fail at s_k → next segment resumes at s_{k+1},
+exactly whole_turn's "failed turn ends at S_{se+1}" convention), the final
+segment's whole-turn advantage EQUALS the multi-turn final turn's. v0 is thus a
+correct SUBSET gradient (same V; intermediate turns' terms absent until the
+expansion follow-up). Proven numerically: `test_step_adv_value_parity` encodes
+one 3-chain group both ways and asserts V and the painted final-segment
+advantages match to 1e-9. Launcher accordingly runs FULL parent science-knob
+parity: step_adv=true, whole_turn=true, norm=true, overlong 0.1 value-mode.
+
+**Per-turn advantage AUDIT columns** (any step-adv run, restart AND multi-turn):
+every rollout dump row now carries `step_adv_turn_advs` — for each
+`step_adv_turns` record, `[head, tail]` = the advantage READ BACK from the final
+tensor at the segment span's first/last token (`None` for zero-span phantoms),
+so it reflects everything downstream of the raw formula (post-hoc overlong,
+per-group normalize/adv_scale; whole_turn ⇒ head==tail, split ⇒ head=a_C /
+tail=a_I) — and `step_adv_V`, the group's fitted V[0..K] (`None` on zeroed
+groups; identical across the group's rows). Check offline: painted / (formula
+from V) must be one constant per group (= the normalize factor,
+`step_adv/norm_factor_mean` in wandb). Plumbing: `apply_step_level_advantages`
+gained a pure side-output `group_values_out` dict + a `read_turn_advantages`
+tensor-readback helper (both additive); the trainer writes the two non-tensor
+columns inside `_hprl_apply_step_advantage` (dump runs AFTER `_update_actor` in
+BOTH trainers — sync ray_trainer.py:1649→1683, async separation fit_step
+441→446 — so the columns are present at dump time), best-effort guarded.
+Known edge: a `restart_prompt_overflow` stop records the failure (enters F_k)
+without charging the hint — reward/value slightly diverge there; keep the
+counter ~0. Caveat: `turn_lens`-based analyses and "turn idx =
+len(step_adv_turns)" heuristics must now skip zero-span phantoms on restart
+rows.
+
+**Activation — registry swap, no dataset rebuild, no shared-path behavior change.**
+`hint_agent_config_restart.yaml` maps the parquet's existing `agent_name=
+"auto_hint"` rows to `RestartHintAgentLoop` (verl's agent-config yaml overrides the
+`@register` table at AgentLoopWorker init); selected via `AGENT_LOOP_CONFIG_PATH`
+in the new launcher `run_auto_hint_qwen3_8b_base_async_restart.sh`. Launcher =
+parent async wrapper with 3 marked deltas: the registry swap; context budget
+`max_prompt_length` 2048→**4096** + `max_response_length` 30720→**28672** (sum
+pinned at the model-native 32768; live per-request context ≤ 4096+8192);
+`-restart-` run labels. ALL science knobs (step_adv/whole_turn/norm/overlong,
+reward, ratchet) = parent values, so restart delivery is the single delta.
+Resume default = the SAME 020431 `global_step_200` ckpt as the parent →
+matched-start restart-vs-multi-turn A/B. Judge on multi-hint conversion (k≥3),
+unaided discovery, vph.
+
+**Cluster smoke #1 (run 20260804-192840) CRASHED on the first trainer batch —
+registry-swap clobbered by the parent's import side effect; FIXED + regression-
+tested.** `AgentLoopWorker.__init__` loads the swap yaml (auto_hint →
+RestartHintAgentLoop), but hydra's FIRST instantiation imports
+`restart_agent_loop`, whose `from auto_hint_agent_loop import ...` executes the
+parent's `@register("auto_hint")` decorator — overwriting the registry entry
+back to AutoHintAgentLoop for every subsequent rollout of that worker. Result:
+rollout 1 per worker ran restart (rows carry `restart_*` keys), the rest ran
+MULTI-TURN (no keys); the mixed batch died in `DataProto.concat`
+(`AssertionError: Key 'restart_prompt_overflow' is not present ...`,
+detach_utils `assemble_batch_from_rollout_samples`) — usefully, BEFORE training
+a silent mode-mix. Fix: `restart_agent_loop` re-pins
+`_agent_loop_registry["auto_hint"]` to itself at module end (after the parent
+import); the module is only imported when restart mode is active, so default
+runs are untouched — verified both ways by fresh-interpreter subprocess test
+`test_registry_repin_survives_parent_import`. CONSEQUENCE: agent_name
+"auto_hint" and "restart_hint" cannot be mixed within one run (one run = one
+delivery mode).
+
+**TRAIN SEGMENTS = all — every turn of a chain gets gradient (user directive:
+"each turn will compute adv and get gradient"; v0's final-only was a scope cut,
+now superseded).** `HPRL_RESTART_TRAIN_SEGMENTS=all` (restart launchers' new
+default; loop code default stays `final`): the loop archives each terminated
+segment's EXACT tensors — prompt ids, response ids, sampling logprobs, its
+step-adv record `[0,b,te,ss,se,1]` — in `extra_fields.restart_segment_rows`
+(separate from the dumped `restart_segments`, so token ids never hit the jsonl;
+env forwarded via HPRL_RESTART_ENV). Trainer side (`restart_expand.py` +
+`_update_actor`): the batch is expanded into a COPY used only for the actor
+update — one appended row per segment (prompt left-pad / response right-pad,
+attention/position ids rebuilt, `old_log_probs := archived sampling logprobs`,
+valid ONLY under bypass mode — guarded, with step_adv also required), padded to
+a multiple of len(batch) with INERT rows (response_mask all-zero → zero trained
+tokens, no token-mean dilution; verl's make_iterator hard-asserts divisibility,
+no autopad) — while the ORIGINAL batch flows on to the ratchet and the rollout
+dump untouched (no double-count guards needed anywhere). Pricing:
+`apply_step_level_advantages` gained `fit_exclude_per_row` — segment rows (and
+pads) are PAINTED from the group V and enter the normalize std, but are EXCLUDED
+from the value fit, because each chain's final row already carries the
+chain-complete failure set via its phantoms (unexcluded they double-count F_k —
+proven by test). So a chain injected hints a,b,c trains all 4 turns:
+A_i = r(h_fail_i) + V[se_i+1] − V[ss_i] on each failed turn's own row, final
+turn V[se]−V[ss] / terminal-fail form, exactly the whole-turn semantics.
+Gotcha found by test: numpy silently builds MULTI-dim object arrays when rows'
+nested lists share a shape (every row = one 6-elem record — common in restart
+batches) and per-element override then broadcasts; `_as_1d_object` rebuilds such
+columns. Tests: `test_restart_expand.py` — fit-exclusion math (V equals the
+final-rows-only fit; segment row painted r+ΔV; unexcluded fit provably lower),
+real-DataProto expansion (tensor layout, logprob anchoring, pad inertness,
+non-tensor overrides), the `restart_segment_advs` trainer splice, loop
+archiving under the env knob. AUDIT/VIEWER: `_hprl_attach_segment_advs` reads
+each expanded segment row's PAINTED advantage back off the trained tensors and
+attaches it to the original batch per chain (`restart_segment_advs`, aligned
+with `restart_segments`, spliced into the rollout dump); rollout_viewer
+overlays it on the archived turns' chips (tagged "own row"), so under
+train_segments=all every turn of a chain shows the advantage it actually
+trained with — the badge for a missing per-segment value now reads "adv — not in dump"
+(the dump cannot distinguish a v0 final-only run — truly untrained — from a
+segment-training run launched before this splice landed, e.g. the 4B run
+20260804-214953: its console shows expansion active — 512 chains + 735/848
+segment rows/step — so all turns train, but its in-process trainer predates
+`_hprl_attach_segment_advs` and can never record the values; next launch
+records them). NOTE: takes effect on
+the NEXT launch — the running 202718 job trains v0 final-only semantics
+(its in-process workers predate the code; its rollouts carry no segment rows).
+
+**SYNC restart wrapper for Olmo (2026-08-05, first sync-trainer restart run).**
+`run_auto_hint_olmo3_7b_instruct_restart.sh` = the sync Olmo auto-hint wrapper
++ the restart deltas (registry swap; prompt 4096 / response 8192 with the
+parent's per-segment cap 4096 — response is only val room now, the parent's val
+ran 32768, mind comparability; pool wording + train_segments=all; `-restart-`
+labels); k-pack hard-guarded OFF (untested with chain expansion); budget-grouped
+sampling stays ON (sync-only — same-budget batches give uniform chain depth, a
+natural restart fit). Platform entry: `launch_hprl_cluster_openai_restart_olmo.sh`
+(thin TRAIN_SCRIPT wrapper over launch_hprl_cluster_openai.sh). SYNC plumbing
+added to run_hprl_qwen2.5_7b.sh (all additive/default-preserving): the
+HPRL_RESTART_ENV runtime-env forwarding block; `sp_size=${SP_SIZE:-4}`;
+`rollout.calculate_log_probs=${HPRL_CALC_LOGPROBS:-False}` — the segment-row
+expansion needs the SAMPLING logprobs as the synthesized rows' old_log_probs
+anchor, so the wrapper sets HPRL_CALC_LOGPROBS=true; and the
+`step_adv.overlong_zeroed` override. The trainer's expansion guard was
+accordingly loosened from "bypass_mode required" to its REAL requirement:
+`rollout_log_probs` present in the batch — in bypass-mode async that anchor
+equals every row's; in sync/decoupled runs final rows keep their recomputed
+anchors while segment rows use the sampling ones (mixed numerics = the known
+vllm-vs-fsdp gap, the same anchor quality bypass mode runs with everywhere).
+
+**4B restart run 214953 is TRAINER-bound at ~4 versions/hour — parameter
+diagnosis.** Steps land 13-17 min apart while the queue holds a 57-group backlog
+(trainer collect wait ~1s; the rollout pool is throttled by the staleness cap,
+NOT slow). Cause: per-step trained tokens tripled under segment-row training —
+step 3 = 512 finals (avg ~22.8k chars, 26% truncated at the FULL 16384 cap) +
+1122 segment rows (23.9M chars) ≈ ~10M tokens — pushed through ONE trainer node
+at dp=2 (sp=4 hardcoded) with a 10240-token/rank microbatch budget
+(PPO_TOKEN_MULT=2). Levers, in order: (1) HPRL_MAX_TURN_TOKENS 16384→8192 +
+max_response_length 8192 (halves truncated-final width and worst-case segments;
+solved finals avg ~6.5k tok, fit fine); (2) TRAINER_NNODES=2 (backlog says the
+rollout pool affords losing a node); (3) SP_SIZE=2 or 1 (sp_size now
+env-overridable in run_hprl_async.sh — a 4B at ≤12k seqs doesn't need sp=4;
+dp 2→4/8); (4) PPO_TOKEN_MULT 2→4. Combined ≈ 6-8× → ~25-30 vph expected.
+HPRL_RESTART_TRAIN_SEGMENTS=final remains the throughput fallback but undoes
+all-turn training. Also note 26% step-1-3 truncation is itself the top token
+sink — the cap cut + overlong_zeroed (next launch) both attack it. ADOPTED (user
+kept lengths unchanged): the 4B restart wrapper now defaults TRAINER_NNODES=2
+(→ 2:3 split), SP_SIZE=2 (dp=8, 512 rows %% 8 = 0 ✓), PPO_TOKEN_MULT=4 (40960
+tok/rank, was 10240); staleness stays 1.9 and batch 64 (batch-32 halves steps
+not samples/hour; staleness-4 only helps a ROLLOUT-bound regime and costs
+off-policy quality). Ckpts under this split are actor world 16 — resume needs
+TRAINER_NNODES=2 (parent multi-turn ckpts world 8 → 1). FOLLOW-UP (2026-08-05,
+run 233932 at s125, ~10.6 vph): the fix flipped the balance to ROLLOUT-bound
+(mq_len 0, collect waits 150-245s); truncation collapsed 12.9%→0-1% (final p99
+~12.7k tok) while final p50 INFLATED 4.3k→7.6k tok. Cap raised 16384→32768
+(user; response_length = cap, both 32768) with PPO_TOKEN_MULT 4→2 so the
+microbatch budget stays in the proven envelope (2×36864/2 = 36864/GPU ≈ the
+16384 run's 40960); 2:3 split kept — the trainer's idle headroom absorbs the
+ongoing length inflation, which the distant 32768 brake will no longer check.
+
+**Flipped-price finding (4B run 214953, step 1) — all-wrong CO-TRUNCATING
+groups got ZERO anti-truncation gradient; FIXED with `overlong_zeroed`.** The
+"car price flipped upside down" problem's group: 8/8 rollouts truncated at the
+16384 cap, 0 correct → `zero_if_no_correct` zeroed the whole group (V=None, all
+painted advs 0.0000). The overlong penalty (0.1 value-mode) never ran: BOTH
+overlong modes were deliberately scored-groups-only — and plain GRPO also gives
+0 there (truncated floor == incorrect_reward == 0.0, no spread). Net: nothing
+ever pushed against truncation exactly where truncating is the group norm (a
+fresh model at step 1 hits many such groups). Fix: `overlong_zeroed` (new
+step_adv key, TRAINER DEFAULT ON, config
+`data.hprl.auto_hint.step_adv.overlong_zeroed` / env `HPRL_OVERLONG_ZEROED`,
+declared in both trainer yamls) — a zeroed group STAYS zeroed (no value fit,
+V=None) but each truncated row's truncation tail is painted the RAW absolute
+−P_over (no normalize exists in a zeroed group; a gentle −0.1 push), clean-wrong
+rows untouched, expanded segment rows/pads skipped (turn_truncated=0 override /
+zero response_mask). Counted in step_adv/overlong_rows. Where the penalties
+live, for the record: format_reward=0.0 and no-box turns are deliberately routed
+through the truncation path; the reward's `length_truncated` floor only matters
+under GRPO advantages (step_adv REPLACES them); step_adv's own overlong routing
+(post_hoc/value) applies in scored groups; `overlong_zeroed` now covers the
+no-correct case. Function default stays False (pure-function back-compat);
+`test_overlong_zeroed_group` pins both behaviors. Takes effect NEXT launch —
+runs 202718/214953 keep in-process pre-fix code.
+
+**EXACT step-adv computation under restart — specification + worked example
+(what the code computes, function by function).** Notation: pool = K ordered
+hints h_0..h_{K-1} (PRUNED order when prune_guidance — state coords and the
+penalty vector must share it), states S_0..S_K = contiguous completed prefix,
+penalties p_k from `compute_hint_penalties` with the REWARD's kwargs
+(`_step_adv_penalty_cfg`), r_k = −p_k.
+
+(1) WHAT EACH ROW CARRIES (`RestartHintAgentLoop`). Final row of a chain:
+`step_adv_turns` = one zero-span PHANTOM `[0,0,0,ss_j,se_j,1]` per consumed hint
+(appended at each restart; `_archive_segment` moves real records to the archive
+and preserves phantoms) + the final segment's own record — solve
+`[ts,te,te,ss,K,0]`, terminal label `[ts,b,te,ss,se_fail,1]` (budget spent),
+truncation `[ts,ts,te,ss,ss,1]`. The final row alone therefore encodes the
+CHAIN: H_i = {se of its is_fail records}, V_i = K if correct else max se.
+Segment row (train_segments=all; `restart_expand._make_row` from
+`restart_segment_rows`): exactly one real record `[0,boundary,len,ss,se,1]`
+(an archived segment by construction failed), marker `restart_expanded=1`;
+inert pads marker 2 with empty records.
+
+(2) VALUE FIT (`step_advantage.compute_state_values`, per uid group, computed
+from FINAL ROWS ONLY — `fit_exclude_per_row` drops marker≠0 rows):
+    per fit row:  V_i = K if acc≥0.5 else max se over records;
+                  H_i = [se : records with is_fail=1, se<K]
+    F_k = #{i : k ∈ H_i}      (rollouts that FAILED hint k)
+    D_k = #{i : V_i ≥ k}      (rollouts that REACHED state k)
+    V[K] = terminal_value(1.0);   V[k] = V[k+1] + F_k·r_k / D_k   (k = K−1..0)
+value-mode overlong adds − T_k·P_over/D_k (T_k = truncated-at-k over FIT rows).
+`zero_if_no_correct`: a group with no correct fit row zeroes ALL its rows,
+segment rows included.
+
+(3) PAINTING (`assign_row_advantages`, EVERY row — fit-excluded ones too):
+whole_turn: failed record (se<K) → A = r_se + V[se+1] − V[ss] over [ts,te);
+no-fail → A = V[se] − V[ss]. Zero-span phantoms paint nothing (te ≤ ts). Each
+row's A lands uniformly on its OWN response tokens. (Split mode: a_C =
+V[se]−V[ss] on [ts,b), a_I = r_se+V[se+1]−V[se] on [b,te).)
+
+(4) NORMALIZE (per group): one factor = adv_scale / std(painted A over ALL the
+group's trained tokens — segment-row tokens included; pads contribute none,
+response_mask 0); every row scaled by it. Audit columns: `step_adv_V` = the raw
+fitted V per row; `step_adv_turn_advs` = post-everything tensor readback.
+
+(5) WHY the fit exclusion is load-bearing: every archived failure exists TWICE
+in the expanded batch — as the phantom on its chain's final row AND as the
+segment row's real record — and segment rows also masquerade as extra rollouts
+(non-tensors are replicated from the parent, so a correct chain's segment row
+carries acc=1 → counted as a second SOLVED rollout, inflating D_k). Unexcluded,
+the per-rollout statistic is fed pseudo-rollouts: on the worked example below V
+corrupts [0.35,0.65,0.80,1.0] → [0.48,0.72,0.87,1.0]; the unit test pins a
+3-row configuration where V[0] drops 0.65→0.583. Composition-dependent
+direction — wrong either way.
+
+(6) WORKED EXAMPLE (one group, 2 chains, K=3, p=[0.3,0.3,0.4]):
+A: fails h0 → restarts at S1 → clears h1,h2, SOLVES. Final row H_A={0}, V_A=3;
+   plus 1 segment row.
+B: fails h0 → fails h1 → terminal-fails h2, budget spent, INCORRECT. Final row
+   H_B={0,1,2}, V_B=2; plus 2 segment rows.
+Fit (final rows only): D_0=D_1=D_2=2; F_0=2, F_1=1, F_2=1 →
+   V[2]=1−0.4/2=0.80, V[1]=0.80−0.3/2=0.65, V[0]=0.65−2·0.3/2=0.35.
+Painted per-turn advantages (pre-normalize):
+   A1 (seg, fail h0@S0):  −0.3+0.65−0.35 =  0.00   ← shared failure is FREE
+   A2 (final, solve S1→S3):    1−0.65    = +0.35
+   B1 (seg, fail h0@S0):                 =  0.00
+   B2 (seg, fail h1@S1):  −0.3+0.80−0.65 = −0.15   (= r_1·(1−F_1/D_1))
+   B3 (final, fail h2@S2): −0.4+1−0.80   = −0.20   (= r_2·(1−F_2/D_2))
+Properties visible in the numbers: a failure everyone shares prices to
+r_k(1−F_k/D_k) = 0; frugality ordering (solve from S1 = +0.35 < unhinted
+V[3]−V[0] = +0.65 < ... > solve from S2 = +0.20); per-chain telescoping
+Σ_turns A = Σ r(consumed/labeled hints) + V(end) − V[0] (A: +0.35, B: −0.35;
+the group sums to 0 — V is the baseline).
+
+**Re-smoke (run 20260804-202718) PASSED + rollout_viewer restart support.**
+The registry-fixed relaunch resumed the s200 ckpt and trains cleanly (s205:
+acc 0.878, 516/1024 hinted rows; recap-carrying fresh prompts with the
+pool-worded numbered progress; restart_segments archived; phantoms + the final
+record in step_adv_turns; audit columns present — phantoms read None, whole-turn
+head==tail; restart_prompt_overflow=0). tools/rollout_viewer.py needed three
+restart-mode fixes, all no-ops on other runs: (1) `_problem_core` strips the
+per-chain recap+hint block ("You have attempted this problem before …") BEFORE
+the suffix strips — without it every hinted chain hashed to its own singleton
+"problem" (step 205 fragmented; now 64 groups × 16 chains, multi-turn runs
+byte-identical); the canonical problem header prefers a clean sibling's prompt
+(or cuts at the marker when all 16 chains were hinted); a pre-fix
+`.rollouts_problem_steps.json` sidecar for this run was deleted (stale keys).
+(2) `restart_turns` rebuilds the chain view — archived attempt, the "restart ↻
+recap+hint" block (the next segment's prompt tail), …, final segment — i.e. the
+loop's logical transcript, so `annotate_selector_keys` produces the SAME content
+keys build_selector_index computed from the selector records: with the run's
+index built, 5/5 buttons on a 5-restart chain resolve to their dumped
+`mode=restart_hint` calls. (3) segment labels (index/pred/state) + an
+`n_restarts` chip in the rollout header. (4) PER-TURN ADVANTAGE display from the
+audit columns: `attach_turn_advs` pairs `step_adv_turns`/`step_adv_turn_advs`
+onto assistant turns in order (records are appended once per assistant turn;
+only a global-cut final turn lacks one), each turn gets a sign-colored chip —
+whole-turn `adv +x.xxxx` (head==tail) or split `a_C`/`a_I`, with states `sA→B ✗`
+— archived restart segments show "adv — not trained", and the group's fitted
+`V[0..K]` renders above the rollouts. Verified on run 202718 s205: unhinted
+solve +1.195 (s0→9) vs +0.520 for a 1-restart chain solving from s1 — the
+frugality ordering visible per turn; audit-less runs render untouched.
+
+**Gotcha found by test: `apply_chat_template` silently left-truncates.**
+`AgentLoopBase.apply_chat_template` clips any prompt to `rollout.prompt_length`
+(keeping the TAIL — i.e. recap+hint survive, system+problem are cut away), so an
+overflow guard written as `>` can never fire — the clipped prompt comes back at
+exactly `prompt_length`. Guard is `>=`: an over-long (or exactly-at-cap) restart
+prompt REFUSES the restart — chain ends on the current segment, the hint is NOT
+charged, `restart_prompt_overflow` counts it (watch it stay ~0; raise
+`max_prompt_length` otherwise).
+
+**Tests.** `test_restart_chain.py` — 3 renderer tests + the step-adv VALUE-PARITY
+proof (both stdlib/numpy-only) + 4 chain-mechanics tests driving the real class
+with a scripted server/selector under the verl env (real Qwen3 tokenizer):
+3-segment chain (row = final segment only; fresh prompt carries recap+latest hint
+and NOT the earlier attempts; selector saw the full transcript; archives/counters
+exact), phantom-record layout under step_adv=true, budget exhaustion, and the
+overflow guard (hint not charged), the fresh-interpreter registry re-pin regression, and the pool-wording on/off pair (rephrased selector output must not reach the prompt by default). 11/11 green; existing suites unchanged
+(test_auto_hint 49/51 — both failures pre-exist on the unmodified tree;
+selector-parse 23/23; kpack green).
+
+### Files touched
+- `restart_agent_loop.py` — NEW: the terminate-and-restart loop (subclass; adapted
+  copy of the parent's processing-tools handler with the restart tail)
+- `selector_multi.py` — NEW `format_restart_hint_message` (additive; v2 block kept
+  verbatim-equivalent, `format_auto_hint_message` untouched)
+- `hint_agent_config_restart.yaml` — NEW registry (auto_hint → RestartHintAgentLoop)
+- `hint_agent_config.yaml` — additive `restart_hint` entry (default routing unchanged)
+- `hprl_ray_trainer.py` — additive dump splices: `restart_segments` / `n_restarts` /
+  `restart_prompt_overflow` (key-guarded; no-op for non-restart runs) + the step-adv
+  audit columns `step_adv_turn_advs` / `step_adv_V` (written in
+  `_hprl_apply_step_advantage`, any step-adv run)
+- `step_advantage.py` — additive: `group_values_out` side-output on
+  `apply_step_level_advantages` + `read_turn_advantages` tensor-readback helper
+- `run_auto_hint_qwen3_8b_base_async_restart.sh` — NEW launcher (3 deltas above;
+  science knobs = parent parity incl. step_adv/whole_turn/overlong)
+- `run_hprl_async.sh` — additive `HPRL_RESTART_ENV` runtime-env forwarding block
+  (conditional; non-restart runs' runtime env unchanged)
+- `run_auto_hint_qwen3_4b_instruct_2507_async_restart.sh` — NEW launcher: restart
+  sibling of the Qwen3-4B-Instruct-2507 async wrapper (model as-is, 262144
+  native → response stays 50768, prompt 2048→4096, per-segment cap 16384;
+  resume default = the multi-turn 20260802-000856 run's global_step_100 for a
+  fixed matched-start branch overlapping its existing steps 100–150)
+- `launch_hprl_cluster_openai_async_restart.sh` — NEW platform entry point (the
+  launch_hprl_cluster_openai_async.sh pattern: thin TRAIN_SCRIPT wrapper over
+  launch_hprl_cluster_openai.sh, pointing at the restart wrapper; note selector
+  COST is unchanged — build_trace still sees the full transcript)
+- `tools/rollout_viewer.py` — restart form: recap-block strip in grouping, chain
+  reconstruction from `restart_segments` (selector buttons intact), header chip
+- `restart_expand.py` — NEW: segment-row materialization (expanded COPY for the
+  actor update; inert padding to the divisibility multiple)
+- `test_restart_expand.py` — NEW: 3 tests (fit exclusion, DataProto expansion,
+  loop archiving)
+- `test_restart_chain.py` — NEW: 11 tests (incl. the step-adv value-parity proof, the registry re-pin regression, and the pool-wording pair)
+- `devlog.md` — this entry; TODO replaced by the follow-ups
 
 ## 2026-07-31 — clip-low ablation CONFIRMS the bypass-clip rectifier: `clip_ratio_low=0.8` (bypass mode kept ON, staleness 1.9) extinguishes the `assistant` tic to sync levels and holds through s430 — past the twins' re-ignition window — with BETTER score/val; residual = rare single-group in-context flares that now get punished, not amplified
 

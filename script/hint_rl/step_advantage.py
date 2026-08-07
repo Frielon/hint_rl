@@ -73,8 +73,11 @@
 #     the group co-truncates. Turns the length signal into a "do the within-length thing"
 #     reward, not only a "don't truncate" push. (Trade-off: it also positively reinforces a
 #     concise-but-WRONG first turn -- keep P_over small.)
-# Both modes are SCORED-groups-only: a no-correct group is already zeroed, so it gets NO
-# length penalty either way.
+# Both modes are SCORED-groups-only... EXCEPT under ``overlong_zeroed`` (default ON at
+# the trainer since 2026-08-04): a no-correct group is still zeroed, but each truncated
+# row's tail then gets the raw absolute -P_over -- an all-wrong co-truncating group
+# previously received ZERO anti-truncation gradient (GRPO gives 0 there too, all rewards
+# at the floor), i.e. no push against truncation exactly where truncating is the norm.
 #
 # ALL-INCORRECT groups get ZERO advantage everywhere (no gradient): without a single
 # solve the V[K]=1 anchor is unreached and the positive a_C pulls would chase a goal
@@ -294,6 +297,41 @@ def assign_row_advantages(
     }
 
 
+def read_turn_advantages(advantages, turns_per_row):
+    """Read back, per row, the advantage ACTUALLY painted for each turn record.
+
+    For every ``(ts, b, te, ss, se, is_fail)`` record of ``turns_per_row[i]``
+    (same coerced structure ``assign_row_advantages`` consumes), returns
+    ``[a_head, a_tail]`` = the advantage tensor's value at the span's first and
+    last token, or ``None`` for an empty span (a restart-mode zero-span PHANTOM
+    record, which paints nothing). Reading the TENSOR -- not re-deriving from V
+    -- makes this an end-to-end audit: it reflects everything downstream of the
+    raw formula (post-hoc overlong subtraction, per-group normalize/adv_scale).
+    In whole_turn mode head == tail; in split mode head samples a_C (when the
+    boundary > ts) and tail samples a_I (when te > b) -- so head != tail is the
+    split visible in one pair. Dumped per row as ``step_adv_turn_advs``.
+    """
+    out = []
+    n = int(advantages.shape[0])
+    for i in range(n):
+        row = []
+        seq_len = int(advantages[i].shape[0])
+        for t in (turns_per_row[i] or []):
+            try:
+                ts, te = int(t[0]), int(t[2])
+            except Exception:  # noqa: BLE001 -- malformed record: mirror _coerce_turns' drop
+                row.append(None)
+                continue
+            ts_c = max(0, min(seq_len, ts))
+            te_c = max(0, min(seq_len, te))
+            if te_c <= ts_c:
+                row.append(None)
+            else:
+                row.append([float(advantages[i][ts_c]), float(advantages[i][te_c - 1])])
+        out.append(row)
+    return out
+
+
 def _zero_rows(advantages, returns, idxs) -> None:
     for i in idxs:
         advantages[i][:] = 0.0
@@ -346,6 +384,9 @@ def apply_step_level_advantages(
     overlong_penalty_type: str = "post_hoc",
     turn_truncated_per_row: Sequence[Any] | None = None,
     whole_turn: bool = False,
+    group_values_out: dict | None = None,
+    fit_exclude_per_row: Sequence[Any] | None = None,
+    overlong_zeroed: bool = False,
 ) -> tuple[Any, Any, dict]:
     """Replace GRPO advantages with the step-level value-based advantages.
 
@@ -390,6 +431,31 @@ def apply_step_level_advantages(
       non-truncated row anchored at k to a positive advantage (+T_k*P_over/D_k) while the
       non-truncate<->truncate gap stays a stable P_over. No post-hoc subtraction runs. See the
       module header for the full rationale / trade-off.
+
+    ``group_values_out`` (optional audit channel): a caller-supplied dict filled with
+    {uid: V[0..K] list} for every scored group (None for zeroed groups). Pure
+    side-output -- passing it changes no advantage; the trainer dumps it per row
+    (``step_adv_V``) beside the tensor-readback ``read_turn_advantages`` column so the
+    whole calculation is checkable offline.
+
+    ``fit_exclude_per_row`` (restart segment-row expansion): rows flagged truthy are
+    EXCLUDED from the group's value fit (final_states / fail_states / trunc_counts)
+    but still PAINTED from the fitted V and included in the normalize std. Restart
+    mode's expanded segment rows need exactly this: each chain's FINAL row already
+    carries the chain-complete failure set (its zero-span phantoms), so letting the
+    segment rows into the fit would double-count every F_k. None -> all rows fit
+    (the multi-turn / final-only behavior, unchanged).
+
+    ``overlong_zeroed`` (2026-08-04, flipped-price finding): apply the ABSOLUTE
+    overlong penalty inside ZEROED (no-correct) groups too -- paint
+    ``-overlong_penalty`` RAW (no group normalize exists there) on each truncated
+    row's truncation tail, everything else staying 0. Historically both overlong
+    modes were scored-groups-only, which left an all-wrong CO-TRUNCATING group
+    (e.g. 8/8 rollouts at the per-segment cap on a hard problem, step 1) with
+    ZERO anti-truncation gradient -- GRPO gives 0 there too (all rewards at the
+    floor), so nothing ever pushed against truncation exactly where it is the
+    norm. Function default False (pure-function back-compat); the trainer
+    defaults it ON (data.hprl.auto_hint.step_adv.overlong_zeroed).
     """
     n_rows = int(advantages.shape[0])
     groups: dict[Any, list] = {}
@@ -432,11 +498,49 @@ def apply_step_level_advantages(
         if K <= 0 or (zero_if_no_correct and not has_correct):
             _zero_rows(advantages, returns, idxs)
             n_zeroed += 1
+            if group_values_out is not None:
+                group_values_out[_uid] = None  # zeroed group: no value fit ran
+            # ZEROED-GROUP OVERLONG (see docstring): the absolute truncation
+            # surcharge still lands -- raw -P_over on each truncated row's last
+            # segment tail. Painted-only rows are skipped (expanded segment rows
+            # carry turn_truncated=0 anyway; inert pads have response_mask 0, so
+            # even a replicated flag there trains nothing).
+            if (
+                overlong_zeroed and float(overlong_penalty) > 0.0
+                and turn_truncated_per_row is not None
+            ):
+                for i in idxs:
+                    if fit_exclude_per_row is not None and fit_exclude_per_row[i]:
+                        continue
+                    if not turn_truncated_per_row[i]:
+                        continue
+                    trow = turns_per_row[i] or []
+                    if not trow:
+                        continue
+                    seq_len = int(advantages[i].shape[0])
+                    b = max(0, min(seq_len, int(trow[-1][1])))
+                    te = max(0, min(seq_len, int(trow[-1][2])))
+                    if te > b:
+                        advantages[i][b:te] = -float(overlong_penalty)
+                        returns[i][b:te] = advantages[i][b:te]
+                        ov_rows += 1
+                        ov_tokens += (te - b)
             continue
 
+        # rows entering the VALUE FIT (fit_exclude rows are painted-only).
+        fit_idxs = [
+            i for i in idxs
+            if fit_exclude_per_row is None or not fit_exclude_per_row[i]
+        ]
+        if not fit_idxs:  # degenerate: nothing to fit from -> zero the group
+            _zero_rows(advantages, returns, idxs)
+            n_zeroed += 1
+            if group_values_out is not None:
+                group_values_out[_uid] = None
+            continue
         final_states = []
         fail_states_list = []
-        for i in idxs:
+        for i in fit_idxs:
             turns = turns_per_row[i] or []
             if bool(correct_per_row[i]):
                 v_i = K
@@ -456,7 +560,7 @@ def apply_step_level_advantages(
         trunc_counts = None
         if value_overlong:
             trunc_counts = [0] * K
-            for i in idxs:
+            for i in fit_idxs:  # painted-only rows never carry a chain truncation
                 if not turn_truncated_per_row[i]:
                     continue
                 trow = turns_per_row[i] or []
@@ -472,6 +576,10 @@ def apply_step_level_advantages(
         )
         v0_sum += V[0]
         n_scored_groups += 1
+        if group_values_out is not None:
+            # audit channel: the group's fitted V[0..K], keyed by uid (dumped per
+            # row as step_adv_V so the recursion is checkable offline).
+            group_values_out[_uid] = [float(v) for v in V]
 
         # pass 1: assign the RAW value-based advantages (scale handled below so the
         # group std for normalization is read off the raw values).

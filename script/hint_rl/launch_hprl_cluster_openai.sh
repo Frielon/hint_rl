@@ -60,7 +60,8 @@ HINT_RL_HOME=${HINT_RL_HOME:-"$(cd "${SCRIPT_DIR}/../.." && pwd)"}
 PROJECT_HOME=${PROJECT_HOME:-"$(cd "${HINT_RL_HOME}/.." && pwd)"}
 BASE_HOME=${BASE_HOME:-"$(cd "${PROJECT_HOME}/.." && pwd)"}
 RAY_LAUNCH=${RAY_LAUNCH:-"${SCRIPT_DIR}/../ray_cluster_launch.sh"}    # script/ray_cluster_launch.sh
-TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_auto_hint_qwen3_8b_base.sh"}
+# TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_auto_hint_qwen3_8b_base.sh"}
+TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_auto_hint_olmo3_7b_instruct.sh"}
 
 # --- resume-in-place: this launch CONTINUES an existing run ------------------
 # Pinning exp_name to the prior run (instead of letting the run wrapper stamp a

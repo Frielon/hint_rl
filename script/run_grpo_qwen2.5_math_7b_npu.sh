@@ -67,8 +67,8 @@ if [ -f "${HINT_RL_HOME}/.envrc" ]; then
 fi
 export WANDB_API_KEY="${WANDB_API_KEY:-${wandb_key:-}}"
 
-project_name='GRPO-Qwen2.5-7B-Instruct'
-exp_name="GRPO-Qwen2.5-7B-Instruct-stephint-data-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
+project_name='GRPO-Qwen2.5-7B-Math'
+exp_name="GRPO-Qwen2.5-7B-Math-stephint-data-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
 wandb_project=${wandb_project:-"hint_rl"}
 
 adv_estimator=grpo
@@ -85,18 +85,18 @@ clip_ratio_high=0.28
 max_prompt_length=2048
 max_response_length=4096
 # GRPO: standard per-token mean over the batch.
-loss_agg_mode="seq-mean-token-mean"
+loss_agg_mode="token-mean"
 
 # Cluster: 6 nodes x 8 H100 = 48 GPUs. This requires a Ray cluster spanning
 # all nodes (see the `ray job submit` at the bottom); the job is dispatched
 # across whatever GPUs the cluster actually has.
-NNODES=${NNODES:-4}
+NNODES=${NNODES:-2}
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 
 # No dynamic-sampling oversample here, so the generation batch equals the
 # training batch (the trainer generates train_prompt_bsz prompts per step).
 train_prompt_bsz=128
-n_resp_per_prompt=16
+n_resp_per_prompt=8
 train_prompt_mini_bsz=128
 
 # Ray
@@ -107,7 +107,7 @@ WORKING_DIR=${WORKING_DIR:-"${VERL_HOME}"}
 # can inject secrets/log paths via env_vars; ${VERL_HOME}/recipe/dapo/runtime_env.yaml
 # is the upstream template it mirrors.
 # Paths
-MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Qwen2.5-7B-Instruct"}
+MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Qwen2.5-Math-7B"}
 CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
 # Single-turn, dapo_17k-style prompts (no agent_name column), so every row routes
 # through verl's built-in single_turn_agent -> plain single-turn GRPO, no hint

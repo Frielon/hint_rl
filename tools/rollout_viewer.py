@@ -30,6 +30,23 @@ user turn whenever an answer is wrong). The new per-rollout HPRL fields (num_hin
 hint_budget, hint_penalty, hint_call_failed, applied_hints) are surfaced in the
 rollout header.
 
+RESTART-mode (segment-chain) runs (devlog 2026-08-04) are a third form: the dumped
+`output` is only the chain's FINAL segment, earlier attempts live in the row's
+`restart_segments`, and every hinted segment's `input` carries a per-chain
+recap+hint block ("You have attempted this problem before ..."). The viewer
+(a) strips that block in `_problem_core` so hinted chains group with their
+unhinted siblings (and prefers/cuts a clean canonical prompt for the problem
+header), and (b) rebuilds the full chain via `restart_turns` -- archived attempt,
+the recap+hint block that restarted it (labeled "restart ↻", it is the NEXT
+segment's prompt tail), ..., final segment -- which reconstructs the loop's
+logical transcript, so the selector-call content keys line up with the index
+unchanged. `n_restarts` joins the rollout header. Per-turn advantages
+(`step_adv_turn_advs` audit column) render as chips; under segment-row training
+(`HPRL_RESTART_TRAIN_SEGMENTS=all`) the trainer also attaches each archived
+segment's OWN painted advantage (`restart_segment_advs`, read back from its
+expanded training row) and the viewer overlays it -- tagged "own row" -- while
+v0 (final-only) dumps keep the "adv — not trained" badge on archived segments.
+
 Selector responses: each injected hint carries a "🔍 selector response" button that
 reveals the ORIGINAL frozen-selector call that produced it -- the student trace and
 candidate hints the selector saw, its parsed pick (major step, chosen hint, the
@@ -144,10 +161,34 @@ def _norm(s: str) -> str:
     return _WS.sub(" ", s or "").strip()
 
 
+# Restart-mode (segment-chain) runs append a recap+hint block to the problem in
+# each fresh segment prompt (selector_multi.format_restart_hint_message). The
+# WITH-progress variant opens "You have attempted this problem before ...";
+# the progress-FREE variant (first restart, nothing verified yet; wording
+# revised 2026-08-04) is just the hint block, opening "Here is a hint to help
+# you make progress:". Stripping everything from the EARLIEST such marker --
+# BEFORE the suffix strips, so the dataset tail becomes trailing again -- makes
+# hinted restart prompts hash to the same problem as their unhinted siblings.
+# A no-op on every other run form (multi-turn INPUT prompts carry no hint
+# blocks; the "further progress" phrasing of injected turns does not match).
+_RESTART_BLOCK_RE = re.compile(
+    r"\s*(?:You have attempted this problem before"
+    r"|Here is a hint to help you make progress:).*$",
+    re.DOTALL,
+)
+
+
+def _restart_block_start(text: str):
+    """Char offset where a restart recap/hint block begins in ``text``, or None."""
+    m = _RESTART_BLOCK_RE.search(text or "")
+    return m.start() if m else None
+
+
 def _problem_core(user_text: str) -> str:
-    """Recover the pure problem statement: drop the dataset's trailing
-    instruction and the rollout's hint-budget line, then normalize whitespace."""
-    return _norm(_DS_SUFFIX.sub("", _RO_SUFFIX.sub("", user_text or "")))
+    """Recover the pure problem statement: drop the restart-mode recap+hint block
+    (if any), the dataset's trailing instruction, and the rollout's hint-budget
+    line, then normalize whitespace."""
+    return _norm(_DS_SUFFIX.sub("", _RO_SUFFIX.sub("", _RESTART_BLOCK_RE.sub("", user_text or ""))))
 
 
 def problem_group_key(rollout_input: str) -> str:
@@ -364,6 +405,88 @@ def split_turns(text: str, start_role: str = "assistant"):
     return [t for t in turns if t["text"].strip()]
 
 
+def restart_turns(d):
+    """Rebuild the full chain view for a RESTART-mode (segment-chain) rollout.
+
+    The dumped ``output`` is only the chain's FINAL segment; every earlier attempt
+    lives in ``restart_segments`` (archived by RestartHintAgentLoop). Interleave
+    each archived attempt with the recap+hint block that restarted it (that block
+    is the tail of the NEXT segment's fresh prompt), then append the final
+    segment's output turns -- reconstructing exactly the loop's logical transcript
+    (``agent_data.messages``). Because the selector saw that same transcript,
+    ``annotate_selector_keys`` over these turns produces the SAME content keys
+    ``build_selector_index.py`` computed from the selector records, so the
+    per-hint "selector response" buttons work unchanged.
+    """
+    turns = []
+    for seg in d.get("restart_segments") or []:
+        if not isinstance(seg, dict):
+            continue
+        turns.append({
+            "role": "assistant", "text": str(seg.get("response") or ""),
+            "hint_call": False, "injected": False,
+            "seg_index": seg.get("seg_index"), "seg_pred": seg.get("pred"),
+            "seg_state_start": seg.get("state_start"), "seg_state_end": seg.get("state_end"),
+        })
+        turns.append({
+            "role": "user", "text": str(seg.get("next_user_message") or ""),
+            "hint_call": False, "injected": True, "restart": True,
+            "next_hint_id": seg.get("next_hint_id"),
+        })
+    final = split_turns(d.get("output", ""), start_role="assistant")
+    for t in final:  # archived segments are clean-decoded; match by trimming EOS tails
+        t["text"] = t["text"].replace(IM_END, "").replace("<|endoftext|>", "").rstrip("\n")
+        t["seg_index"] = len(d.get("restart_segments") or [])
+    turns += final
+    return [t for t in turns if t.get("text", "").strip()]
+
+
+def attach_turn_advs(turns, d):
+    """Pair each assistant turn with its step-adv record + PAINTED advantage.
+
+    ``step_adv_turns`` records are appended once per assistant turn in turn order
+    (restart rows: one zero-span phantom per archived segment, then the final
+    segment's record), and ``step_adv_turn_advs`` -- the trainer's tensor-readback
+    audit column ([head, tail] per record; None for a zero-span phantom) -- is
+    aligned index-for-index. Pair both onto the assistant turns in order. A turn
+    beyond the record list (only ever the FINAL turn: the neutral tail of a
+    global-length cut records no segment) gets no adv field at all; ``adv: None``
+    specifically means an archived restart segment whose tokens are NOT in the
+    trained row. No-op on rows without the audit column (pre-2026-08-04 dumps,
+    step_adv-off runs)."""
+    recs = d.get("step_adv_turns") or []
+    advs = d.get("step_adv_turn_advs") or []
+    if recs and advs:
+        j = 0
+        for t in turns:
+            if t.get("role") != "assistant":
+                continue
+            if j >= len(recs):
+                break
+            r = recs[j] or []
+            t["adv"] = advs[j] if j < len(advs) else None
+            if isinstance(r, (list, tuple)) and len(r) >= 6:
+                t["adv_state_start"], t["adv_state_end"], t["adv_fail"] = r[3], r[4], r[5]
+            j += 1
+    # SEGMENT-ROW TRAINING (train_segments=all, devlog 2026-08-04): archived
+    # segments train on their OWN expanded rows; the trainer reads their painted
+    # advantages back and attaches them per chain as ``restart_segment_advs``
+    # (aligned with restart_segments). Overlay them onto the archived assistant
+    # turns -- their phantom records paint nothing on the final row, so without
+    # this they would read as adv=None ("not trained", the v0 semantics, which
+    # remains correct for dumps lacking the column).
+    seg_advs = d.get("restart_segment_advs") or []
+    if seg_advs:
+        for t in turns:
+            si = t.get("seg_index")
+            if t.get("role") != "assistant" or si is None:
+                continue
+            if si < len(seg_advs) and seg_advs[si] is not None:
+                t["adv"] = seg_advs[si]
+                t["adv_own_row"] = True
+    return turns
+
+
 def safe_join(base: str, *parts: str) -> str:
     """Join and ensure the result stays within base (no path traversal)."""
     path = os.path.abspath(os.path.join(base, *parts))
@@ -531,10 +654,18 @@ def api_problems():
                 "n_hint_failed": 0,
                 "pack_budgets": Counter(),
                 "preview": d["input"][-300:],
+                "_preview_src": d["input"],
             }
             order.append(h)
         g = groups[h]
         g["count"] += 1
+        # restart runs: a hinted rollout's input tail is its own recap+hint block;
+        # prefer a clean sibling's tail as the problem preview when one shows up
+        # (cleanliness judged on the FULL input -- the tail may miss the opener).
+        if _restart_block_start(g.get("_preview_src") or g["preview"]) is not None \
+                and _restart_block_start(d["input"]) is None:
+            g["preview"] = d["input"][-300:]
+            g["_preview_src"] = d["input"]
         if _num(d, "acc") > 0:
             g["n_correct"] += 1
         g["sum_hints"] += _num(d, "num_hints")
@@ -546,6 +677,7 @@ def api_problems():
         g = groups[h]
         g["avg_hints"] = round(g["sum_hints"] / g["count"], 2) if g["count"] else 0.0
         g.pop("sum_hints", None)
+        g.pop("_preview_src", None)
         # distinct budgets this problem ran at this step, B first. >1 == it was split
         # into k-pack probe packs (cf. budget_sankey / hint_budget_callback).
         g["pack_budgets"] = sorted(g["pack_budgets"], reverse=True)
@@ -569,9 +701,18 @@ def api_rollouts():
     if matches:
         # canonical prompt = the highest-budget pack (the assigned budget B); the forced
         # probe packs B-1,... frame the same problem with a lower budget reminder.
-        canon = max(matches, key=lambda d: _num(d, "hint_budget"))
+        # Restart runs: prefer a CLEAN (unhinted) prompt -- a hinted rollout's input
+        # carries its own chain's recap+hint block, which is not "the problem".
+        clean = [d for d in matches if _restart_block_start(d.get("input") or "") is None]
+        canon = max(clean or matches, key=lambda d: _num(d, "hint_budget"))
         problem_input = canon["input"]
-        input_turns = split_turns(canon["input"], start_role="system")
+        # No clean sibling (every chain of this problem got hinted): show the
+        # prompt cut at the block marker so the header is the problem, not one
+        # chain's recap+hint tail (display-only; chains render their own blocks).
+        cut = _restart_block_start(problem_input)
+        if cut is not None:
+            problem_input = problem_input[:cut].rstrip()
+        input_turns = split_turns(problem_input, start_role="system")
         ds_match = match_dataset_problem(canon["input"])
         # budget-invariant statement -> the selector-call match key (same core the
         # selector dump recovers from its own `problem`). One per problem group.
@@ -581,8 +722,14 @@ def api_rollouts():
         pack_budgets = sorted({int(_num(d, "hint_budget")) for d in matches}, reverse=True)
     out = []
     for d in matches:
-        turns = split_turns(d.get("output", ""), start_role="assistant")
+        # restart-mode rows: rebuild the whole chain (archived segments + the
+        # final-segment output); everything else: split the output as before.
+        if d.get("restart_segments"):
+            turns = restart_turns(d)
+        else:
+            turns = split_turns(d.get("output", ""), start_role="assistant")
         annotate_selector_keys(problem_core, turns)  # tag injected-hint turns
+        attach_turn_advs(turns, d)  # per-turn painted advantages (audit columns)
         out.append({
             "turns": turns,
             "score": d.get("score"),
@@ -596,6 +743,7 @@ def api_rollouts():
             "hint_penalty": d.get("hint_penalty"),
             "hint_call_failed": d.get("hint_call_failed"),
             "applied_hints": d.get("applied_hints"),
+            "n_restarts": d.get("n_restarts"),
         })
     def _parse_json(raw):
         if raw is None or isinstance(raw, (dict, list)):
@@ -613,12 +761,16 @@ def api_rollouts():
             "hint": _parse_json(ds_match.get("hint")),
             "hint_full": _parse_json(ds_match.get("hint_full")),
         }
+    # group value vector (step-adv audit): identical across the group's rows;
+    # None on zeroed groups / runs without the audit column.
+    step_adv_V = next((d.get("step_adv_V") for d in matches if d.get("step_adv_V")), None)
     return jsonify({
         "input": problem_input,
         "input_turns": input_turns,
         "dataset": ds_info,
         "pack_budgets": pack_budgets,  # distinct budgets, B first (>1 == k-packed)
         "has_selector_index": _selector_index_ok(exp),  # show "selector response" buttons?
+        "step_adv_V": step_adv_V,
         "rollouts": out,
     })
 
@@ -1129,7 +1281,51 @@ function renderTurns(turns){
   return turns.map(t => {
     const cls = t.role === 'user' ? 'turn-hint'
               : t.role === 'system' ? 'turn-sys' : 'turn-asst';
-    const label = t.role === 'user' ? 'injected hint' : t.role;
+    // restart-mode chains: assistant turns are per-segment fresh attempts; the
+    // user turn between them is the recap+hint block that became the tail of the
+    // NEXT segment's fresh prompt (not an in-context injection).
+    let label = t.role === 'user'
+        ? (t.restart ? `restart ↻ recap+hint${t.next_hint_id != null ? ` (hint ${esc(t.next_hint_id)})` : ''} — next segment's prompt tail`
+                     : 'injected hint')
+        : t.role;
+    if (t.role === 'assistant' && t.seg_index != null) {
+      const st = (t.seg_state_start != null && t.seg_state_end != null)
+          ? ` · state ${esc(t.seg_state_start)}→${esc(t.seg_state_end)}` : '';
+      const pd = t.seg_pred != null ? ` · pred ${esc(t.seg_pred)}` : '';
+      label = `assistant — segment ${esc(t.seg_index)}${pd}${st}`;
+    }
+    // step-adv audit: the advantage actually PAINTED on this turn's tokens
+    // ([head, tail] read back from the tensor; whole_turn => head==tail, split
+    // mode => a_C prefix / a_I tail). null == archived restart segment (its
+    // tokens are not in the trained row); absent == no record for this turn.
+    let advChip = '';
+    if (t.adv !== undefined) {
+      if (t.adv === null) {
+        // No per-segment value in this dump. Two run generations produce this:
+        // v0 (train_segments=final) runs, where the archived segment genuinely
+        // trained nowhere; and train_segments=all runs launched BEFORE the
+        // restart_segment_advs audit splice landed (e.g. 4B run 20260804-214953:
+        // expansion active, segments DO train, values just unrecorded -- live
+        // Ray actors never reload code). The dump cannot distinguish them, so
+        // the badge claims only what it knows.
+        advChip = ` <span class="badge" style="opacity:.55" title="no per-segment advantage recorded in this dump: either a v0 final-only run (segment truly untrained; its phantom feeds the value fit only) or a segment-training run launched before the restart_segment_advs audit splice (trained, value unrecorded — check the console for 'restart segment expansion' lines)">adv — not in dump</span>`;
+      } else {
+        const h = Number(t.adv[0]), tl = Number(t.adv[1]);
+        const fmt = x => (x >= 0 ? '+' : '') + x.toFixed(4);
+        // states shown here only when the segment label above doesn't already carry them
+        const st = (t.seg_index == null && t.adv_state_start != null)
+            ? ` · s${esc(t.adv_state_start)}→${esc(t.adv_state_end)}` : '';
+        const fl = t.adv_fail ? ' ✗fail' : '';
+        const own = t.adv_own_row ? ' · own row' : '';
+        const wtTitle = t.adv_own_row
+            ? 'whole-turn advantage painted on this segment\'s OWN expanded training row (post normalize/overlong)'
+            : 'whole-turn advantage (post normalize/overlong)';
+        advChip = (Math.abs(h - tl) < 1e-9)
+          ? ` <span class="badge ${h >= 0 ? 'ok' : 'bad'}" title="${wtTitle}">adv ${fmt(h)}${st}${fl}${own}</span>`
+          : ` <span class="badge ${h >= 0 ? 'ok' : 'bad'}" title="a_C verified-prefix advantage">a_C ${fmt(h)}</span><span class="badge ${tl >= 0 ? 'ok' : 'bad'}" title="a_I failed-tail advantage">a_I ${fmt(tl)}${st}${fl}${own}</span>`;
+      }
+    }
+    label += advChip;
     // an injected-hint turn that we can trace to its selector call gets a button
     let btn = '', panel = '';
     if (t.role === 'user' && t.sel_key && state.hasSelIndex) {
@@ -1323,6 +1519,11 @@ async function loadRollouts(pid) {
   html += `<h3>${data.rollouts.length} rollouts`
         + (multiPack ? ` &nbsp;·&nbsp; ${packs.length} k-packs, ordered B=${esc(packs.join(', '))}` : '')
         + `</h3>`;
+  if (data.step_adv_V && data.step_adv_V.length) {
+    // step-adv audit: the group's fitted state values (constant across rollouts).
+    html += `<div class="hint" style="font-family:monospace" title="step-adv value fit V[0..K] over this problem's rollouts (audit column step_adv_V)">`
+          + `group V[0..K] = [${data.step_adv_V.map(v => Number(v).toFixed(3)).join(', ')}]</div>`;
+  }
   let lastB;
   data.rollouts.forEach((r, i) => {
     if (multiPack && r.hint_budget !== lastB) {  // new budget group -> B first, then B-1, ...
@@ -1348,6 +1549,7 @@ async function loadRollouts(pid) {
       `<span><span class="k">score</span> ${esc(r.score)}</span>`,
       r.reward!=null ? `<span><span class="k">reward</span> ${esc(r.reward)}</span>` : '',
       hintsTxt!=null ? `<span><span class="k">hints</span> <span class="badge hintb">${hintsTxt}</span></span>` : '',
+      (r.n_restarts!=null && parseFloat(r.n_restarts)>0) ? `<span><span class="k">restarts</span> <span class="badge hintb">↻ ${esc(r.n_restarts)}</span></span>` : '',
       r.hint_penalty!=null ? `<span><span class="k">hint pen</span> ${esc(r.hint_penalty)}</span>` : '',
       parseFloat(r.hint_call_failed)>0 ? `<span><span class="badge failb">hint call failed</span></span>` : '',
       `<span><span class="k">format</span> ${esc(r.has_format)}</span>`,

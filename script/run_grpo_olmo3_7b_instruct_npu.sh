@@ -72,9 +72,9 @@ if [ -f "${HINT_RL_HOME}/.envrc" ]; then
 fi
 export WANDB_API_KEY="${WANDB_API_KEY:-${wandb_key:-}}"
 
-project_name='GRPO-Olmo-3-7B-dpo-dolci-7k'
-# exp_name="GRPO-Olmo-3-7B-dpo-dolci-7k-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
-exp_name="GRPO-Olmo-3-7B-dpo-dolci-7k-20260731-161520"
+project_name='GRPO-Olmo-3-7B-sft'
+exp_name="GRPO-Olmo-3-7B-sft-stephint-data-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
+# exp_name="GRPO-Olmo-3-7B-dpo-dolci-7k-20260731-161520"
 wandb_project=${wandb_project:-"hint_rl"}
 
 adv_estimator=grpo
@@ -89,7 +89,7 @@ kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 max_prompt_length=2048
-max_response_length=16384
+max_response_length=8192
 # GRPO: standard per-token mean over the batch.
 loss_agg_mode="token-mean"
 
@@ -101,15 +101,15 @@ N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 
 # No dynamic-sampling oversample here, so the generation batch equals the
 # training batch (the trainer generates train_prompt_bsz prompts per step).
-train_prompt_bsz=64
+train_prompt_bsz=128
 n_resp_per_prompt=8
-train_prompt_mini_bsz=64
+train_prompt_mini_bsz=128
 
 # Ray
 VERL_HOME=${VERL_HOME:-"${PROJECT_HOME}/verl"}
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 WORKING_DIR=${WORKING_DIR:-"${VERL_HOME}"}
-MODEL_PATH="${BASE_HOME}/model/Olmo-3-7B-Instruct-DPO"
+MODEL_PATH="${BASE_HOME}/model/Olmo-3-7B-Instruct-SFT"
 # The Ray runtime env is generated per-run just before submit (see below), so we
 # can inject secrets/log paths via env_vars; ${VERL_HOME}/recipe/dapo/runtime_env.yaml
 # is the upstream template it mirrors.
@@ -174,7 +174,9 @@ CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
 # through verl's built-in single_turn_agent -> plain single-turn GRPO, no hint
 # agent loop. Use dapo-3139-hint-verl-mt-clean.parquet (agent_name="hint_agent")
 # only with the HPRL launcher (run_hprl), which registers that loop.
-TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dolci-instruct-rl-6762-auto-hint-ex-hard100-single-turn.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/StepHint_train.parquet"}
+# TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dolci-instruct-rl-492-auto-hint-qwen3-4b-le1of8-single-turn.parquet"}
+# TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dolci-instruct-rl-6762-auto-hint-ex-hard100-single-turn.parquet"}
 TEST_FILE=${TEST_FILE:-"${HINT_RL_HOME}/dataset/aime2024.parquet"}
 TEST_FILE2=${TEST_FILE2:-"${HINT_RL_HOME}/dataset/dapo_sample_hard_100.parquet"}
 TEST_FILE3=${TEST_FILE3:-"${HINT_RL_HOME}/dataset/aime2025.parquet"}
@@ -296,7 +298,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     actor_rollout_ref.rollout.val_kwargs.top_p=${top_p} \
     actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.rollout.val_kwargs.n=4 \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=-1 \
@@ -314,7 +316,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     trainer.val_before_train=True \
     trainer.test_freq=10 \
     trainer.save_freq=50 \
-    `# trainer.max_actor_ckpt_to_keep=1` \
+    trainer.max_actor_ckpt_to_keep=1 \
     trainer.total_epochs=100 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.rollout_data_dir="${LOG_DIR}/${exp_name}/rollouts" \

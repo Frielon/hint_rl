@@ -243,6 +243,9 @@ data:
         #     truncate" push; the non-truncate<->truncate gap stays a co-truncation-proof P_over.
         #     (Also reinforces a concise-but-WRONG first turn, so keep P_over small.)
         overlong_penalty_type: post_hoc
+        # absolute -P_over on truncation tails INSIDE zeroed (no-correct) groups
+        # (raw, unnormalized); default on -- see step_advantage overlong_zeroed.
+        overlong_zeroed: true
         # WHOLE-TURN advantage: don't split a turn into the verified prefix (a_C) and the
         # failed tail (a_I); score the ENTIRE turn with a SINGLE value
         #   A = V[s_end] + hint_penalty - V[s_start]

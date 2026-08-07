@@ -11,9 +11,10 @@ set -xeuo pipefail
 #     * algorithm.norm_adv_by_std_in_grpo=True  -> advantage is (r - mean)/std,
 #       the standard GRPO group-normalized advantage (keeps the std divide that
 #       Dr. GRPO drops to remove question-difficulty bias).
-#     * actor.loss_agg_mode=token-mean -> loss is averaged per token over the
-#       whole batch (standard GRPO), instead of Dr. GRPO's
-#       seq-mean-token-sum-norm constant-length normalization.
+#     * actor.loss_agg_mode=seq-mean-token-mean -> per-sequence token mean,
+#       then mean over sequences (the original GRPO sample-level loss),
+#       instead of Dr. GRPO's seq-mean-token-sum-norm constant-length
+#       normalization.
 #   Kept the same as the Dr. GRPO run (per the request):
 #     * No KL: use_kl_in_reward=False, use_kl_loss=False, coefs 0.
 #     * clip-higher: asymmetric clip with clip_ratio_low / clip_ratio_high.
@@ -68,7 +69,7 @@ fi
 export WANDB_API_KEY="${WANDB_API_KEY:-${wandb_key:-}}"
 
 project_name='GRPO-Qwen2.5-7B-Instruct'
-exp_name="GRPO-Qwen2.5-7B-Instruct-stephint-data-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
+exp_name="GRPO-Qwen2.5-7B-Instruct-dapo-512-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"
 wandb_project=${wandb_project:-"hint_rl"}
 
 adv_estimator=grpo
@@ -84,20 +85,21 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 max_prompt_length=2048
 max_response_length=4096
-# GRPO: standard per-token mean over the batch.
+# GRPO: sample-level loss — mean over tokens within each sequence, then mean
+# over sequences (the original GRPO objective).
 loss_agg_mode="seq-mean-token-mean"
 
 # Cluster: 6 nodes x 8 H100 = 48 GPUs. This requires a Ray cluster spanning
 # all nodes (see the `ray job submit` at the bottom); the job is dispatched
 # across whatever GPUs the cluster actually has.
-NNODES=${NNODES:-4}
+NNODES=${NNODES:-2}
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 
 # No dynamic-sampling oversample here, so the generation batch equals the
 # training batch (the trainer generates train_prompt_bsz prompts per step).
-train_prompt_bsz=128
+train_prompt_bsz=64
 n_resp_per_prompt=16
-train_prompt_mini_bsz=128
+train_prompt_mini_bsz=64
 
 # Ray
 VERL_HOME=${VERL_HOME:-"${PROJECT_HOME}/verl"}
@@ -113,8 +115,8 @@ CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
 # through verl's built-in single_turn_agent -> plain single-turn GRPO, no hint
 # agent loop. Use dapo-3139-hint-verl-mt-clean.parquet (agent_name="hint_agent")
 # only with the HPRL launcher (run_hprl), which registers that loop.
-TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/StepHint_train.parquet"}
-# TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dolci-rl-zero-9517-auto-hint-single-turn.parquet"}
+# TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/StepHint_train.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dolci-rl-zero-9517-auto-hint-single-turn.parquet"}
 TEST_FILE=${TEST_FILE:-"${HINT_RL_HOME}/dataset/aime2024.parquet"}
 TEST_FILE2=${TEST_FILE2:-"${HINT_RL_HOME}/dataset/dapo_sample_hard_100.parquet"}
 TEST_FILE3=${TEST_FILE3:-"${HINT_RL_HOME}/dataset/aime2025.parquet"}

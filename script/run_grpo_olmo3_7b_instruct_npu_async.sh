@@ -8,7 +8,7 @@ set -xeuo pipefail
 # GPUs, each step gated on its slowest rollout) the cluster's pods are SPLIT
 # into two pools running concurrently:
 #
-#   * ROLLOUT pool (ROLLOUT_NNODES x N_GPUS_PER_NODE, default 2x8): vLLM
+#   * ROLLOUT pool (ROLLOUT_NNODES x N_GPUS_PER_NODE, default 3x8): vLLM
 #     replicas STREAMING one prompt-group (rollout.n responses = one GRPO
 #     group) at a time into a message queue. No step barrier: a long rollout
 #     never idles the GPUs that finished. The single-turn rows (no agent_name
@@ -28,8 +28,10 @@ set -xeuo pipefail
 #
 # Algorithm & hyperparameters are IDENTICAL to the sync script (GRPO with
 # clip-higher 0.2/0.28, no KL, std-normalized advantage, token-mean, lr 1e-6,
-# mini 64, n=8, lengths 2048/16384, sp 4, reward 0.9/0.0/0.1). Deliberate
-# deltas, all async mechanics or freed-up-resource tuning:
+# mini 64, n=8, prompt 2048, sp 4, reward 0.9/0.0/0.1) EXCEPT
+# max_response_length=20480 (sync: 16384 -- run 20260805-014728 clipped 6-10%
+# of responses at 16k). Deliberate deltas, all async mechanics or
+# freed-up-resource tuning:
 #   * data.train_batch_size=0 + data.gen_batch_size=1 (streaming; the
 #     Rollouter asserts both), actor_rollout_ref.hybrid_engine=False,
 #     rollout.mode=async, data.return_raw_chat=True.
@@ -45,24 +47,48 @@ set -xeuo pipefail
 #     trainer -- the recompute brackets with an fsdp2-only CPU snapshot that
 #     kills an fsdp1 actor on its first fit step (run 20260731-010034);
 #     guarded loudly below.
-#   * offload=False + PPO_TOKEN_MULT=2: the trainer pool no longer shares its
+#   * offload=False + PPO_TOKEN_MULT=3: the trainer pool no longer shares its
 #     GPUs with vLLM, so the sync script's param/optimizer offload and tight
 #     (p+r)/sp token budget are pure overhead there. Both env-overridable
-#     back to the sync values (OFFLOAD=True PPO_TOKEN_MULT=1).
+#     back to the sync values (OFFLOAD=True PPO_TOKEN_MULT=1); drop MULT to
+#     2 on trainer OOM.
+#   * GPU_MEMORY_UTILIZATION=0.90, not the colocated sync script's 0.80: the
+#     rollout pods run nothing but vLLM, and generation here is KV-CAPACITY
+#     bound -- Olmo-3-7B is full MHA (32 KV heads, no GQA), so even with
+#     vLLM 0.12's SWA-aware hybrid allocator (24/32 layers sliding-4096) a
+#     ~9k-token rollout holds ~2.7 GB of KV and run 20260805-162811 fit only
+#     ~15-20 concurrent seqs/GPU (~950 resp tok/s/GPU). Extra KV converts
+#     near-1:1 into throughput; drop back to 0.80 (env) if the NCCL weight
+#     sync OOMs on the rollout pods.
 #   * update_weights_bucket_megabytes=1024, not the sync 4096: a 4 GiB bucket
-#     OOMs next to vLLM at gpu_memory_utilization=0.80 on the rollout pods
-#     once the allocator fragments (grid 20260720-141549).
+#     OOMs next to vLLM even at gpu_memory_utilization=0.80 on the rollout
+#     pods once the allocator fragments (grid 20260720-141549) -- all the
+#     more binding at 0.90.
 #   * NO runtime_env pip block (the sync script installs mathruler there): a
 #     pip block hangs Ray forever on this air-gapped fabric; mathruler is
 #     baked into the verl conda env.
 #
-# Cluster: 3 nodes x 8 GPUs by default = 1 trainer + 2 rollout, both pools
-# inside ONE Ray cluster. Bring it up on all pods first, e.g. by pointing the
-# platform entry at the sibling launcher:
+# Cluster: 4 nodes x 8 GPUs by default = 1 trainer + 3 rollout, both pools
+# inside ONE Ray cluster. The split has flipped twice; the history matters:
+#   * 1:2 was hard trainer-bound at 16k with the sync trainer settings
+#     (run 20260805-014728: trainer idle_ratio 0.002, update_actor 630s =
+#     99% of the step, rollout queue pegged at the staleness cap).
+#   * 2:2 + offload=False + PPO_TOKEN_MULT=3 cut update_actor 630s -> ~70s
+#     and overshot the other way (run 20260805-162811: trainer idle_ratio
+#     0.72-0.89, rollouter idle_ratio 0.00, queue pinned at 0, ~320s/version
+#     of which ~230s was the trainer starved waiting on samples).
+#   * 1:3 puts the version time at the rollout floor (~200s) with the 1-node
+#     trainer (~150s update_actor) just under it -- still rollout-bound but
+#     balanced. With a 5th pod, 1:4 is the balanced split (~150s/version).
+# Bring the cluster up on all pods first, e.g. by pointing the platform
+# entry at the sibling launcher:
 #   bash ray_cluster_launch_olmo3_7b_instruct_async.sh
 # Rebalance the split with the fully_async/{trainer,rollouter}/idle_ratio
 # wandb metrics: high rollouter idle + low trainer idle -> shift a node to
-# the trainer pool, and vice versa.
+# the trainer pool, and vice versa. Healthy shape for this config: trainer
+# idle ~0.2-0.3, rollouter idle ~0. Validation also runs on the rollout pool
+# (~800s per val at 4 sets x n=4): TEST_FREQ=20 is ~13% of wall clock; pass
+# TEST_FREQ=40 to halve that if coarser val curves are acceptable.
 #
 # START / RESUME: fresh timestamped exp_name by default. Pin exp_name=... to
 # resume that run in place (trainer.resume_mode=auto picks up its latest
@@ -100,8 +126,9 @@ if [ -f "${HINT_RL_HOME}/.envrc" ]; then
 fi
 export WANDB_API_KEY="${WANDB_API_KEY:-${wandb_key:-}}"
 
-project_name=${project_name:-'GRPO-Olmo-3-7B-sft-dolci-492-async'}
-exp_name=${exp_name:-"GRPO-Olmo-3-7B-sft-dolci-492-async-16-2e-6-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
+project_name=${project_name:-'GRPO-Olmo-3-7B-dolci-492-async'}
+# exp_name=${exp_name:-"GRPO-Olmo-3-7B-dolci-492-async-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
+exp_name=${exp_name:-"GRPO-Olmo-3-7B-dolci-492-async-20260805-162811"}
 wandb_project=${wandb_project:-"hint_rl"}
 
 # ---- GRPO algorithm (identical to the sync script) --------------------------
@@ -116,12 +143,13 @@ clip_ratio_high=${clip_ratio_high:-0.28}
 loss_agg_mode="token-mean"
 
 max_prompt_length=${max_prompt_length:-2048}
-max_response_length=${max_response_length:-16384}
+max_response_length=${max_response_length:-20480}
 
 # ---- cluster: split the NNODES pods into the two pools ----------------------
 # NNODES is the TOTAL pod count (exported by the cluster launcher). Default
-# 3 = 1 trainer + 2 rollout.
-NNODES=${NNODES:-3}
+# 4 = 1 trainer + 3 rollout (1:2 was trainer-bound, 2:2 rollout-bound with
+# the trainer ~75-90% idle; see header).
+NNODES=${NNODES:-4}
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 TRAINER_NNODES=${TRAINER_NNODES:-1}
 ROLLOUT_NNODES=${ROLLOUT_NNODES:-$((NNODES - TRAINER_NNODES))}
@@ -141,7 +169,7 @@ fi
 # (the Rollouter asserts both): samples are streamed, not stepped. The PPO
 # update geometry is unchanged from the sync job -- ppo_mini_batch_size
 # prompts x rollout.n responses per optimizer step.
-n_resp_per_prompt=16
+n_resp_per_prompt=8
 train_prompt_mini_bsz=64
 
 # ---- async pipeline knobs ---------------------------------------------------
@@ -186,7 +214,7 @@ WORKING_DIR=${WORKING_DIR:-"${VERL_HOME}"}
 
 # Model: the DPO instruct checkpoint, used AS-IS (instruct ckpts ship a chat
 # template + proper eos, so none of the base-model -hprl derivation applies).
-MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Olmo-3-7B-Instruct-SFT"}
+MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Olmo-3-7B-Instruct"}
 if [ ! -f "${MODEL_PATH}/config.json" ]; then
     echo "[run_grpo_olmo3_async] ERROR: model dir not found: ${MODEL_PATH}" >&2
     exit 1
@@ -245,15 +273,24 @@ top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 
 # Performance. The trainer pool is vLLM-free in disaggregated mode, so offload
-# defaults OFF and the per-GPU token budget gets a 2x headroom multiplier
-# (OFFLOAD=True PPO_TOKEN_MULT=1 restores the exact sync values).
+# defaults OFF and the per-GPU token budget gets a 3x headroom multiplier --
+# at 2x the 16k run packed only ~11k tokens/GPU and ran ~50 TFLOPs/GPU on
+# update_actor (OFFLOAD=True PPO_TOKEN_MULT=1 restores the exact sync
+# values; drop to 2 on trainer OOM). The default 1-node trainer doubles the
+# FSDP shards vs 2:2 (run 20260805-162811 peaked at 26.5 GB allocated on 16
+# GPUs -> expect ~34 GB on 8): fits 80 GB, MULT=2 is the fallback.
 sp_size=4
 use_dynamic_bsz=True
-PPO_TOKEN_MULT=${PPO_TOKEN_MULT:-2}
+PPO_TOKEN_MULT=${PPO_TOKEN_MULT:-3}
 actor_ppo_max_token_len=$((PPO_TOKEN_MULT * (max_prompt_length + max_response_length) / sp_size))
 infer_ppo_max_token_len=$((PPO_TOKEN_MULT * (max_prompt_length + max_response_length) / sp_size))
 offload=${OFFLOAD:-False}
 gen_tp=1
+
+# vLLM KV budget on the (vLLM-only) rollout pods -- generation is KV-capacity
+# bound on this MHA model, so this converts near-1:1 into rollout throughput
+# (see header; back off to 0.80 if the weight sync OOMs).
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.90}
 
 # Weight-sync bucket for the disaggregated checkpoint engine (see header).
 UPDATE_WEIGHTS_BUCKET_MB=${UPDATE_WEIGHTS_BUCKET_MB:-1024}
@@ -299,7 +336,7 @@ fi
 #   actor_rollout_ref.hybrid_engine=False            (pools are disaggregated)
 #   actor_rollout_ref.rollout.mode=async             (server-based rollout)
 #   data.return_raw_chat=True                        (agent-loop path input)
-#   trainer.nnodes / rollout.nnodes                  (the 1:2 resource split)
+#   trainer.nnodes / rollout.nnodes                  (the 2:2 resource split)
 #   async_training.*                                 (pipeline knobs)
 #   rollout.calculate_log_probs=True                 (behavior-policy logprobs)
 ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
@@ -343,7 +380,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     +actor_rollout_ref.model.override_config.attention_dropout=0. \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.optim.lr=2e-6 \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
@@ -353,7 +390,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.80 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
@@ -389,7 +426,8 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     async_training.use_trainer_do_validate=${USE_TRAINER_DO_VALIDATE} \
     trainer.val_before_train=${VAL_BEFORE_TRAIN:-True} \
     trainer.test_freq=${TEST_FREQ:-20} \
-    trainer.save_freq=${SAVE_FREQ:-100} \
+    trainer.save_freq=${SAVE_FREQ:-20} \
+    trainer.max_actor_ckpt_to_keep=${MAX_ACTOR_CKPT_TO_KEEP:-1} \
     trainer.total_epochs=${TOTAL_EPOCHS:-100} \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.rollout_data_dir="${LOG_DIR}/${exp_name}/rollouts" \

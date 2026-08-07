@@ -1,0 +1,23 @@
+# HPRL agent-loop registry -- RESTART (terminate-and-restart / segment-chain)
+# variant of hint_agent_config.yaml.
+#
+# The ONE delta vs the default registry: dataset rows tagged agent_name=
+# "auto_hint" route to restart_agent_loop.RestartHintAgentLoop instead of
+# AutoHintAgentLoop -- so the SAME auto-hint parquet runs in restart mode with
+# no dataset rebuild and no shared-code edit. Select it via
+#   AGENT_LOOP_CONFIG_PATH=<this file>
+# (run_auto_hint_qwen3_8b_base_async_restart.sh does). verl loads this at
+# AgentLoopWorker init and the yaml entries override the @register decorators.
+#
+# NOTE: the mapping is additionally RE-PINNED inside restart_agent_loop.py --
+# importing that module (hydra's first instantiation) executes the parent's
+# @register("auto_hint") decorator, which would otherwise clobber this yaml's
+# mapping back to AutoHintAgentLoop for every later rollout (cluster smoke #1,
+# run 20260804-192840: mixed-mode rows -> DataProto.concat key assert). One run
+# therefore = one delivery mode; never mix auto_hint and restart_hint rows.
+- name: hint_agent
+  _target_: hint_agent_loop.HintAgentLoop
+- name: auto_hint
+  _target_: restart_agent_loop.RestartHintAgentLoop
+- name: restart_hint
+  _target_: restart_agent_loop.RestartHintAgentLoop

@@ -1,43 +1,35 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Ray Cluster Auto-Launch & Job Submission -- FULLY-ASYNC Olmo GRPO edition
+# Ray Cluster Auto-Launch & Job Submission (multi-node PyTorchJob)
 # =============================================================================
-# Async sibling of ray_cluster_launch_olmo3_1025_7b.sh. Identical cluster
-# bring-up (the Rollouter and Trainer pools of the fully-async job both live
-# inside this ONE Ray cluster -- the pool split happens at job-submit time via
-# trainer.nnodes / rollout.nnodes, not here); the deltas are only:
-#   * TRAIN_SCRIPT default -> run_grpo_olmo3_7b_instruct_npu_async.sh
-#     (2 trainer + 2 rollout nodes, verl fully_async_policy).
-#   * NNODES default 4 (2 trainer + 2 rollout), still overridden by the
-#     PyTorchJob's WORLD_SIZE when present.
-#
-# Which training script the head runs is set by the TRAIN_SCRIPT variable
-# below or via the TRAIN_SCRIPT env var. Positional args are ignored on
-# purpose -- the PyTorchJob wrapper appends its own junk args
-# (`... /xutao/ undefined`).
+# Which training script the head runs is set by the TRAIN_SCRIPT variable below
+# (default: run_drgrpo_qwen2.5_7b_npu.sh), or overridden via the TRAIN_SCRIPT env
+# var. Positional args are ignored on purpose -- the PyTorchJob wrapper appends
+# its own junk args (`... /xutao/ undefined`).
 #
 # Run this on EVERY pod of the PyTorchJob (head + workers). It:
 #   1. activates the verl conda env (same path logic as run_dapo_*.sh),
 #   2. waits for the master pod's DNS name to resolve,
 #   3. auto-detects whether this pod is the head (MASTER_ADDR -> a local IP),
 #   4. head : `ray start --head`, waits for all NNODES to join, then runs the
-#             training script (which `ray job submit`s the async job),
+#             training script (run_dapo_*.sh, which `ray job submit`s the job),
 #      worker: `ray start --block --address <head>:<port>` and stays alive.
 #
-# Point the web service / PyTorchJob entrypoint at THIS script.
+# Point the web service / PyTorchJob entrypoint at THIS script instead of
+# run_dapo_qwen2.5_7b_npu.sh.
 #
 # Required env (injected by the PyTorchJob):
 #   MASTER_ADDR  - hostname/IP of the head pod
 #   MASTER_PORT  - port for the Ray head GCS server
 # Optional env:
-#   NNODES              - total pods (default: WORLD_SIZE, else 4)
+#   NNODES              - total pods (default: WORLD_SIZE, else 2)
 #   N_GPUS_PER_NODE     - GPUs per pod (default: 8)
 #   RAY_DASHBOARD_PORT  - head dashboard port (default: 8265; must match
-#                         RAY_ADDRESS in the run script)
+#                         RAY_ADDRESS in run_dapo_*.sh)
 #   NODE_WAIT_TIMEOUT   - minutes to wait for cluster/DNS (default: 180)
 #   POLL_INTERVAL       - minutes between cluster status checks (default: 1)
 #   TRAIN_SCRIPT        - training script the head runs (default: the sibling
-#                         run_grpo_olmo3_7b_instruct_npu_async.sh).
+#                         run_drgrpo_qwen2.5_7b_npu.sh).
 # =============================================================================
 
 set -euo pipefail
@@ -73,7 +65,8 @@ RAY_BIN=${RAY_BIN:-"${CONDA_HOME}/envs/${CONDA_ENV}/bin/ray"}
 # invokes this script as `ray_cluster_launch.sh /xutao/ undefined`, so $1/$2 are
 # platform junk, not ours. A bare filename (no slash) is resolved against this
 # script's dir.
-TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_grpo_olmo3_7b_instruct_npu_async.sh"}
+TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_grpo_qwen2.5_math_7b_npu.sh"}
+# TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_drgrpo_qwen2.5_7b_npu.sh"}
 if [[ "${TRAIN_SCRIPT}" != */* ]]; then
     TRAIN_SCRIPT="${SCRIPT_DIR}/${TRAIN_SCRIPT}"
 fi
@@ -93,10 +86,10 @@ for var in MASTER_ADDR MASTER_PORT; do
 done
 
 # Export so the exec'd TRAIN_SCRIPT inherits the SAME node count this launcher
-# waited for. The async run script splits this total into its trainer/rollout
-# pools (TRAINER_NNODES + ROLLOUT_NNODES = NNODES); a mismatch would strand
-# pods in Ray that neither pool schedules onto.
-export NNODES=${NNODES:-${WORLD_SIZE:-4}}
+# waited for. Otherwise that script falls back to its own NNODES default and can
+# tell verl a different trainer.nnodes than the cluster actually has (e.g. 6 pods
+# join Ray but verl claims 4 -> 2 nodes idle).
+export NNODES=${NNODES:-${WORLD_SIZE:-2}}
 export N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8265}
 NODE_WAIT_TIMEOUT=${NODE_WAIT_TIMEOUT:-180}   # minutes
@@ -106,7 +99,7 @@ NODE_WAIT_TIMEOUT_SEC=$((NODE_WAIT_TIMEOUT * 60))
 POLL_INTERVAL_SEC=$((POLL_INTERVAL * 60))
 
 echo "============================================="
-echo " Ray Cluster Launch (fully-async GRPO)"
+echo " Ray Cluster Launch"
 echo "   MASTER_ADDR        : ${MASTER_ADDR}"
 echo "   MASTER_PORT        : ${MASTER_PORT}"
 echo "   NNODES             : ${NNODES}"
@@ -118,6 +111,7 @@ echo "============================================="
 
 # ---------------------------------------------------------------------------
 # Wait for MASTER_ADDR to be DNS-resolvable (k8s pod DNS can lag pod start).
+# This is what was failing before: `nslookup can't resolve ...master-0`.
 # ---------------------------------------------------------------------------
 resolve_host() {
     getent hosts "$1" >/dev/null 2>&1 \
@@ -207,8 +201,7 @@ except Exception:
     echo "============================================="
 
     # Cluster is up; run the training script. It `ray job submit`s to the
-    # dashboard on localhost:${RAY_DASHBOARD_PORT}; the fully-async job then
-    # carves the trainer/rollout pools out of this one cluster.
+    # dashboard on localhost:${RAY_DASHBOARD_PORT} and dispatches across all nodes.
     echo "[INFO] Launching training: ${TRAIN_SCRIPT}"
     exec /bin/bash "${TRAIN_SCRIPT}"
 else

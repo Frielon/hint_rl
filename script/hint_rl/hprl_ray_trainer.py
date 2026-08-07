@@ -37,8 +37,9 @@ from hint_penalty import (
     compute_hint_penalties,
 )
 from kpack_expand import render_variant_rows
+from restart_expand import expand_restart_segment_rows
 from selector_multi import pending_hint_ids, prune_hint_pool
-from step_advantage import apply_step_level_advantages
+from step_advantage import apply_step_level_advantages, read_turn_advantages
 
 
 def _truthy(v) -> bool:
@@ -284,21 +285,93 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
         # every micro-batch. No-op (returns {}) unless data.hprl.auto_hint.enable.
         auto_hint_stats = {}
         ac = self._auto_hint_cfg()
+        step_adv_on = (
+            _truthy((ac.get("step_adv", {}) or {}).get("enable", False))
+            if ac.get("enable", False) else False
+        )
+
+        # RESTART segment-row expansion (train_segments=all): materialize every
+        # archived segment as its OWN training row so all turns of a chain get
+        # gradient (A_i = r + V[se_i+1] - V[ss_i] per failed turn). The expansion
+        # is a COPY used ONLY for the actor update -- the original ``batch`` keeps
+        # its shape for the ratchet and the rollout dump below. Requires step-adv
+        # (the per-turn pricing) and bypass mode (segment rows' old_log_probs :=
+        # their archived sampling logprobs); padded with inert rows to a multiple
+        # of len(batch) (the train path asserts divisibility, no autopad).
+        train_batch = batch
+        n_orig = len(batch)
+        if ac.get("enable", False) and isinstance(getattr(batch, "non_tensor_batch", None), dict) \
+                and "restart_segment_rows" in batch.non_tensor_batch:
+            try:
+                # The expansion's real requirement is an old_log_probs ANCHOR for
+                # the synthesized rows: the archived SAMPLING logprobs, which need
+                # rollout.calculate_log_probs=true ("rollout_log_probs" in the
+                # batch). In bypass-mode async that equals every row's anchor; in
+                # sync/decoupled runs the final rows keep their recomputed
+                # anchors while segment rows use the sampling ones -- mixed
+                # numerics (the known vllm-vs-fsdp gap), the same anchor quality
+                # bypass mode runs with everywhere.
+                have_rlp = "rollout_log_probs" in batch.batch.keys()
+                if not step_adv_on or not have_rlp:
+                    logger.warning(
+                        "HPRL restart expansion SKIPPED at step %s: needs step_adv=on (%s) and "
+                        "rollout.calculate_log_probs=true / rollout_log_probs in batch (%s); "
+                        "training final rows only.",
+                        self.global_steps, step_adv_on, have_rlp,
+                    )
+                else:
+                    pad_tok = getattr(self.tokenizer, "pad_token_id", None) or 0
+                    train_batch, n_orig, xstats = expand_restart_segment_rows(
+                        batch, pad_multiple=len(batch), pad_token_id=int(pad_tok)
+                    )
+                    if xstats:
+                        auto_hint_stats.update(xstats)
+                        print(
+                            f"[HPRL step={self.global_steps}] restart segment expansion: "
+                            f"{int(xstats['restart_expand/rows_original'])} chains + "
+                            f"{int(xstats['restart_expand/rows_segments'])} segment rows + "
+                            f"{int(xstats['restart_expand/rows_pad'])} pads = "
+                            f"{int(xstats['restart_expand/rows_total'])} rows",
+                            flush=True,
+                        )
+            except Exception as e:  # expansion must never crash training
+                logger.warning("HPRL restart expansion failed at step %s: %s", self.global_steps, e)
+                train_batch, n_orig = batch, len(batch)
+
         if ac.get("enable", False):
             # STEP-LEVEL value-based advantages (step_advantage) SUPERSEDE the
             # verified-prefix loss MASK (auto_hint_mask) when enabled -- they handle the
             # unverified tail by giving it a negative advantage instead of dropping it,
             # so the two are mutually exclusive. Default: mask (step_adv off).
-            step_adv_on = _truthy((ac.get("step_adv", {}) or {}).get("enable", False))
             try:
                 if step_adv_on:
-                    auto_hint_stats = self._hprl_apply_step_advantage(batch)
+                    auto_hint_stats.update(self._hprl_apply_step_advantage(train_batch))
+                    if train_batch is not batch:
+                        # audit columns for the DUMP live on the original batch;
+                        # its rows are the expanded batch's first n_orig rows.
+                        for k in ("step_adv_turn_advs", "step_adv_V"):
+                            col = train_batch.non_tensor_batch.get(k)
+                            if col is not None:
+                                batch.non_tensor_batch[k] = col[:n_orig].copy()
+                        # per-archived-segment PAINTED advantages, read back from
+                        # the expanded rows and re-attached per chain (aligned
+                        # with restart_segments) so the dump/viewer can show the
+                        # advantage each earlier turn actually trained with.
+                        # Expanded layout is deterministic: [0,n_orig) originals,
+                        # then segment rows in parent order, then inert pads.
+                        try:
+                            self._hprl_attach_segment_advs(batch, train_batch, n_orig)
+                        except Exception as e:  # noqa: BLE001 -- audit only
+                            logger.warning(
+                                "HPRL segment-adv splice failed at step %s: %s",
+                                self.global_steps, e,
+                            )
                 else:
-                    auto_hint_stats = self._hprl_apply_auto_hint_mask(batch)
+                    auto_hint_stats.update(self._hprl_apply_auto_hint_mask(train_batch))
             except Exception as e:  # adv/mask edits must never crash training
                 logger.warning("HPRL auto-hint adv/mask failed at step %s: %s", self.global_steps, e)
 
-        actor_output = super()._update_actor(batch)
+        actor_output = super()._update_actor(train_batch)
 
         metrics = {}
         if self._hprl_cfg().get("enable", False):
@@ -444,9 +517,21 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
         normalize = _truthy(sa.get("normalize", False))
         overlong = float(sa.get("overlong_penalty", 0.0))
         overlong_type = str(sa.get("overlong_penalty_type", "post_hoc"))
+        # zeroed-group absolute truncation surcharge: DEFAULT ON (2026-08-04
+        # flipped-price finding -- an all-wrong co-truncating group otherwise
+        # gets zero anti-truncation gradient); config key overrides.
+        overlong_zeroed = _truthy(sa.get("overlong_zeroed", True))
         whole_turn = _truthy(sa.get("whole_turn", False))
         # GRPO sets returns == advantages (same tensor); fall back to advantages if absent.
         returns_t = bb["returns"] if "returns" in bb.keys() else bb["advantages"]
+        # restart segment-row expansion: expanded rows (marker 1) and inert pads
+        # (marker 2) are painted from V but EXCLUDED from the value fit -- the
+        # final rows' phantom records already carry the chain-complete F_k.
+        fe_arr = ntb.get("restart_expanded")
+        fit_exclude = (
+            [bool(_to_py(fe_arr[i])) for i in range(n)] if fe_arr is not None else None
+        )
+        group_values: dict = {}
         _, _, mstats = apply_step_level_advantages(
             bb["advantages"], returns_t, bb["response_mask"], list(uids),
             turns_per_row, correct_per_row, penalty_per_row, K_per_row,
@@ -454,8 +539,28 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
             overlong_penalty=overlong, overlong_penalty_type=overlong_type,
             turn_truncated_per_row=turn_truncated_per_row,
             whole_turn=whole_turn,
+            group_values_out=group_values,
+            fit_exclude_per_row=fit_exclude,
+            overlong_zeroed=overlong_zeroed,
         )
         stats.update(mstats)
+
+        # AUDIT columns for the rollout dump (dump runs AFTER _update_actor in both
+        # trainers): per-row per-turn advantages READ BACK from the final tensor
+        # ([head, tail] per segment record; None for zero-span phantom records) +
+        # the group's fitted V[0..K] -- together they make the whole step-adv
+        # calculation checkable offline against the recursion/formula. Best-effort:
+        # the audit must never undo the already-applied advantages.
+        try:
+            turn_advs = read_turn_advantages(bb["advantages"], turns_per_row)
+            col_a = np.empty(n, dtype=object)
+            col_a[:] = turn_advs
+            col_v = np.empty(n, dtype=object)
+            col_v[:] = [group_values.get(uids[i]) for i in range(n)]
+            ntb["step_adv_turn_advs"] = col_a
+            ntb["step_adv_V"] = col_v
+        except Exception as e:  # noqa: BLE001
+            logger.warning("HPRL step-adv audit columns failed at step %s: %s", self.global_steps, e)
         logger.warning(
             "[HPRL step=%s] step-adv: groups=%d scored=%d zeroed=%d rows=%d tokens=%d "
             "pos=%.4f neg=%.4f V0=%.4f gstd=%.4f nfac=%.2f cite=%.3f wt=%d ov=%s(rows=%d)",
@@ -470,6 +575,38 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
             (overlong_type if overlong > 0.0 else "off"), int(mstats["step_adv/overlong_rows"]),
         )
         return stats
+
+    def _hprl_attach_segment_advs(self, batch, train_batch, n_orig: int) -> None:
+        """Read each expanded segment row's painted advantage off the trained
+        tensors and attach them to the ORIGINAL batch as ``restart_segment_advs``
+        -- per chain, one ``[head, tail]`` (or None) per archived segment, in
+        ``restart_segments`` order. Dump-only audit; never touches training."""
+        ntb0 = batch.non_tensor_batch
+        if "restart_segment_rows" not in ntb0:
+            return
+        seg_counts = [
+            len(_to_py(ntb0["restart_segment_rows"][i]) or []) for i in range(n_orig)
+        ]
+        total = sum(seg_counts)
+        if total == 0 or len(train_batch) < n_orig + total:
+            return
+        etb = train_batch.non_tensor_batch
+        seg_turns = [_to_py(etb["step_adv_turns"][n_orig + j]) or [] for j in range(total)]
+        per_row = read_turn_advantages(
+            train_batch.batch["advantages"][n_orig: n_orig + total], seg_turns
+        )
+        col = np.empty(n_orig, dtype=object)
+        pos = 0
+        vals_per_chain = []
+        for i in range(n_orig):
+            vals = []
+            for _ in range(seg_counts[i]):
+                row_advs = per_row[pos]
+                vals.append(row_advs[0] if row_advs else None)
+                pos += 1
+            vals_per_chain.append(vals)
+        col[:] = vals_per_chain
+        ntb0["restart_segment_advs"] = col
 
     def _step_adv_penalty_cfg(self):
         """(total_penalty, hard_factor, guidance_difficulty, guidance_free) from the
@@ -774,4 +911,20 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
         # turn segments, so the value-based advantage assignment is inspectable.
         if "step_adv_turns" in ntb:
             out.setdefault("step_adv_turns", [_to_py(ntb["step_adv_turns"][i]) for i in range(n)])
+        # step-adv AUDIT (written by _hprl_apply_step_advantage): per-turn painted
+        # advantages ([head, tail] per segment record, None = zero-span phantom)
+        # and the group's fitted V[0..K] -- verify offline that each turn's value
+        # matches the recursion (up to the group's normalize factor, itself
+        # recoverable as painted/raw ratio, constant across the group).
+        for k in ("step_adv_turn_advs", "step_adv_V"):
+            if k in ntb:
+                out.setdefault(k, [_to_py(ntb[k][i]) for i in range(n)])
+        # restart (segment-chain) mode: the row itself is only the chain's FINAL
+        # segment, so splice in the archived earlier segments + chain counters --
+        # without these the dump loses every pre-final attempt. Keys are absent
+        # in non-restart runs (guarded), so this is a no-op there.
+        for k in ("restart_segments", "n_restarts", "restart_prompt_overflow",
+                  "restart_segment_advs"):
+            if k in ntb:
+                out.setdefault(k, [_to_py(ntb[k][i]) for i in range(n)])
         return out

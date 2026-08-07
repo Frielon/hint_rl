@@ -437,7 +437,10 @@ top_p=1.0
 top_k=-1
 
 # Performance
-sp_size=4
+# Ulysses sequence-parallel size (env-overridable, mirrors run_hprl_async.sh):
+# 4 suits 7-8B x 30k+ rows; restart-mode segments are much shorter -- SP_SIZE=2
+# frees data parallelism when the update is the bottleneck.
+sp_size=${SP_SIZE:-4}
 use_dynamic_bsz=True
 # --- update-phase speed (lever 4) ------------------------------------------------
 # The step is ~86% generation and ~10% actor update; these two knobs trim the update
@@ -486,6 +489,16 @@ fi
 # any proxy var set at submit time is forwarded verbatim into the workers'
 # runtime env. Conditional lines -- injecting an EMPTY proxy var could confuse
 # httpx/vLLM networking in the (default) proxy-less local mode.
+# Restart-mode (segment-chain) agent-loop knobs: forwarded verbatim when set
+# (same conditional pattern as the proxy vars; absent in non-restart runs).
+# Env is the only channel that reaches the agent-loop workers for these.
+HPRL_RESTART_ENV=""
+for _rv in HPRL_RESTART_POOL_WORDING HPRL_RESTART_TRAIN_SEGMENTS HPRL_RESTART_ARCHIVE_IDS; do
+    if [ -n "${!_rv:-}" ]; then
+        HPRL_RESTART_ENV="${HPRL_RESTART_ENV}  ${_rv}: \"${!_rv}\""$'\n'
+    fi
+done
+
 SELECTOR_PROXY_ENV=""
 for _pv in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
     if [ -n "${!_pv:-}" ]; then
@@ -518,7 +531,7 @@ env_vars:
   SELECTOR_REASONING_EFFORT: "${SELECTOR_REASONING_EFFORT}"
   SELECTOR_MAX_CONCURRENCY: "${SELECTOR_MAX_CONCURRENCY}"
   OPENAI_API_KEY: "${OPENAI_API_KEY}"
-${SELECTOR_PROXY_ENV}  HPRL_SELECTOR_DUMP_DIR: "${HPRL_SELECTOR_DUMP_DIR}"
+${SELECTOR_PROXY_ENV}${HPRL_RESTART_ENV}  HPRL_SELECTOR_DUMP_DIR: "${HPRL_SELECTOR_DUMP_DIR}"
   # make hint_tool.py / hint_reward_manager.py importable in the job env.
   PYTHONPATH: "${TOOL_PYTHONPATH}"
 # NOTE: do NOT add a runtime_env pip block on this air-gapped fabric. mathruler
@@ -572,6 +585,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     data.hprl.auto_hint.step_adv.overlong_penalty=${HPRL_OVERLONG_PENALTY} \
     data.hprl.auto_hint.step_adv.overlong_penalty_type=${HPRL_OVERLONG_PENALTY_TYPE} \
     data.hprl.auto_hint.step_adv.whole_turn=${HPRL_STEP_ADV_WHOLE_TURN} \
+    data.hprl.auto_hint.step_adv.overlong_zeroed=${HPRL_OVERLONG_ZEROED:-true} \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
@@ -600,6 +614,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=${max_turns} \
     actor_rollout_ref.rollout.multi_turn.format=hermes \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=null \
+    actor_rollout_ref.rollout.calculate_log_probs=${HPRL_CALC_LOGPROBS:-False} \
     actor_rollout_ref.rollout.agent.agent_loop_config_path="${AGENT_LOOP_CONFIG_PATH}" \
     actor_rollout_ref.rollout.multi_turn.max_tool_response_length=${max_tool_response_length} \
     actor_rollout_ref.rollout.multi_turn.tokenization_sanity_check_mode=ignore_strippable \

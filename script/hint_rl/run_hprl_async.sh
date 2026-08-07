@@ -245,6 +245,10 @@ HPRL_OVERLONG_PENALTY=${HPRL_OVERLONG_PENALTY:-0.1}
 # wrapper defaults to value); export HPRL_OVERLONG_PENALTY_TYPE=value to fold
 # the penalty into the value recursion instead.
 HPRL_OVERLONG_PENALTY_TYPE=${HPRL_OVERLONG_PENALTY_TYPE:-post_hoc}
+# Absolute -P_over on truncation tails inside ZEROED (no-correct) groups --
+# without it an all-wrong co-truncating group gets zero anti-truncation
+# gradient (2026-08-04 flipped-price finding). false restores scored-only.
+HPRL_OVERLONG_ZEROED=${HPRL_OVERLONG_ZEROED:-true}
 # WHOLE-TURN advantage: one A = V(s_end) + hint_penalty - V(s_start) per turn
 # (boundary-free; no verified-prefix a_C / failed-tail a_I split).
 HPRL_STEP_ADV_WHOLE_TURN=${HPRL_STEP_ADV_WHOLE_TURN:-true}
@@ -364,19 +368,31 @@ top_k=-1
 
 # Performance (identical to the sync job; the trainer pool is smaller, so the
 # per-GPU token budget math is unchanged -- FSDP shards across TRAINER_NNODES*8).
-sp_size=4
+# Ulysses sequence-parallel size. 4 suits 7-8B x 30k+ multi-turn rows; for a
+# SMALL model on short restart segments (e.g. 4B at prompt 4096 + cap 8192 =
+# 12288 max seq) sp=2 or 1 frees data parallelism (dp = 8/sp) and drops the
+# all-to-all overhead -- the 4B restart run 214953 was trainer-bound at dp=2.
+sp_size=${SP_SIZE:-4}
 use_dynamic_bsz=True
 PPO_TOKEN_MULT=${PPO_TOKEN_MULT:-2}
 actor_ppo_max_token_len=$((PPO_TOKEN_MULT * (max_prompt_length + max_response_length) / sp_size))
 infer_ppo_max_token_len=$((PPO_TOKEN_MULT * (max_prompt_length + max_response_length) / sp_size))
 offload=${OFFLOAD:-False}
 gen_tp=1
+# vLLM KV-pool fraction on the (vLLM-only) rollout pods. Historical default
+# 0.80. MHA models (Olmo3, no GQA) are KV-bound there, so their wrappers may
+# raise it -- but the non-vLLM residue of the 79 GB pods must still hold the
+# CANN runtime + the checkpoint-engine sync buffers below: shrink
+# UPDATE_WEIGHTS_BUCKET_MB in step when you raise this.
+GPU_MEMORY_UTIL=${GPU_MEMORY_UTIL:-0.80}
 
 # Weight-sync bucket for the disaggregated checkpoint engine. 4096 OOMed on the
 # rollout pods (grid 20260720-141549 st1: update_weights tried to alloc exactly
 # 4.00 GiB with 3.67 GiB free next to vLLM at gpu_memory_utilization=0.80, ~10
 # syncs in once the allocator fragmented). 1024 fits the observed free headroom
-# with margin; cost is a few extra flush round-trips per sync.
+# with margin; cost is a few extra flush round-trips per sync. NOTE: that
+# headroom was measured at util 0.80 -- wrappers raising GPU_MEMORY_UTIL lose
+# ~0.8 GB per 0.01 and should pass a smaller bucket (olmo restart: 0.90 + 512).
 UPDATE_WEIGHTS_BUCKET_MB=${UPDATE_WEIGHTS_BUCKET_MB:-1024}
 
 # Per-run Ray runtime env (same rationale + air-gap warning as the sync job:
@@ -395,6 +411,19 @@ SELECTOR_PROXY_ENV=""
 for _pv in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
     if [ -n "${!_pv:-}" ]; then
         SELECTOR_PROXY_ENV="${SELECTOR_PROXY_ENV}  ${_pv}: \"${!_pv}\""$'\n'
+    fi
+done
+
+# Restart-mode (segment-chain) agent-loop knobs: forwarded verbatim into the
+# workers' runtime env WHEN SET (same conditional pattern as the proxy vars --
+# absent in non-restart runs, so their runtime env is unchanged). Env is the
+# ONLY channel that reaches the agent-loop workers for these: registry-yaml
+# extra keys are lost after the first rollout (restart_agent_loop's registry
+# re-pin keeps only _target_), and data.hprl.* would need new hydra keys.
+HPRL_RESTART_ENV=""
+for _rv in HPRL_RESTART_POOL_WORDING HPRL_RESTART_TRAIN_SEGMENTS HPRL_RESTART_ARCHIVE_IDS; do
+    if [ -n "${!_rv:-}" ]; then
+        HPRL_RESTART_ENV="${HPRL_RESTART_ENV}  ${_rv}: \"${!_rv}\""$'\n'
     fi
 done
 
@@ -423,7 +452,7 @@ env_vars:
   SELECTOR_REASONING_EFFORT: "${SELECTOR_REASONING_EFFORT}"
   SELECTOR_MAX_CONCURRENCY: "${SELECTOR_MAX_CONCURRENCY}"
   OPENAI_API_KEY: "${OPENAI_API_KEY}"
-${SELECTOR_PROXY_ENV}  HPRL_SELECTOR_DUMP_DIR: "${HPRL_SELECTOR_DUMP_DIR}"
+${SELECTOR_PROXY_ENV}${HPRL_RESTART_ENV}  HPRL_SELECTOR_DUMP_DIR: "${HPRL_SELECTOR_DUMP_DIR}"
   # make the HPRL modules importable in every actor of the job.
   PYTHONPATH: "${TOOL_PYTHONPATH}"
 EOF
@@ -490,6 +519,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     data.hprl.auto_hint.step_adv.normalize=${HPRL_STEP_ADV_NORM} \
     data.hprl.auto_hint.step_adv.overlong_penalty=${HPRL_OVERLONG_PENALTY} \
     data.hprl.auto_hint.step_adv.overlong_penalty_type=${HPRL_OVERLONG_PENALTY_TYPE} \
+    data.hprl.auto_hint.step_adv.overlong_zeroed=${HPRL_OVERLONG_ZEROED} \
     data.hprl.auto_hint.step_adv.whole_turn=${HPRL_STEP_ADV_WHOLE_TURN} \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
@@ -541,7 +571,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.80 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEMORY_UTIL} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
@@ -590,8 +620,8 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     trainer.val_before_train=${VAL_BEFORE_TRAIN:-True} \
     trainer.test_freq=${TEST_FREQ:-20} \
     trainer.save_freq=${SAVE_FREQ:-50} \
-    trainer.max_actor_ckpt_to_keep=100 \
-    trainer.total_epochs=${TOTAL_EPOCHS:-40} \
+    trainer.max_actor_ckpt_to_keep=1 \
+    trainer.total_epochs=${TOTAL_EPOCHS:-100} \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.rollout_data_dir="${LOG_DIR}/${exp_name}/rollouts" \
     trainer.validation_data_dir="${LOG_DIR}/${exp_name}/val_rollouts" \

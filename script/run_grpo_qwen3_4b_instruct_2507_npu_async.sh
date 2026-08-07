@@ -95,11 +95,11 @@ if [ -f "${HINT_RL_HOME}/.envrc" ]; then
 fi
 export WANDB_API_KEY="${WANDB_API_KEY:-${wandb_key:-}}"
 
-# project_name=${project_name:-'GRPO-Qwen3-4B-Instruct-2507-dolci-492-async'}
-# exp_name=${exp_name:-"GRPO-Qwen3-4B-Instruct-2507-dolci-492-async-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
+project_name=${project_name:-'GRPO-Qwen3-4B-Instruct-2507-dolci-492-async'}
+exp_name=${exp_name:-"GRPO-Qwen3-4B-Instruct-2507-dolci-492-async-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
 
-project_name=${project_name:-'GRPO-Qwen3-4B-Instruct-2507-dolci-2180-async'}
-exp_name=${exp_name:-"GRPO-Qwen3-4B-Instruct-2507-dolci-2180-async-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
+# project_name=${project_name:-'GRPO-Qwen3-4B-Instruct-2507-dolci-2180-async'}
+# exp_name=${exp_name:-"GRPO-Qwen3-4B-Instruct-2507-dolci-2180-async-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
 
 wandb_project=${wandb_project:-"hint_rl"}
 
@@ -115,7 +115,7 @@ clip_ratio_high=${clip_ratio_high:-0.28}
 loss_agg_mode="token-mean"
 
 max_prompt_length=${max_prompt_length:-2048}
-max_response_length=${max_response_length:-16384}
+max_response_length=${max_response_length:-32768}
 
 # ---- cluster: split the NNODES pods into the two pools ----------------------
 # NNODES is the TOTAL pod count (exported by the cluster launcher). Default
@@ -194,8 +194,8 @@ CKPTS_DIR=${CKPTS_DIR:-"${HINT_RL_HOME}/ckpt/${project_name}/${exp_name}"}
 # Data: identical to the Olmo async / sync scripts -- single-turn dolci
 # prompts (no agent_name column -> verl's built-in single_turn_agent) + the 4
 # bare val sets.
-# TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dolci-instruct-rl-492-auto-hint-qwen3-4b-le1of8.parquet"}
-TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dolci-dapo-2180-single-turn.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dolci-instruct-rl-492-auto-hint-qwen3-4b-le1of8.parquet"}
+# TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dolci-dapo-2180-single-turn.parquet"}
 TEST_FILE=${TEST_FILE:-"${HINT_RL_HOME}/dataset/aime2024.parquet"}
 TEST_FILE2=${TEST_FILE2:-"${HINT_RL_HOME}/dataset/dapo_sample_hard_100.parquet"}
 TEST_FILE3=${TEST_FILE3:-"${HINT_RL_HOME}/dataset/aime2025.parquet"}
@@ -391,7 +391,8 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     async_training.use_trainer_do_validate=${USE_TRAINER_DO_VALIDATE} \
     trainer.val_before_train=${VAL_BEFORE_TRAIN:-True} \
     trainer.test_freq=${TEST_FREQ:-20} \
-    trainer.save_freq=${SAVE_FREQ:-50} \
+    trainer.save_freq=${SAVE_FREQ:-20} \
+    trainer.max_actor_ckpt_to_keep=${MAX_ACTOR_CKPT_TO_KEEP:-1} \
     trainer.total_epochs=${TOTAL_EPOCHS:-100} \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.rollout_data_dir="${LOG_DIR}/${exp_name}/rollouts" \

@@ -324,6 +324,47 @@ def format_auto_hint_message(
     )
 
 
+def format_restart_hint_message(
+    hint_text: str,
+    progress_state: Iterable[Any] = (),
+    *,
+    include_progress: bool = False,
+) -> str:
+    """Build the hint block of a RESTART-mode fresh prompt (restart_agent_loop).
+
+    The terminate-and-restart rollout does not inject this as a mid-conversation
+    user turn: it is appended to the problem statement in a FRESH single-turn
+    prompt (the failed attempt is not in context). The recap list and the
+    hint/continue framing keep the v2 injection's wording (the recap that
+    eliminated restart drift). WITH progress, the opener is the single merged
+    sentence (wording pinned 2026-08-04); the progress-FREE variant (first
+    restart, nothing verified yet) is JUST the hint block -- no invalidation
+    preamble and no mention of the prior attempt (wording revised 2026-08-04:
+    in a fresh context there is nothing to invalidate or recap).
+    """
+    body = hint_text or "(the selector returned an empty hint)"
+    progress_lines = []
+    if include_progress:
+        for item in progress_state or ():
+            text = item.get("text") if isinstance(item, dict) else None
+            if isinstance(text, str) and text.strip():
+                progress_lines.append(f"{len(progress_lines) + 1}. {text.strip()}")
+
+    if progress_lines:
+        return (
+            "You have attempted this problem before and you made the following "
+            "verified progress, which is correct:\n"
+            + "\n".join(progress_lines)
+            + "\n\n"
+            + f"Here is a hint to help you make further progress:\n{body}\n\n"
+            + "Using this hint, continue your reasoning from the verified progress and give your final boxed answer."
+        )
+    return (
+        f"Here is a hint to help you make progress:\n{body}\n\n"
+        + "Using this hint, reason step by step from the beginning and give your final boxed answer."
+    )
+
+
 def _norm_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 

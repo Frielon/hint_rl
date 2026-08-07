@@ -205,7 +205,7 @@ export TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dolci-rl-zero-10324-aut
 #     any other .../global_step_N obeys the header's world-size / dataset
 #     constraints -- or merge the ckpt and pass MODEL_PATH instead. ---
 QWEN3_ASYNC_S200_CKPT="${HINT_RL_HOME}/ckpt/HPRL-AutoHint-Qwen3-8B-Base-async/HPRL-AutoHint-Qwen3-8B-Base-async-dolci-rl-zero-10324-20260731-020431/global_step_200"
-export RESUME_FROM_PATH=${RESUME_FROM_PATH-"${QWEN3_ASYNC_S200_CKPT}"}
+export RESUME_FROM_PATH=${RESUME_FROM_PATH-}
 if [ -n "${RESUME_FROM_PATH}" ] && [ ! -d "${RESUME_FROM_PATH}/actor" ]; then
     echo "[run_auto_hint_qwen3_async] ERROR: RESUME_FROM_PATH has no actor/ ckpt: ${RESUME_FROM_PATH}" >&2
     exit 1
@@ -257,7 +257,7 @@ export HPRL_ALLOW_DECREASE=${HPRL_ALLOW_DECREASE:-false}
 
 # --- distinct run labels in wandb ----------------------------------------------
 export project_name=${project_name:-'HPRL-AutoHint-Qwen3-8B-Base-async'}
-export exp_name=${exp_name:-"HPRL-AutoHint-Qwen3-8B-Base-async-dolci-rl-zero-10324-resume-200-020431-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
+export exp_name=${exp_name:-"HPRL-AutoHint-Qwen3-8B-Base-async-dolci-rl-zero-10324-r16-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
 
 echo "[run_auto_hint_qwen3_async] auto-hint FULLY-ASYNC mode ON  (model=${MODEL_PATH})"
 echo "[run_auto_hint_qwen3_async]   base-model deltas: eos=[151643,151645] via ${MODEL_PATH##*/}, max_response_length=${max_response_length}"

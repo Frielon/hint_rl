@@ -65,7 +65,7 @@ RAY_BIN=${RAY_BIN:-"${CONDA_HOME}/envs/${CONDA_ENV}/bin/ray"}
 # invokes this script as `ray_cluster_launch.sh /xutao/ undefined`, so $1/$2 are
 # platform junk, not ours. A bare filename (no slash) is resolved against this
 # script's dir.
-TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_grpo_qwen3_8b_npu.sh"}
+TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_grpo_qwen2.5_7b_npu.sh"}
 # TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_drgrpo_qwen2.5_7b_npu.sh"}
 if [[ "${TRAIN_SCRIPT}" != */* ]]; then
     TRAIN_SCRIPT="${SCRIPT_DIR}/${TRAIN_SCRIPT}"
@@ -89,7 +89,7 @@ done
 # waited for. Otherwise that script falls back to its own NNODES default and can
 # tell verl a different trainer.nnodes than the cluster actually has (e.g. 6 pods
 # join Ray but verl claims 4 -> 2 nodes idle).
-export NNODES=${NNODES:-${WORLD_SIZE:-2}}
+export NNODES=${NNODES:-${WORLD_SIZE:-4}}
 export N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8265}
 NODE_WAIT_TIMEOUT=${NODE_WAIT_TIMEOUT:-180}   # minutes

@@ -10,3 +10,10 @@
 # still wrong (no <hint_call/>). Rows tagged agent_name="auto_hint" route here.
 - name: auto_hint
   _target_: auto_hint_agent_loop.AutoHintAgentLoop
+# Terminate-and-restart (segment-chain) push-hint rollout: on a wrong answer the
+# chain restarts from a FRESH recap+hint prompt instead of growing the context.
+# Registered here for per-row routing; the usual activation is the registry SWAP
+# in hint_agent_config_restart.yaml (auto_hint rows -> RestartHintAgentLoop),
+# selected via AGENT_LOOP_CONFIG_PATH by the *_restart launcher.
+- name: restart_hint
+  _target_: restart_agent_loop.RestartHintAgentLoop
