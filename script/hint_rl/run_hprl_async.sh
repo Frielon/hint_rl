@@ -233,6 +233,9 @@ HPRL_AUTO_HINT_PROGRESS_MESSAGE=${HPRL_AUTO_HINT_PROGRESS_MESSAGE:-true}
 # Prune X.0 step-guidance hints from the pool before the selector sees it
 # (eval/train parity with the offline selector eval).
 HPRL_PRUNE_GUIDANCE=${HPRL_PRUNE_GUIDANCE:-true}
+# Mirror the trainer's per-step rollout JSONL dumps into the wandb run's Files
+# tab (rollouts/<step>.jsonl, live upload; a few GB per run at auto-hint sizes).
+HPRL_WANDB_SAVE_ROLLOUTS=${HPRL_WANDB_SAVE_ROLLOUTS:-false}
 # STEP-LEVEL advantage ON (replaces GRPO's scalar advantage, skips the
 # verified-prefix mask), with GRPO-style per-group std-normalization
 # (adv_scale = TARGET std when normalize is on).
@@ -508,6 +511,7 @@ ray job submit --runtime-env="${RUNTIME_ENV_RUN}" \
     data.hprl.strategy=${HINT_STRATEGY} \
     data.hprl.step_exclude_mode=${HINT_STEP_EXCLUDE_MODE} \
     data.hprl.finalize_incorrect=${HINT_FINALIZE_INCORRECT} \
+    data.hprl.wandb_save_rollouts=${HPRL_WANDB_SAVE_ROLLOUTS} \
     data.hprl.kpack.enable=${HPRL_KPACK_ENABLE} \
     data.hprl.budget_sampling.enable=${HPRL_BUDGET_SAMPLING} \
     data.hprl.auto_hint.enable=${HPRL_AUTO_HINT} \

@@ -852,6 +852,52 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
                 self._dump_futures = [f for f in getattr(self, "_dump_futures", []) if not f.done()]
             except Exception:  # noqa: BLE001
                 pass
+        # Mirror the dump dirs into the live wandb run (data.hprl.wandb_save_rollouts).
+        # The val dir rides along so trainer-side val dumps (sync mode /
+        # use_trainer_do_validate) upload continuously, not only at shutdown.
+        dump_path = kwargs.get("dump_path", args[5] if len(args) > 5 else None)
+        self._hprl_wandb_save_rollouts(dump_path)
+        val_dir = self.config.trainer.get("validation_data_dir", None)
+        if val_dir and str(val_dir) != str(dump_path):
+            self._hprl_wandb_save_rollouts(val_dir)
+
+    def _hprl_wandb_save_rollouts(self, dump_path):
+        """Mirror a rollout-dump dir's JSONLs into the live wandb run's Files tab.
+
+        Gated on ``data.hprl.wandb_save_rollouts`` (default off). wandb.save()
+        registers only files that exist AT CALL time (the glob is not re-watched),
+        and verl's ``_dump_generations`` writes in a background thread -- so the
+        per-step call typically picks up files one step late, and the run's last
+        file is caught by the ``_shutdown_dump_executor`` pass after the writer
+        drains. Repeated calls with the same glob are idempotent. policy="live"
+        uploads during the run (a mid-write symlink is re-synced on change and at
+        run end), so a crash loses at most the newest file. base_path keeps the
+        dir name, so files land as e.g. ``rollouts/12.jsonl``. In processes whose
+        Tracking has no wandb backend (async Rollouter) ``wandb.run`` is None and
+        this is a silent no-op. Never raises: upload trouble must not touch
+        training.
+        """
+        if not _truthy(self._hprl_cfg().get("wandb_save_rollouts", False)):
+            return
+        if not dump_path or not os.path.isdir(str(dump_path)):
+            return  # nothing dumped there yet (empty-glob wandb.save can warn-spam)
+        try:
+            import wandb  # deferred: only touched when the flag is on
+
+            if wandb.run is None:
+                return
+            dump_path = os.path.abspath(str(dump_path))
+            wandb.save(
+                os.path.join(dump_path, "*.jsonl"),
+                base_path=os.path.dirname(dump_path),
+                policy="live",
+            )
+        except Exception as e:  # noqa: BLE001 -- logging must never crash training
+            print(
+                f"[HPRL step={getattr(self, 'global_steps', '?')}] wandb rollout save "
+                f"skipped: {type(e).__name__}: {e}",
+                flush=True,
+            )
 
     def _shutdown_dump_executor(self):
         """Drain the rollout-dump executor without letting a failed background dump crash.
@@ -879,6 +925,11 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
                 self._dump_executor.shutdown(wait=True)
             except Exception:  # noqa: BLE001
                 pass
+        finally:
+            # the writer is drained -> every dumped file exists on disk; register
+            # the tail files the per-step wandb pass hadn't seen yet (train + val).
+            for _key in ("rollout_data_dir", "validation_data_dir"):
+                self._hprl_wandb_save_rollouts(self.config.trainer.get(_key, None))
 
     def _hprl_rollout_log_columns(self, batch, reward_extra_infos_dict) -> dict:
         ntb = batch.non_tensor_batch

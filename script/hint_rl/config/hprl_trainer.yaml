@@ -87,6 +87,11 @@ data:
     # call per INCORRECT rollout when on. false -> ordinary incorrect scoring.
     finalize_incorrect: false
 
+    # mirror the trainer's per-step rollout JSONL dumps (trainer.rollout_data_dir,
+    # + trainer-side val dumps) into the wandb run's Files tab as rollouts/<step>.jsonl.
+    # Live upload during the run; expect a few GB per run at auto-hint dump sizes.
+    wandb_save_rollouts: false
+
     # ---- k-pack counterfactual-probe ratchet ("double-rollout" / k-pack) ----------
     # Measure (don't infer) whether one fewer hint would still solve a problem: split
     # EVERY problem's rollout.n rollouts into k packs of rollout.n/k, each FORCED to a

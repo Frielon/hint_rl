@@ -37,4 +37,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export TRAIN_SCRIPT=${TRAIN_SCRIPT:-"${SCRIPT_DIR}/run_auto_hint_olmo3_7b_instruct_async_restart.sh"}
 export HPRL_AUTO_HINT_PROGRESS_MESSAGE=${HPRL_AUTO_HINT_PROGRESS_MESSAGE:-true}
+# Mirror the per-step rollout JSONL dumps into the wandb run's Files tab
+# (rollouts/<step>.jsonl; live upload from the trainer). Default ON for this
+# launcher only; a full run adds a few GB to wandb storage.
+export HPRL_WANDB_SAVE_ROLLOUTS=${HPRL_WANDB_SAVE_ROLLOUTS:-true}
 exec bash "${SCRIPT_DIR}/launch_hprl_cluster_openai.sh" "$@"

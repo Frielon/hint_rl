@@ -93,6 +93,11 @@ data:
     step_exclude_mode: cumulative
     finalize_incorrect: false
 
+    # mirror the trainer's per-step rollout JSONL dumps (trainer.rollout_data_dir,
+    # + trainer-side val dumps) into the wandb run's Files tab as rollouts/<step>.jsonl.
+    # Live upload during the run; expect a few GB per run at auto-hint dump sizes.
+    wandb_save_rollouts: false
+
     # k-pack is NOT supported in fully-async mode (see header). Kept so the
     # config shape matches hprl_trainer.yaml; main_hprl_async.py raises if true.
     kpack:

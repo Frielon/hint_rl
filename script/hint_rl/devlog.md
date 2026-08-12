@@ -21,6 +21,59 @@ entry once it lands.
 
 # Done log
 
+## 2026-08-12 — wandb ROLLOUT-DUMP MIRRORING (`data.hprl.wandb_save_rollouts` / env `HPRL_WANDB_SAVE_ROLLOUTS`): the trainer registers every dumped `rollouts/<step>.jsonl` (+ `val_rollouts/`) with the run's wandb via `wandb.save(policy="live")` — same run as the metrics, Files tab — plus a fit-start catch-up pass in the async trainer so a resume-in-place uploads the prior run's steps BEFORE training; default ON only in the olmo async-restart launcher
+
+**What.** New flag `data.hprl.wandb_save_rollouts` (config default false; mirrored in both
+`config/hprl_trainer.yaml` and `config/hprl_fully_async_trainer.yaml`, env-plumbed as
+`HPRL_WANDB_SAVE_ROLLOUTS` in `run_hprl_async.sh` only). When on, the per-step rollout
+JSONL dumps stream into the wandb run's Files tab as `rollouts/<step>.jsonl` /
+`val_rollouts/<step>.jsonl` while the run trains — rollout logs survive the pod and are
+browsable next to the metrics, no rsync required. Size math (020934 restart run): 2.3GB
+over ~160 steps (3–14MB/step) → a long run adds ~10GB to wandb storage.
+
+**How (and why it works in fully-async).** `HPRLRayPPOTrainer._dump_generations` gains a
+post-dump hook: `wandb.save(<dump_dir>/*.jsonl, base_path=<parent>, policy="live")` for
+the train dump dir AND `trainer.validation_data_dir`. Fully-async works because
+`FullyAsyncTrainer.__init__` inits `Tracking` (= `wandb.init`) in the SAME trainer actor
+that dumps (`_fit_dump_data` → our `_log_rollout_data` override); in processes with no
+wandb run (the Rollouter) the helper is a silent no-op. Rollouter-side VAL dumps (our
+`use_trainer_do_validate=False` default) still upload: the TRAINER globs the shared-FS
+val dir every step, whoever wrote the files. Two timing caveats, both handled: (1)
+`wandb.save` registers only files existing AT CALL time and verl writes dumps on a
+background single-worker executor → a step's file is typically registered one step LATE;
+(2) the run's final file(s) are caught by a drain-time pass in `_shutdown_dump_executor`
+(post-drain = every dumped file is on disk). A hard SIGKILL can lose the newest file;
+everything earlier is already uploaded. The helper NEVER raises (upload trouble must not
+touch training) and skips nonexistent dirs (empty-glob `wandb.save` would warn-spam).
+
+**Resume-in-place catch-up.** Every pass re-globs the WHOLE dir, so resuming with the
+same `exp_name` (same `logs/<exp>/` dirs) sweeps the prior run's step files in
+automatically; `_HPRLFullyAsyncTrainerImpl.fit` additionally does an EAGER pass at fit
+start (Tracking is already live from `__init__` there — the sync trainer only inits it
+inside `super().fit()`, so sync catches up at the first step's dump instead), closing
+the dies-before-step-1 window. NOTE: verl's Tracking passes only `name=exp_name`, so a
+resumed job is a NEW wandb run id with the same display name — the full file history
+lands in the new run; the old run keeps just its metrics.
+
+**Defaults.** Config false everywhere; `launch_hprl_cluster_openai_async_restart_olmo.sh`
+exports `HPRL_WANDB_SAVE_ROLLOUTS=true` (the only launcher with it on — flip the env to
+disable per-run). Sync configs carry the knob but no run-script plumbing yet. One-shot
+for FINISHED runs (no resume planned):
+`wandb artifact put --type rollouts --name hint_rl/<exp>-rollouts logs/<exp>/rollouts`.
+
+**Validation.** 9-case stubbed smoke test (fake wandb + verl): flag gating incl. hydra
+string coercion, exact save args (glob/base_path/policy), `wandb.run is None` no-op,
+missing-dir no-op, exception swallow, kwargs + positional `dump_path` extraction, the
+per-step val ride-along, and the shutdown double-dir pass — all green; `py_compile` +
+yaml parse + `bash -n` clean on every touched file.
+
+### Files touched
+- `hprl_ray_trainer.py` — `_hprl_wandb_save_rollouts` helper; hooks in `_dump_generations` + `_shutdown_dump_executor`
+- `hprl_fully_async.py` — fit-start catch-up pass (resume-in-place)
+- `config/hprl_trainer.yaml`, `config/hprl_fully_async_trainer.yaml` — `wandb_save_rollouts` knob (mirrored blocks)
+- `run_hprl_async.sh` — `HPRL_WANDB_SAVE_ROLLOUTS` env default + `data.hprl.wandb_save_rollouts` job arg
+- `launch_hprl_cluster_openai_async_restart_olmo.sh` — export default true
+
 ## 2026-08-08 — REFERENCE-PREFIX restart delivery (`HPRL_RESTART_REFERENCE_PREFIX`): restarts prefix the completed steps' reference solutions + the new hint's reference to the ASSISTANT turn (untrained mask-0 response tokens over the BARE problem prompt) instead of building a recap+hint user message; turn adv computed as usual, gradient only on the model's continuation; per-round fallback to the user-message delivery when a reference is missing or the prefix would squeeze the per-segment cap
 
 **What.** A new restart-mode hyperparameter (`HPRL_RESTART_REFERENCE_PREFIX`, default

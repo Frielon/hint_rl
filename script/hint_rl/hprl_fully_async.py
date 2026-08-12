@@ -136,6 +136,16 @@ class _HPRLFullyAsyncTrainerImpl(HPRLRayPPOTrainer, _FULLY_ASYNC_TRAINER_BODY):
                 "gen batch in the sync trainer's _get_gen_batch, which the async "
                 "queue path never calls. Run the sync job for k-pack."
             )
+        # Resume-in-place catch-up (data.hprl.wandb_save_rollouts): register the
+        # rollout/val JSONLs ALREADY in the dump dirs -- steps a prior run of
+        # this exp_name dumped before the flag existed (or before a crash) --
+        # with this run's wandb BEFORE the first training step, so the Files tab
+        # holds the full step history even if this run dies early. Possible here
+        # because FullyAsyncTrainer inits Tracking (wandb) in __init__; the sync
+        # trainer only inits it inside super().fit(), where the first step's
+        # dump pass does the same catch-up (every pass re-globs the whole dir).
+        for _key in ("rollout_data_dir", "validation_data_dir"):
+            self._hprl_wandb_save_rollouts(self.config.trainer.get(_key, None))
         # Unbound call through the async body (super() from here would resolve
         # to HPRLRayPPOTrainer.fit, the sync one we are shadowing).
         return await _FULLY_ASYNC_TRAINER_BODY.fit(self)
