@@ -23,7 +23,10 @@
 # Row plumbing (mirrors the agent-loop postprocess):
 #   * prompt left-padded to prompt_len, response right-padded to resp_len;
 #   * attention_mask from real lengths; position_ids = clamp(cumsum-1, 0);
-#   * response_mask = 1 on real response tokens (fully model-generated);
+#   * response_mask = 1 on real response tokens (fully model-generated), EXCEPT
+#     the first ``prefix_len`` tokens of a reference-prefix segment (the glued
+#     reference-solution text the model merely continued: attended, untrained --
+#     restart_agent_loop archives the full region + its prefix_len);
 #   * rollout_log_probs from the archived sampling logprobs, and old_log_probs
 #     set EQUAL to them -- the behavior-policy anchor. In bypass-mode async that
 #     matches every other row's anchor exactly; in sync / decoupled runs the
@@ -111,7 +114,7 @@ def expand_restart_segment_rows(batch, pad_multiple: int, pad_token_id: int = 0)
 
     warned_keys = set()
 
-    def _make_row(parent_i: int, prompt_ids, response_ids, logprobs, turn):
+    def _make_row(parent_i: int, prompt_ids, response_ids, logprobs, turn, prefix_len=0):
         """One synthesized row's tensor dict + non-tensor overrides."""
         p = list(prompt_ids or [])[-prompt_len:]
         r = list(response_ids or [])[:resp_len]
@@ -128,6 +131,13 @@ def expand_restart_segment_rows(batch, pad_multiple: int, pad_token_id: int = 0)
         attn[prompt_len - len(p): prompt_len + len(r)] = 1
         rmask = torch.zeros(resp_len, dtype=bb["response_mask"].dtype, device=dev)
         rmask[: len(r)] = 1
+        # reference-prefix segment: the leading prefix_len response tokens are the
+        # glued reference text -- real context (attention stays 1) but untrained
+        # (loss mask 0), exactly the live final-row treatment; the segment's turn
+        # record already starts at prefix_len, so nothing is painted there either.
+        plen = max(0, int(prefix_len or 0))
+        if plen:
+            rmask[: min(plen, len(r))] = 0
         lprow = torch.zeros(resp_len, dtype=torch.float32, device=dev)
         if r:
             lprow[: len(r)] = torch.tensor(lp[: len(r)], dtype=torch.float32, device=dev)
@@ -167,7 +177,7 @@ def expand_restart_segment_rows(batch, pad_multiple: int, pad_token_id: int = 0)
                 continue
             row, ov = _make_row(
                 i, seg.get("prompt_ids"), seg.get("response_ids"),
-                seg.get("logprobs"), seg.get("turns"),
+                seg.get("logprobs"), seg.get("turns"), seg.get("prefix_len"),
             )
             new_rows.append(row)
             new_overrides.append(ov)

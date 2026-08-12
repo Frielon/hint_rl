@@ -421,7 +421,8 @@ done
 # extra keys are lost after the first rollout (restart_agent_loop's registry
 # re-pin keeps only _target_), and data.hprl.* would need new hydra keys.
 HPRL_RESTART_ENV=""
-for _rv in HPRL_RESTART_POOL_WORDING HPRL_RESTART_TRAIN_SEGMENTS HPRL_RESTART_ARCHIVE_IDS; do
+for _rv in HPRL_RESTART_POOL_WORDING HPRL_RESTART_TRAIN_SEGMENTS HPRL_RESTART_ARCHIVE_IDS \
+           HPRL_RESTART_REFERENCE_PREFIX; do
     if [ -n "${!_rv:-}" ]; then
         HPRL_RESTART_ENV="${HPRL_RESTART_ENV}  ${_rv}: \"${!_rv}\""$'\n'
     fi

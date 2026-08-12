@@ -40,6 +40,19 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _set_create_kwarg(tools_kwargs, key, value, tool_name: str) -> None:
+    """Set one key inside tools_kwargs[tool_name]["create_kwargs"] (no-op on any
+    missing/odd level -- same tolerant shape-walk as budget_manager's helpers)."""
+    if not isinstance(tools_kwargs, dict):
+        return
+    tool = tools_kwargs.get(tool_name)
+    if not isinstance(tool, dict):
+        return
+    ck = tool.get("create_kwargs")
+    if isinstance(ck, dict):
+        ck[key] = value
+
+
 class HintBudgetDataset(RLHFDataset):
     """RLHFDataset that injects the per-problem ratcheted budget B_q at sample time."""
 
@@ -53,11 +66,22 @@ class HintBudgetDataset(RLHFDataset):
         # mtime-cached view of {problem_id: B_q}
         self._budget_table: dict[str, int] = {}
         self._budget_mtime: Optional[float] = None
+        # REFERENCE-PREFIX restart delivery (restart_agent_loop, env-gated like
+        # the other HPRL_RESTART_* knobs): the agent loop reads the per-problem
+        # reference solutions from create_kwargs, so when the mode is on, copy
+        # the parquet's extra_info["hint_reference"] into
+        # tools_kwargs.request_hint.create_kwargs at sample time (auto-hint rows
+        # only). Off (default) -> rows are byte-identical to before.
+        self.hprl_ref_prefix = str(
+            os.environ.get("HPRL_RESTART_REFERENCE_PREFIX", "false")
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
         if self.hprl_enable:
             logger.warning(
-                "HintBudgetDataset: dynamic budget ENABLED (state=%s, default_budget=%d)",
+                "HintBudgetDataset: dynamic budget ENABLED (state=%s, default_budget=%d, "
+                "reference_prefix_plumbing=%s)",
                 self.hprl_state_path,
                 self.hprl_default_budget,
+                self.hprl_ref_prefix,
             )
 
     # ------------------------------------------------------------------ #
@@ -155,6 +179,15 @@ class HintBudgetDataset(RLHFDataset):
         ei_tools = extra_info.get("tools_kwargs")
         if ei_tools is not tools_kwargs:  # keep the two copies consistent
             set_create_budget(ei_tools, budget, self.hprl_tool_name)
+        # reference-prefix restart: hand the loop this problem's per-substep
+        # reference solutions (the hint_reference JSON string; parsed loop-side).
+        # Absent from the parquet -> nothing set; the loop warns + falls back.
+        if self.hprl_ref_prefix:
+            ref = extra_info.get("hint_reference")
+            if ref is not None:
+                _set_create_kwarg(tools_kwargs, "hint_reference", ref, self.hprl_tool_name)
+                if ei_tools is not tools_kwargs:
+                    _set_create_kwarg(ei_tools, "hint_reference", ref, self.hprl_tool_name)
         row["tools_kwargs"] = tools_kwargs
         row["extra_info"] = extra_info
         return row

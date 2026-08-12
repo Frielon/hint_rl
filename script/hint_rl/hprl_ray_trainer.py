@@ -924,7 +924,8 @@ class HPRLRayPPOTrainer(RayPPOTrainer):
         # without these the dump loses every pre-final attempt. Keys are absent
         # in non-restart runs (guarded), so this is a no-op there.
         for k in ("restart_segments", "n_restarts", "restart_prompt_overflow",
-                  "restart_segment_advs"):
+                  "restart_segment_advs", "restart_ref_fallback",
+                  "restart_ref_prefix_tokens"):
             if k in ntb:
                 out.setdefault(k, [_to_py(ntb[k][i]) for i in range(n)])
         return out

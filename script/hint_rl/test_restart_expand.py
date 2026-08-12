@@ -141,6 +141,12 @@ def test_expand_rows_and_padding():
     seg = {"prompt_ids": [7, 8, 9], "response_ids": [11, 12, 13, 14],
            "logprobs": [-0.5, -0.25, -0.125, -0.0625],
            "turns": [[0, 0, 4, 0, 0, 1]]}
+    # reference-prefix segment: first 2 response tokens are the untrained glued
+    # reference (logprobs 0.0), the turn record starts at the prefix boundary.
+    seg_pref = {"prompt_ids": [7, 8], "response_ids": [21, 22, 23, 24, 25],
+                "logprobs": [0.0, 0.0, -0.5, -0.25, -0.125],
+                "prefix_len": 2,
+                "turns": [[2, 2, 5, 1, 1, 1]]}
     ntb = {
         "uid": np.array(["pA", "pB"], dtype=object),
         "acc": np.array([1.0, 0.0], dtype=object),
@@ -149,12 +155,12 @@ def test_expand_rows_and_padding():
         "restart_segment_rows": np.empty(n, dtype=object),
     }
     ntb["restart_segment_rows"][0] = [seg]
-    ntb["restart_segment_rows"][1] = []
+    ntb["restart_segment_rows"][1] = [seg_pref]
     batch = DataProto(batch=bb, non_tensor_batch=ntb, meta_info={"m": 1})
 
-    out, n_orig, stats = expand_restart_segment_rows(batch, pad_multiple=2, pad_token_id=0)
-    assert n_orig == 2 and len(out) == 4, (n_orig, len(out), stats)  # 2 + 1 seg + 1 pad
-    assert stats["restart_expand/rows_segments"] == 1 and stats["restart_expand/rows_pad"] == 1
+    out, n_orig, stats = expand_restart_segment_rows(batch, pad_multiple=3, pad_token_id=0)
+    assert n_orig == 2 and len(out) == 6, (n_orig, len(out), stats)  # 2 + 2 segs + 2 pads
+    assert stats["restart_expand/rows_segments"] == 2 and stats["restart_expand/rows_pad"] == 2
 
     # original batch untouched
     assert len(batch) == 2 and "restart_expanded" not in batch.non_tensor_batch
@@ -175,23 +181,36 @@ def test_expand_rows_and_padding():
     assert entb["uid"][2] == "pA" and entb["restart_expanded"][2] == 1
     assert entb["step_adv_turns"][2] == [[0, 0, 4, 0, 0, 1]]
     assert entb["turn_truncated"][2] == 0
-    # pad row (index 3): fully untrained clone
-    assert entb["restart_expanded"][3] == 2
-    assert int(eb["response_mask"][3].sum()) == 0
-    assert float(eb["advantages"][3].abs().sum()) == 0.0
+    # PREFIXED segment row (index 3): the 2 reference-prefix tokens are real
+    # context (attention 1) but untrained (loss mask 0); logprob zeros ride in.
+    assert eb["responses"][3].tolist() == [21, 22, 23, 24, 25, 0]
+    assert eb["response_mask"][3].tolist() == [0, 0, 1, 1, 1, 0]
+    assert eb["attention_mask"][3].tolist() == [0] * (P - 2) + [1] * 2 + [1] * 5 + [0] * 1
+    assert torch.allclose(eb["old_log_probs"][3][:5],
+                          torch.tensor([0.0, 0.0, -0.5, -0.25, -0.125]))
+    assert entb["uid"][3] == "pB" and entb["restart_expanded"][3] == 1
+    assert entb["step_adv_turns"][3] == [[2, 2, 5, 1, 1, 1]]
+    # pad rows (indices 4-5): fully untrained clones
+    for j in (4, 5):
+        assert entb["restart_expanded"][j] == 2
+        assert int(eb["response_mask"][j].sum()) == 0
+        assert float(eb["advantages"][j].abs().sum()) == 0.0
     # originals keep marker 0
     assert entb["restart_expanded"][0] == 0 and entb["restart_expanded"][1] == 0
 
-    # trainer splice: paint a fake advantage on the segment row and read it back
-    # onto the ORIGINAL batch as restart_segment_advs (dump/viewer audit path).
+    # trainer splice: paint fake advantages on the segment rows and read them
+    # back onto the ORIGINAL batch as restart_segment_advs (dump/viewer audit
+    # path). The prefixed row's turn span starts at its prefix boundary.
     from hprl_ray_trainer import HPRLRayPPOTrainer
 
     eb["advantages"][2, :4] = -0.15
+    eb["advantages"][3, 2:5] = -0.25
     HPRLRayPPOTrainer._hprl_attach_segment_advs(None, batch, out, n_orig)
     col = batch.non_tensor_batch["restart_segment_advs"]
     (pair,) = col[0]                                   # chain A's one archived segment
     assert abs(pair[0] + 0.15) < 1e-6 and abs(pair[1] + 0.15) < 1e-6, col[0]
-    assert list(col[1]) == [], col[1]                  # chain B had none
+    (pair_b,) = col[1]                                 # chain B's prefixed segment
+    assert abs(pair_b[0] + 0.25) < 1e-6 and abs(pair_b[1] + 0.25) < 1e-6, col[1]
 
 
 def test_loop_archives_segment_rows():

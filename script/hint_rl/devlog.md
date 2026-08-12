@@ -21,6 +21,77 @@ entry once it lands.
 
 # Done log
 
+## 2026-08-08 — REFERENCE-PREFIX restart delivery (`HPRL_RESTART_REFERENCE_PREFIX`): restarts prefix the completed steps' reference solutions + the new hint's reference to the ASSISTANT turn (untrained mask-0 response tokens over the BARE problem prompt) instead of building a recap+hint user message; turn adv computed as usual, gradient only on the model's continuation; per-round fallback to the user-message delivery when a reference is missing or the prefix would squeeze the per-segment cap
+
+**What.** A new restart-mode hyperparameter (`HPRL_RESTART_REFERENCE_PREFIX`, default
+false, restart-loop-only). The `...-hint-reference.parquet` datasets re-emit the hint
+pool with a per-substep `reference` field — the reference solution's prose for exactly
+that substep (every substep hint in all 489/490 parseable rows has one; X.0 guidance
+hints have none). With the flag on, a restart delivers progress+hint by GLUING those
+references — completed hints in pool order, then the newly selected hint's reference
+(`selector_multi.build_reference_prefix`) — and PREFIXING them to the next segment's
+assistant turn: the fresh prompt is the BARE original `[system, user(problem)]`, the
+prefix tokens are appended after the generation tag, and the model continues a
+verified partial solution that ends at exactly the step it must do next.
+
+**Training semantics — "turn adv as usual, train only the continuation".** The prefix
+rides the RESPONSE region with `response_mask=0` and 0.0 logprobs (the injected-user-
+turn convention): attended, never trained, and never painted — every turn-record span
+already starts at `len(response_mask) - len(response_ids) == prefix_len`, so the
+whole-turn/step-adv advantage, the phantom fail records, the value fit, the ratchet,
+`applied_hints` pricing, and the GRPO fallback (loss-masked scalar) are all unchanged
+with zero new advantage code. `train_segments=all` archives now carry the full
+response region + `prefix_len`; `restart_expand._make_row` re-zeroes the loss mask
+over the prefix (attention stays 1), and the segment's turn record starts at
+`prefix_len`. Grading is unchanged: the box-protocol check reads the GENERATED text
+only, `_is_correct` joins assistant messages only (the delivery block is a user turn),
+and the reward's last-boxed extraction sits after the prefix (a box-less generation
+already floors via `length_truncated`).
+
+**Fallback, budgets, plumbing.** A restart whose selected hint has no reference (X.0,
+the one bad-JSON row, or a parquet without `hint_reference`) or whose prefix would
+leave `response_length - prefix_len < max_turn_tokens` (per-turn-cut classification
+would silently flip to the neutral "global" label) FALLS BACK to the user-message
+delivery for that round — hint still delivered + charged; `restart_ref_fallback`
+counts it and `restart_ref_prefix_tokens` totals the injected prefix (both dumped).
+`messages` records the delivery via `format_restart_reference_message` so build_trace
+shows the selector what was revealed (trace parity; quotes in the block count toward
+cite stats as recaps already did). Plumbing: `HintBudgetDataset` copies
+`extra_info.hint_reference` into `create_kwargs` at sample time (env-gated, auto-hint
+rows only; off = byte-identical rows), and the env var joins the `HPRL_RESTART_ENV`
+runtime-env forwarding list. Measured glue sizes on the 492 set: p50 ~620 / p99 ~1330
+/ max ~1650 tokens → the new wrapper (`run_auto_hint_qwen2.5-7b_async_restart_refprefix.sh`,
+492 hint-reference parquet) sets `max_response_length=6144` = per-segment cap 4096 +
+2048 prefix headroom; prompt stays 4096 (the bare-problem prompt is SHORTER than the
+recap one).
+
+**Tests.** `test_restart_chain.py` +3 stdlib (parse/glue/message: pool-order glue,
+X.0 skip, selected-ref-missing → None) and +3 chain-mechanics under the verl env
+(prefixed 2-segment chain: region/mask/logprob layout, bare prompt, step-adv spans at
+the prefix boundary, `turn_lens` generated-only; fallback without references; 
+train_segments=all archives with `prefix_len` + full region). `test_restart_expand.py`
+expansion test extended with a prefixed segment row (mask `[0,0,1,1,1,0]`, attention
+over the full region, splice reads the span at the prefix boundary). Stdlib layers
+7/7 + 2/2 green locally; verl-env layers pending the next cluster session, as usual.
+
+### Files touched
+- `selector_multi.py` — NEW `parse_reference_texts` / `build_reference_prefix` /
+  `format_restart_reference_message` (stdlib-only, additive)
+- `restart_agent_loop.py` — the `reference_prefix` knob + delivery branch in the
+  restart tail (flag-off path byte-identical); `_archive_segment` records
+  `prefix_tokens`/`prefix_len` + full-region segment rows; per-segment
+  `_restart_prefix_len` tracking; fallback + prefix-token counters
+- `restart_expand.py` — `_make_row` honors `prefix_len` (loss mask 0 over the prefix)
+- `hint_dataset.py` — env-gated `hint_reference` → create_kwargs copy (auto-hint rows)
+- `hprl_ray_trainer.py` — dump splice for `restart_ref_fallback` /
+  `restart_ref_prefix_tokens`
+- `run_hprl_async.sh` — `HPRL_RESTART_REFERENCE_PREFIX` joins the restart env forward
+- `run_auto_hint_qwen2.5-7b_async_restart_10k.sh` — knob documented, default false
+  (the 9517 set has no references)
+- `run_auto_hint_qwen2.5-7b_async_restart_refprefix.sh` — NEW wrapper: flag on, the
+  492 hint-reference parquet, response 6144 (cap 4096 + prefix headroom)
+- `test_restart_chain.py` / `test_restart_expand.py` — the tests above
+
 ## 2026-08-04 — TERMINATE-AND-RESTART hint delivery (segment-chain mode) IMPLEMENTED, v0 "final-segment row": `RestartHintAgentLoop` restarts each failed attempt from a fresh problem+recap+hint prompt (per-segment live context ≤ 4096+8192 tok vs 20–40k chains); step_adv/whole_turn COMPATIBLE via zero-span phantom fail records (numeric restart↔multi-turn value-parity proven); activation = registry swap, same parquet, flag-off path byte-identical; SEGMENT-ROW TRAINING landed same-day (train_segments=all: EVERY turn gets gradient, A_i = r+V[se+1]-V[ss] per its own row); 11+3 tests green; smoke #1's registry-clobber crash fixed; re-smoke 20260804-202718 HEALTHY (v0 semantics) and rollout_viewer taught the restart form
 
 **Motivation (see the moved TODO / 2026-08-04 stats).** In run `...-20260731-020431`,

@@ -16,9 +16,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 
-from selector_multi import format_restart_hint_message
+from selector_multi import (
+    build_reference_prefix,
+    format_restart_hint_message,
+    format_restart_reference_message,
+    parse_reference_texts,
+)
 
 # --------------------------------------------------------------------------- #
 # renderer tests (stdlib-only)
@@ -67,6 +73,58 @@ def test_restart_message_without_progress():
 def test_restart_message_empty_hint_placeholder():
     msg = format_restart_hint_message("", [], include_progress=True)
     assert "(the selector returned an empty hint)" in msg
+
+
+_REF_JSON = json.dumps({"steps": [
+    {"step_id": 1, "purpose": "setup", "hints": [
+        {"type": "step_guidence_hint", "hint_id": "1.0", "hint": "Think about overlaps."},
+        {"hint_id": "1.1", "hint": "Use inclusion-exclusion.",
+         "reference": "By inclusion-exclusion, $|A\\cup B| = |A|+|B|-|A\\cap B|$."},
+        {"hint_id": "1.2", "hint": "Count the complement.",
+         "reference": "Here $|A|=50$, $|B|=20$, $|A\\cap B|=10$, so the count is $60$."},
+    ]},
+    {"step_id": 2, "purpose": "finish", "hints": [
+        {"hint_id": "2.1", "hint": "Conclude.", "reference": "Therefore the answer is $60$."},
+    ]},
+]})
+
+
+def test_parse_reference_texts():
+    refs = parse_reference_texts(_REF_JSON)
+    # only hints CARRYING a reference land in the map (X.0 guidance has none)
+    assert set(refs) == {"1.1", "1.2", "2.1"}, refs
+    assert refs["1.1"].startswith("By inclusion-exclusion")
+    # dict input accepted; junk shapes / bad JSON / absent field -> {}
+    assert parse_reference_texts(json.loads(_REF_JSON)) == refs
+    assert parse_reference_texts("{not json") == {}
+    assert parse_reference_texts("") == {}
+    assert parse_reference_texts(None) == {}
+    assert parse_reference_texts('["a"]') == {}
+
+
+def test_build_reference_prefix():
+    refs = parse_reference_texts(_REF_JSON)
+    order = ["1.1", "1.2", "2.1"]
+    # first restart, nothing completed: prefix = the selected hint's reference alone
+    p = build_reference_prefix(order, [], "1.1", refs)
+    assert p == refs["1.1"] + "\n\n", p
+    # completed steps glue IN POOL ORDER regardless of done-set order, then the
+    # new hint's reference; the selected id never duplicates out of the done set
+    p = build_reference_prefix(order, ["1.2", "1.1", "2.1"], "2.1", refs)
+    assert p == refs["1.1"] + "\n\n" + refs["1.2"] + "\n\n" + refs["2.1"] + "\n\n", p
+    # a completed id without a reference (X.0 guidance / stray id) is skipped
+    p = build_reference_prefix(order, ["1.0", "1.1"], "1.2", refs)
+    assert p == refs["1.1"] + "\n\n" + refs["1.2"] + "\n\n", p
+    # the SELECTED hint lacking a reference -> None (caller falls back)
+    assert build_reference_prefix(order, ["1.1"], "1.0", refs) is None
+    assert build_reference_prefix(order, ["1.1"], None, refs) is None
+    assert build_reference_prefix(order, ["1.1"], "9.9", refs) is None
+
+
+def test_format_restart_reference_message():
+    msg = format_restart_reference_message("REF-A\n\nREF-B\n\n")
+    assert msg.startswith("Your next attempt was started for you"), msg[:80]
+    assert "REF-A\n\nREF-B" in msg and not msg.endswith("\n\n")
 
 
 def test_step_adv_value_parity():
@@ -488,6 +546,149 @@ def test_pool_wording_off_uses_selector_text(fix):
         "REPHRASED-A: think about overlaps.", "REPHRASED-C: re-add what you subtracted twice."]
 
 
+# --------------------------------------------------------------------------- #
+# reference-prefix delivery (assistant-turn prefix instead of a recap+hint user
+# message; HPRL_RESTART_REFERENCE_PREFIX / the reference_prefix loop kwarg)
+# --------------------------------------------------------------------------- #
+_POOL_REF = json.dumps({"steps": [{"step_id": 1, "purpose": "setup", "hints": [
+    {"hint_id": "1.1", "hint": "Use inclusion-exclusion.",
+     "reference": "By inclusion-exclusion, count = |A| + |B| - |A cap B| = 50 + 20 - 10."},
+    {"hint_id": "1.2", "hint": "Count the complement.",
+     "reference": "So the count is 50 + 20 - 10 = 60."},
+]}]})
+
+
+def _tools_kwargs_refs(budget, with_refs=True):
+    tk = _tools_kwargs(budget)
+    if with_refs:
+        tk["request_hint"]["create_kwargs"]["hint_reference"] = _POOL_REF
+    return tk
+
+
+def test_reference_prefix_chain(fix):
+    """2-segment chain under reference_prefix: the restart's fresh prompt is the
+    BARE problem; the glued reference rides the RESPONSE region as an untrained
+    (mask-0) assistant prefix; every turn record's span starts past it."""
+    tokenizer, make_loop = fix
+    texts = [
+        "Count multiples of 2: 50. I think the answer is \\boxed{50}.",   # wrong
+        "Continuing: 50 + 20 - 10 = 60. \\boxed{60}.",                    # correct
+    ]
+    server = _ScriptedServer(tokenizer, texts)
+    loop_obj = make_loop(server, step_adv=True, reference_prefix=True)
+    loop_obj._selector = _ScriptedSelector([
+        {"hint_id": "1.1", "hint": "Use inclusion-exclusion.", "completed_hints": []},
+    ])
+    out = _run(loop_obj, raw_prompt=_RAW_PROMPT, tools_kwargs=_tools_kwargs_refs(4), extra_info={})
+
+    refs = parse_reference_texts(_POOL_REF)
+    prefix_text = refs["1.1"] + "\n\n"          # first restart: nothing completed
+    prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
+    plen = len(prefix_ids)
+    gen_ids = tokenizer.encode(texts[1], add_special_tokens=False)
+
+    # row layout: response region = [untrained reference prefix][trained generation]
+    assert out.response_ids == prefix_ids + gen_ids, "region must be prefix + generation"
+    assert out.response_mask == [0] * plen + [1] * len(gen_ids)
+    assert out.response_logprobs == [0.0] * plen + [-0.1] * len(gen_ids), \
+        "prefix logprobs must be 0.0 to keep sampling-logprob alignment"
+
+    # fresh prompt = the BARE original problem: no recap block, no hint text,
+    # and the reference text lives in the RESPONSE region, not the prompt.
+    prompt_text = tokenizer.decode(out.prompt_ids, skip_special_tokens=True)
+    assert _PROBLEM in prompt_text
+    assert "Here is a hint" not in prompt_text and "You have attempted" not in prompt_text
+    assert "Use inclusion-exclusion." not in prompt_text
+    assert "inclusion-exclusion, count" not in prompt_text
+    assert tokenizer.decode(out.response_ids[:plen], skip_special_tokens=True) \
+        == prefix_text, "prefix tokens must decode to the glued reference"
+
+    ef = out.extra_fields
+    assert [a["hint_id"] for a in ef["applied_hints"]] == ["1.1"], "hint still charged"
+    assert ef["n_restarts"] == 1 and ef["restart_ref_fallback"] == 0
+    assert ef["restart_ref_prefix_tokens"] == plen
+    # trace parity: the delivery is recorded as the injected user turn
+    assert ef["restart_segments"][0]["next_user_message"].startswith(
+        "Your next attempt was started for you")
+    assert refs["1.1"] in ef["restart_segments"][0]["next_user_message"]
+    # step-adv: phantom for the archived fail + the solving record, whose span
+    # starts AT the prefix boundary (nothing painted on the reference tokens).
+    assert ef["step_adv_turns"] == [
+        [0, 0, 0, 0, 0, 1],
+        [plen, plen + len(gen_ids), plen + len(gen_ids), 1, 2, 0],
+    ], ef["step_adv_turns"]
+    assert ef["turn_lens"] == [len(gen_ids)], "turn_lens counts only generated tokens"
+
+
+def test_reference_prefix_fallback_without_refs(fix):
+    """reference_prefix ON but the problem carries no hint_reference: the restart
+    must FALL BACK to the user-message delivery (hint still delivered+charged)."""
+    tokenizer, make_loop = fix
+    texts = [
+        "Count multiples of 2: 50. I think the answer is \\boxed{50}.",
+        "Inclusion-exclusion: 50 + 20 - 10 = 60. \\boxed{60}.",
+    ]
+    server = _ScriptedServer(tokenizer, texts)
+    loop_obj = make_loop(server, reference_prefix=True)
+    loop_obj._selector = _ScriptedSelector([
+        {"hint_id": "1.1", "hint": "Use inclusion-exclusion.", "completed_hints": []},
+    ])
+    out = _run(loop_obj, raw_prompt=_RAW_PROMPT,
+               tools_kwargs=_tools_kwargs_refs(4, with_refs=False), extra_info={})
+
+    gen_ids = tokenizer.encode(texts[1], add_special_tokens=False)
+    assert out.response_ids == gen_ids and out.response_mask == [1] * len(gen_ids)
+    prompt_text = tokenizer.decode(out.prompt_ids, skip_special_tokens=True)
+    assert "Here is a hint to help you make progress:\nUse inclusion-exclusion." in prompt_text
+    ef = out.extra_fields
+    assert ef["restart_ref_fallback"] == 1 and ef["restart_ref_prefix_tokens"] == 0
+    assert [a["hint_id"] for a in ef["applied_hints"]] == ["1.1"]
+
+
+def test_reference_prefix_segment_rows(fix):
+    """train_segments=all + reference_prefix: an archived PREFIXED segment's row
+    carries the full response region, its prefix_len, and a turn record whose
+    span starts at the prefix boundary (restart_expand re-zeroes the mask)."""
+    os.environ["HPRL_RESTART_TRAIN_SEGMENTS"] = "all"
+    try:
+        tokenizer, make_loop = fix
+        texts = [
+            "Count multiples of 2: 50. I think the answer is \\boxed{50}.",  # fail -> 1.1
+            "Hmm, still \\boxed{70}.",                                        # fail -> 1.2
+            "So 50 + 20 - 10 = 60. \\boxed{60}.",                             # correct
+        ]
+        server = _ScriptedServer(tokenizer, texts)
+        loop_obj = make_loop(server, step_adv=True, reference_prefix=True)
+        loop_obj._selector = _ScriptedSelector([
+            {"hint_id": "1.1", "hint": "Use inclusion-exclusion.", "completed_hints": []},
+            {"hint_id": "1.2", "hint": "Count the complement.", "completed_hints": []},
+        ])
+        out = _run(loop_obj, raw_prompt=_RAW_PROMPT, tools_kwargs=_tools_kwargs_refs(4),
+                   extra_info={})
+
+        refs = parse_reference_texts(_POOL_REF)
+        p1_ids = tokenizer.encode(refs["1.1"] + "\n\n", add_special_tokens=False)
+        p2_ids = tokenizer.encode(refs["1.1"] + "\n\n" + refs["1.2"] + "\n\n",
+                                  add_special_tokens=False)
+        g1 = tokenizer.encode(texts[1], add_special_tokens=False)
+
+        rows = out.extra_fields["restart_segment_rows"]
+        assert len(rows) == 2, [r.get("prefix_len") for r in rows]
+        # segment 1 (no prefix): unchanged legacy shape
+        assert rows[0]["prefix_len"] == 0
+        assert rows[0]["turns"][0][0] == 0
+        # segment 2 (prefixed): full region archived; turn span starts at plen
+        assert rows[1]["prefix_len"] == len(p1_ids)
+        assert rows[1]["response_ids"] == p1_ids + g1, "archived region must include the prefix"
+        assert rows[1]["logprobs"] == [0.0] * len(p1_ids) + [-0.1] * len(g1)
+        assert rows[1]["turns"] == [[len(p1_ids), len(p1_ids), len(p1_ids) + len(g1), 1, 1, 1]]
+        # final row's prefix = both references glued
+        assert out.response_mask[: len(p2_ids)] == [0] * len(p2_ids)
+        assert out.extra_fields["restart_ref_prefix_tokens"] == len(p1_ids) + len(p2_ids)
+    finally:
+        os.environ.pop("HPRL_RESTART_TRAIN_SEGMENTS", None)
+
+
 def test_chain_budget_exhausted(fix):
     tokenizer, make_loop = fix
     texts = [
@@ -547,7 +748,10 @@ def test_prompt_overflow_ends_chain_without_charging(fix):
 def main():
     passed = 0
     for fn in (test_restart_message_with_progress, test_restart_message_without_progress,
-               test_restart_message_empty_hint_placeholder, test_step_adv_value_parity):
+               test_restart_message_empty_hint_placeholder,
+               test_parse_reference_texts, test_build_reference_prefix,
+               test_format_restart_reference_message,
+               test_step_adv_value_parity):
         fn()
         passed += 1
         print(f"PASS {fn.__name__}")
@@ -559,6 +763,8 @@ def main():
     for fn in (test_registry_repin_survives_parent_import,
                test_chain_three_segments, test_chain_step_adv_phantom_records,
                test_pool_wording_delivery, test_pool_wording_off_uses_selector_text,
+               test_reference_prefix_chain, test_reference_prefix_fallback_without_refs,
+               test_reference_prefix_segment_rows,
                test_chain_budget_exhausted,
                test_prompt_overflow_ends_chain_without_charging):
         fn(fix)

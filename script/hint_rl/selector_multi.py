@@ -213,6 +213,87 @@ def pool_hint_texts(pool: Any) -> dict[str, str]:
     return out
 
 
+def parse_reference_texts(reference: Any) -> dict[str, str]:
+    """{hint_id: reference-solution text} for every hint carrying a non-empty
+    ``reference`` field. {} on a parse problem (or when the field is absent).
+
+    ``reference`` is the dataset's ``extra_info.hint_reference`` -- the hint-pool
+    JSON re-emitted with a per-substep ``reference`` (the reference solution's
+    prose for exactly that substep; X.0 guidance hints carry none). Accepts the
+    JSON string or the parsed dict, mirroring ``pool_hint_texts``.
+    """
+    if isinstance(reference, str):
+        if not reference.strip():
+            return {}
+        try:
+            reference = json.loads(reference)
+        except Exception:  # noqa: BLE001
+            return {}
+    if not isinstance(reference, dict):
+        return {}
+    out: dict[str, str] = {}
+    for st in reference.get("steps", []) or []:
+        for h in st.get("hints", []) or []:
+            hid = h.get("hint_id")
+            ref = h.get("reference")
+            if hid is not None and isinstance(ref, str) and ref.strip():
+                out[str(hid)] = ref.strip()
+    return out
+
+
+def build_reference_prefix(
+    hint_order: Iterable[str],
+    done_ids: Iterable[str],
+    new_hint_id: Optional[str],
+    ref_texts: dict[str, str],
+    sep: str = "\n\n",
+) -> Optional[str]:
+    """The assistant-turn PREFIX of a reference-prefix restart (restart_agent_loop):
+    the reference solutions of the completed hints, glued in pool order, followed by
+    the newly selected hint's reference -- i.e. the verified start of a solution,
+    ending exactly at the step the model should carry out next. A trailing ``sep``
+    separates the prefix from the model's continuation.
+
+    Returns None when the SELECTED hint has no reference (the caller then falls
+    back to the user-message restart delivery -- without the new step's reference
+    the prefix cannot deliver the hint). A completed id without a reference (an
+    X.0 guidance hint, or a stray id) is skipped silently: its content is
+    guidance, not solution prose, and the glue stays a coherent solution prefix.
+    """
+    nid = str(new_hint_id) if new_hint_id is not None else None
+    if nid is None:
+        return None
+    new_ref = (ref_texts.get(nid) or "").strip()
+    if not new_ref:
+        return None
+    done = {str(x) for x in (done_ids or ())}
+    done.discard(nid)
+    parts = [
+        (ref_texts.get(str(h)) or "").strip()
+        for h in (hint_order or ())
+        if str(h) in done and (ref_texts.get(str(h)) or "").strip()
+    ]
+    parts.append(new_ref)
+    return sep.join(parts) + sep
+
+
+def format_restart_reference_message(prefix_text: str) -> str:
+    """The transcript record of a REFERENCE-PREFIX restart delivery.
+
+    NOT shown to the policy -- the policy sees the raw reference prefix at the
+    start of its own assistant turn (restart_agent_loop prepends the tokens to
+    the fresh segment's context). This block is appended to ``messages`` as the
+    injected user turn instead, so build_trace shows the selector (and the
+    dumps show the viewer) exactly what solution content was revealed, in the
+    same "[hint given]" slot a multi-turn injection would occupy.
+    """
+    return (
+        "Your next attempt was started for you: it begins with the following "
+        "verified solution progress, which ends at the step to carry out next, "
+        "and you continued from there:\n\n" + (prefix_text or "").strip()
+    )
+
+
 def update_progress_state(
     state: list[dict],
     completed_hints: Iterable[Any] = (),

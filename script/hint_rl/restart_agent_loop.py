@@ -86,6 +86,30 @@
 # prompt that would exceed rollout.prompt_length is NOT emitted (verl would
 # left-truncate away the system prompt + problem): the chain ends instead, the
 # hint is not charged, and ``restart_prompt_overflow`` counts the event.
+#
+# REFERENCE-PREFIX delivery (HPRL_RESTART_REFERENCE_PREFIX, default off; needs a
+# ``hint_reference`` parquet + HintBudgetDataset's create_kwargs plumbing). A
+# restart delivers progress + hint as an ASSISTANT-TURN PREFIX instead of the
+# recap+hint user message: the fresh prompt is the ORIGINAL [system, user
+# (problem)] alone, and the completed hints' reference solutions (pool order) +
+# the newly selected hint's reference are glued (selector_multi.
+# build_reference_prefix) and prepended to the assistant turn -- the model
+# CONTINUES a verified partial solution that ends at the step to do next. The
+# prefix tokens live in the RESPONSE region with response_mask=0 (the injected-
+# user-turn convention): attended, never trained, never painted -- every turn
+# record's span starts at len(response_mask) - len(response_ids) == prefix_len,
+# so the turn advantage is computed AS USUAL and lands only on the model-
+# generated tokens. Selection, ``applied_hints`` (penalty), ``completed``,
+# phantom fail records and the archive flow are IDENTICAL to the user-message
+# delivery; ``messages`` records the delivery as an injected user turn
+# (format_restart_reference_message) for build_trace/dump parity. The prefix
+# consumes response-length budget: a prefix that would leave less than one full
+# per-segment cap (max_turn_tokens) of generation room -- or a hint whose
+# reference is missing (X.0 guidance, or a parquet without hint_reference) --
+# FALLS BACK to the user-message restart for that round (``restart_ref_fallback``
+# counts it; the hint is still delivered + charged). train_segments=all archives
+# carry the full response region + ``prefix_len`` so restart_expand keeps the
+# prefix untrained on segment rows too.
 
 from __future__ import annotations
 
@@ -98,11 +122,14 @@ from verl.experimental.agent_loop.tool_agent_loop import AgentState
 from verl.utils.profiler import simple_timer
 
 from auto_hint_agent_loop import AutoHintAgentLoop, _extract_boxed
-from hint_agent_loop import _as_bool, _dump_selector_call
+from hint_agent_loop import _as_bool, _dump_selector_call, _strip_lone_surrogates
 from hint_selector import _is_selector_decline, build_trace, hint_id_of
 from selector_multi import (
+    build_reference_prefix,
     format_restart_hint_message,
+    format_restart_reference_message,
     locate_quote_end,
+    parse_reference_texts,
     pending_hint_ids,
     pool_hint_texts,
     resolve_selected_hint,
@@ -153,9 +180,19 @@ class RestartHintAgentLoop(AutoHintAgentLoop):
         self.restart_train_segments = str(
             kwargs.get("train_segments", os.environ.get("HPRL_RESTART_TRAIN_SEGMENTS", "final"))
         ).strip().lower()
+        # REFERENCE-PREFIX delivery (default OFF; see module header): restarts
+        # prepend the completed steps' reference solutions + the new hint's
+        # reference to the ASSISTANT turn (response_mask=0, untrained) instead of
+        # building a recap+hint user message. Needs create_kwargs["hint_reference"]
+        # (a hint-reference parquet + HintBudgetDataset's env-gated plumbing);
+        # without it every restart falls back to the user-message delivery.
+        self.restart_reference_prefix = _as_bool(
+            kwargs.get("reference_prefix", os.environ.get("HPRL_RESTART_REFERENCE_PREFIX", "false"))
+        )
         logger.warning(
             "RestartHintAgentLoop: terminate-and-restart (segment-chain) mode ACTIVE "
-            "(pool_wording=%s, train_segments=%s, archive_token_ids=%s, step_adv=%s). "
+            "(pool_wording=%s, train_segments=%s, archive_token_ids=%s, step_adv=%s, "
+            "reference_prefix=%s). "
             "train_segments=all -> every segment becomes a training row (trainer-side "
             "expansion); final -> v0 final-segment row only. Phantom fail records keep "
             "the group value fit chain-exact either way (see module header).",
@@ -163,6 +200,7 @@ class RestartHintAgentLoop(AutoHintAgentLoop):
             self.restart_train_segments,
             self.restart_archive_ids,
             self.step_adv_enable,
+            self.restart_reference_prefix,
         )
 
     # ------------------------------------------------------------------ #
@@ -174,6 +212,12 @@ class RestartHintAgentLoop(AutoHintAgentLoop):
         # every fresh segment prompt. A plain attribute (NOT extra_fields): it
         # must not ride to non_tensor_batch / the dumps.
         agent_data._restart_base_messages = [dict(m) for m in agent_data.messages]
+        # Reference-prefix bookkeeping, plain attributes for the same reason:
+        # the CURRENT segment's untrained assistant-prefix length (0 = none; the
+        # first segment never has one) and the per-rollout {hint_id: reference}
+        # cache (parsed lazily from create_kwargs on the first restart).
+        agent_data._restart_prefix_len = 0
+        agent_data._restart_ref_texts = None
         return state
 
     async def _handle_generating_state(
@@ -187,6 +231,12 @@ class RestartHintAgentLoop(AutoHintAgentLoop):
         ef.setdefault("restart_segments", [])
         ef.setdefault("n_restarts", 0)
         ef.setdefault("restart_prompt_overflow", 0)
+        # Reference-prefix counters, present on every rollout of a restart run
+        # (key-consistency again): restarts that had to FALL BACK to the
+        # user-message delivery, and the total untrained prefix tokens injected.
+        # Both stay 0 when reference_prefix is off.
+        ef.setdefault("restart_ref_fallback", 0)
+        ef.setdefault("restart_ref_prefix_tokens", 0)
         if self.restart_train_segments == "all":
             ef.setdefault("restart_segment_rows", [])
         return state
@@ -203,13 +253,14 @@ class RestartHintAgentLoop(AutoHintAgentLoop):
             include_progress=self.progress_message,
         )
 
-    async def _render_restart_prompt(self, agent_data, block: str):
+    async def _render_restart_prompt(self, agent_data, block):
         """(messages, prompt_ids) of the next segment's fresh prompt.
 
         system turn verbatim from the original conversation; user turn = the
-        original problem text + the recap/hint block. Tokenized exactly like the
-        initial prompt (_handle_pending_state: full template + generation tag,
-        through the surrogate-scrubbing apply_chat_template override).
+        original problem text + the recap/hint block (``block`` None/empty -> the
+        BARE problem, the reference-prefix mode's fresh prompt). Tokenized exactly
+        like the initial prompt (_handle_pending_state: full template + generation
+        tag, through the surrogate-scrubbing apply_chat_template override).
         """
         base = getattr(agent_data, "_restart_base_messages", None) or agent_data.messages
         msgs = []
@@ -221,10 +272,42 @@ class RestartHintAgentLoop(AutoHintAgentLoop):
             elif role == "user" and not user_done:
                 user_done = True
                 content = str(m.get("content") or "").rstrip()
-                msgs.append({"role": "user", "content": content + "\n\n" + block})
+                msgs.append({"role": "user", "content": content + ("\n\n" + block if block else "")})
         schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
         prompt_ids = await self.apply_chat_template(msgs, tools=schemas)
         return msgs, prompt_ids
+
+    # ------------------------------------------------------------------ #
+    # reference-prefix delivery helpers
+    # ------------------------------------------------------------------ #
+    _ref_missing_warned = False  # class-level: warn ONCE per worker process
+
+    def _reference_texts(self, agent_data) -> dict:
+        """{hint_id: reference} for this problem, parsed once per rollout from
+        create_kwargs["hint_reference"] (plumbed by HintBudgetDataset when
+        HPRL_RESTART_REFERENCE_PREFIX is on). {} when the parquet carries no
+        usable field -- every restart then falls back to the user-message
+        delivery (warned once per worker, counted per chain)."""
+        cached = getattr(agent_data, "_restart_ref_texts", None)
+        if cached is not None:
+            return cached
+        refs = parse_reference_texts(self._create_kwargs(agent_data).get("hint_reference"))
+        if not refs and not RestartHintAgentLoop._ref_missing_warned:
+            RestartHintAgentLoop._ref_missing_warned = True
+            logger.warning(
+                "RestartHintAgentLoop: reference_prefix is ON but this problem has no usable "
+                "create_kwargs['hint_reference'] (missing field, bad JSON, or a parquet without "
+                "references). Affected restarts FALL BACK to the user-message delivery "
+                "(restart_ref_fallback counts them). Warned once per worker."
+            )
+        agent_data._restart_ref_texts = refs
+        return refs
+
+    def _reference_prefix_ids(self, prefix_text: str) -> list:
+        """Tokenize the assistant-turn prefix (no special tokens -- it continues
+        the generation-tagged fresh prompt), surrogate-scrubbed like every other
+        injected text (the lone-surrogate tokenizer crash, hint_agent_loop)."""
+        return list(self.tokenizer.encode(_strip_lone_surrogates(prefix_text), add_special_tokens=False))
 
     # ------------------------------------------------------------------ #
     # segment archive
@@ -250,6 +333,10 @@ class RestartHintAgentLoop(AutoHintAgentLoop):
         ef = agent_data.extra_fields
         seg_end = len(agent_data.response_mask)
         live_turns = ef.get("step_adv_turns", []) or []
+        # THIS segment's own untrained reference prefix (reference_prefix mode;
+        # 0 in user-message delivery and always on segment 1). Its generated span
+        # is [plen, seg_end) -- every record below must exclude the prefix.
+        plen = int(getattr(agent_data, "_restart_prefix_len", 0) or 0)
 
         def _is_phantom(t) -> bool:
             return int(t[0]) == 0 and int(t[1]) == 0 and int(t[2]) == 0
@@ -257,12 +344,15 @@ class RestartHintAgentLoop(AutoHintAgentLoop):
         seg = {
             "seg_index": len(ef.get("restart_segments", [])),
             "n_tokens": len(agent_data.response_ids),
+            "prefix_tokens": plen,
             "pred": _extract_boxed(turn_text),
             "state_start": int(state_start),
             "state_end": int(state_end),
             "boundary": int(boundary),
             "next_hint_id": (str(next_hint_id) if next_hint_id is not None else None),
-            # the exact user block the NEXT segment's prompt appends (recap+hint)
+            # the exact user block recorded for the NEXT segment's delivery
+            # (recap+hint appended to its prompt, or -- reference_prefix mode --
+            # the format_restart_reference_message record of its assistant prefix)
             "next_user_message": next_block,
             "response": turn_text,
             "turn_lens": list(ef.get("turn_lens", []) or []),
@@ -272,7 +362,10 @@ class RestartHintAgentLoop(AutoHintAgentLoop):
         if self.restart_archive_ids:
             n_resp = len(agent_data.response_mask)
             seg["prompt_ids"] = list(agent_data.prompt_ids[: len(agent_data.prompt_ids) - n_resp])
-            seg["response_ids"] = list(agent_data.response_ids)
+            # the full RESPONSE REGION (reference prefix included), so prompt_ids
+            # + response_ids reassemble the segment's exact live context. ==
+            # agent_data.response_ids whenever there is no prefix.
+            seg["response_ids"] = list(agent_data.prompt_ids[len(agent_data.prompt_ids) - n_resp:])
         ef.setdefault("restart_segments", []).append(seg)
         # train_segments=all: the exact tensors the trainer needs to materialize
         # this segment as its OWN training row. Separate key from the (dumped)
@@ -281,12 +374,17 @@ class RestartHintAgentLoop(AutoHintAgentLoop):
             n_resp = len(agent_data.response_mask)
             ef.setdefault("restart_segment_rows", []).append({
                 "prompt_ids": list(agent_data.prompt_ids[: len(agent_data.prompt_ids) - n_resp]),
-                "response_ids": list(agent_data.response_ids),
+                # full response region (prefix + generation): the sampling
+                # logprobs below align with it (prefix rides 0.0s), and
+                # restart_expand re-zeroes the loss mask over prefix_len.
+                "response_ids": list(agent_data.prompt_ids[len(agent_data.prompt_ids) - n_resp:]),
                 "logprobs": list(agent_data.response_logprobs or []),
-                # the segment's step-adv record, segment-relative coords: an
-                # archived segment always FAILED its next hint (that is why the
-                # chain restarted), advancing state_start -> state_end.
-                "turns": [[0, int(boundary), n_resp, int(state_start), int(state_end), 1]],
+                "prefix_len": plen,
+                # the segment's step-adv record, segment-relative coords over the
+                # GENERATED span [plen, n_resp): an archived segment always
+                # FAILED its next hint (that is why the chain restarted),
+                # advancing state_start -> state_end.
+                "turns": [[plen, int(boundary), n_resp, int(state_start), int(state_end), 1]],
             })
         ef["step_adv_turns"] = [list(t) for t in live_turns if _is_phantom(t)]
         ef["disable_spans"] = []
@@ -450,21 +548,25 @@ class RestartHintAgentLoop(AutoHintAgentLoop):
             return AgentState.TERMINATED
 
         # ---- RESTART tail (replaces the parent's user-turn injection) --------
-        # This round's newly self-completed hint ids (needed both for the recap
-        # below and, later, the ``completed`` status update).
+        # This round's newly self-completed hint ids (needed both for the recap /
+        # reference glue below and, later, the ``completed`` status update).
         newly = [
             str(c.get("hint_id"))
             for c in completed_hints
             if isinstance(c, dict) and c.get("hint_id") is not None
         ]
+        # The authoritative completed set at THIS delivery (prior ``completed`` +
+        # this round's ``newly``, minus the hint being given now) -- drives both
+        # the pool-worded recap and the reference-prefix glue, in pool order.
+        done_ids = {str(x) for x in completed} | set(newly)
+        done_ids.discard(str(hid))
 
         # POOL WORDING (restart default -- see __init__): the delivered hint and
-        # the recap lines use the hint set's ORIGINAL sentences. The recap is
-        # rebuilt from the authoritative completed set (prior ``completed`` +
-        # this round's ``newly``, minus the hint being given now) in pool order
-        # -- the same ids/order the selector-worded progress_state would carry,
-        # just with canonical text. Falls back to the selector's text for an id
-        # the pool cannot resolve (should not happen after resolve_selected_hint).
+        # the recap lines use the hint set's ORIGINAL sentences, rebuilt from
+        # ``done_ids`` in pool order -- the same ids/order the selector-worded
+        # progress_state would carry, just with canonical text. Falls back to the
+        # selector's text for an id the pool cannot resolve (should not happen
+        # after resolve_selected_hint).
         deliver_text = hint_text
         recap_state = progress_state
         if self.restart_pool_wording:
@@ -472,39 +574,80 @@ class RestartHintAgentLoop(AutoHintAgentLoop):
             _pt = pool_texts.get(str(hid)) if hid is not None else None
             if isinstance(_pt, str) and _pt.strip():
                 deliver_text = _pt.strip()
-            done_ids = {str(x) for x in completed} | set(newly)
-            done_ids.discard(str(hid))
             recap_state = [
                 {"hint_id": h, "text": str(pool_texts.get(h, "")).strip()}
                 for h in hint_order
                 if h in done_ids and str(pool_texts.get(h, "")).strip()
             ]
 
-        # Render the fresh prompt FIRST and guard its length: an over-long prompt
-        # is LEFT-TRUNCATED inside AgentLoopBase.apply_chat_template (system +
-        # problem cut away, recap kept) and comes back at exactly prompt_length
-        # -- so the guard must be >=, not >. Refuse to restart instead: the chain
-        # ends on this segment and the hint is NOT charged (mirrors the
-        # pool-exhausted benign stop). The >= also refuses an exactly-at-cap
-        # prompt (indistinguishable from a clipped one); that lost margin is one
-        # token and the conservative side is the safe one.
-        block = self._restart_hint_block(deliver_text, recap_state)
-        new_msgs, new_prompt_ids = await self._render_restart_prompt(agent_data, block)
-        if len(new_prompt_ids) >= self.prompt_length:
-            agent_data.extra_fields["restart_prompt_overflow"] = (
-                agent_data.extra_fields.get("restart_prompt_overflow", 0) + 1
+        # REFERENCE-PREFIX delivery (see module header): glue the completed
+        # steps' reference solutions + the selected hint's reference and prepend
+        # them to the next segment's ASSISTANT turn over the BARE problem prompt.
+        # Falls back to the user-message delivery below when the selected hint
+        # has no reference (X.0 guidance / a parquet without hint_reference), or
+        # the prefix would not leave a full per-segment cap of generation room,
+        # or (degenerate) the bare prompt itself no longer fits.
+        prefix_ids: list = []
+        block = None
+        new_msgs = None
+        new_prompt_ids = None
+        if self.restart_reference_prefix:
+            prefix_text = build_reference_prefix(
+                hint_order, done_ids, hid, self._reference_texts(agent_data)
             )
-            agent_data.metrics["restart_prompt_overflow"] = (
-                agent_data.metrics.get("restart_prompt_overflow", 0) + 1
-            )
-            logger.warning(
-                "restart prompt overflow (request=%s): %d > prompt_length %d -- chain ends, hint not charged",
-                agent_data.request_id, len(new_prompt_ids), self.prompt_length,
-            )
-            self._dump(agent_data, turn_start, turn_end, problem, trace, completed, selection, err,
-                       boundary=boundary, completed_hints=completed_hints,
-                       selector_raw=_raw, selector_prompt=_prompt)
-            return AgentState.TERMINATED
+            if prefix_text is not None:
+                base_msgs, base_prompt_ids = await self._render_restart_prompt(agent_data, None)
+                cand_ids = self._reference_prefix_ids(prefix_text)
+                # The prefix rides the RESPONSE budget: require it to leave at
+                # least one full per-segment cap of room, so the continuation is
+                # never squeezed below what every other segment gets (and a cap
+                # hit keeps its per_turn classification -- classify_length_cut
+                # flips to the neutral "global" label once room < max_turn_tokens).
+                room_after = self.response_length - len(cand_ids)
+                need = self.max_turn_tokens if (self.max_turn_tokens or 0) > 0 else 1
+                if len(base_prompt_ids) < self.prompt_length and room_after >= need:
+                    new_msgs, new_prompt_ids = base_msgs, base_prompt_ids
+                    prefix_ids = cand_ids
+                    block = format_restart_reference_message(prefix_text)
+            if not prefix_ids:
+                # Delivery still happens -- via the user-message path below; the
+                # hint is charged as usual. Counted so a fallback-heavy run
+                # (wrong parquet, tight response budget) is visible.
+                agent_data.extra_fields["restart_ref_fallback"] = (
+                    agent_data.extra_fields.get("restart_ref_fallback", 0) + 1
+                )
+                agent_data.metrics["restart_ref_fallback"] = (
+                    agent_data.metrics.get("restart_ref_fallback", 0) + 1
+                )
+
+        # USER-MESSAGE delivery (the default path, and the reference-prefix
+        # fallback). Render the fresh prompt FIRST and guard its length: an
+        # over-long prompt is LEFT-TRUNCATED inside AgentLoopBase.
+        # apply_chat_template (system + problem cut away, recap kept) and comes
+        # back at exactly prompt_length -- so the guard must be >=, not >.
+        # Refuse to restart instead: the chain ends on this segment and the hint
+        # is NOT charged (mirrors the pool-exhausted benign stop). The >= also
+        # refuses an exactly-at-cap prompt (indistinguishable from a clipped
+        # one); that lost margin is one token and the conservative side is the
+        # safe one.
+        if new_prompt_ids is None:
+            block = self._restart_hint_block(deliver_text, recap_state)
+            new_msgs, new_prompt_ids = await self._render_restart_prompt(agent_data, block)
+            if len(new_prompt_ids) >= self.prompt_length:
+                agent_data.extra_fields["restart_prompt_overflow"] = (
+                    agent_data.extra_fields.get("restart_prompt_overflow", 0) + 1
+                )
+                agent_data.metrics["restart_prompt_overflow"] = (
+                    agent_data.metrics.get("restart_prompt_overflow", 0) + 1
+                )
+                logger.warning(
+                    "restart prompt overflow (request=%s): %d > prompt_length %d -- chain ends, hint not charged",
+                    agent_data.request_id, len(new_prompt_ids), self.prompt_length,
+                )
+                self._dump(agent_data, turn_start, turn_end, problem, trace, completed, selection, err,
+                           boundary=boundary, completed_hints=completed_hints,
+                           selector_raw=_raw, selector_prompt=_prompt)
+                return AgentState.TERMINATED
 
         # Record the GIVEN hint for the per-hint penalty (chain-cumulative).
         # ``hint`` = the text actually DELIVERED (pool sentence under
@@ -553,11 +696,23 @@ class RestartHintAgentLoop(AutoHintAgentLoop):
         # FRESH SEGMENT: replace the live context wholesale. run() finalizes the
         # row as prompt_ids[-len(response_mask):] vs the rest, so after this the
         # eventual row is (fresh prompt, final segment's attempt) -- earlier
-        # segments exist only in the archive.
-        agent_data.prompt_ids = list(new_prompt_ids)
+        # segments exist only in the archive. In reference-prefix mode the glued
+        # reference tokens go AFTER the generation tag as the start of the
+        # assistant turn: RESPONSE-region tokens with mask 0 (the injected-user-
+        # turn convention -- attended, never trained, never painted; 0.0
+        # logprobs keep the sampling-logprob alignment). Generation continues
+        # from them, and every later turn record's span starts past them
+        # (turn_start = len(response_mask) - len(response_ids) == prefix_len).
+        lp_on = bool(agent_data.response_logprobs)  # read BEFORE the reset below
+        agent_data.prompt_ids = list(new_prompt_ids) + list(prefix_ids)
         agent_data.response_ids = []
-        agent_data.response_mask = []
-        agent_data.response_logprobs = []
+        agent_data.response_mask = [0] * len(prefix_ids)
+        agent_data.response_logprobs = [0.0] * len(prefix_ids) if (lp_on and prefix_ids) else []
+        agent_data._restart_prefix_len = len(prefix_ids)
+        if prefix_ids:
+            agent_data.extra_fields["restart_ref_prefix_tokens"] = (
+                agent_data.extra_fields.get("restart_ref_prefix_tokens", 0) + len(prefix_ids)
+            )
         agent_data.extra_fields["n_restarts"] = (
             agent_data.extra_fields.get("n_restarts", 0) + 1
         )

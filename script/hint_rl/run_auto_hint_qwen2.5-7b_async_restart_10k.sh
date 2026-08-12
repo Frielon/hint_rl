@@ -115,6 +115,16 @@ export HPRL_RESTART_POOL_WORDING=${HPRL_RESTART_POOL_WORDING:-true}
 # group fit, final rows keep the chain-exact phantom fit). =final -> v0
 # final-segment-only rows. Requires step_adv + bypass_mode (both on here).
 export HPRL_RESTART_TRAIN_SEGMENTS=${HPRL_RESTART_TRAIN_SEGMENTS:-all}
+# REFERENCE-PREFIX delivery (restart-only; forwarded via run_hprl_async.sh
+# HPRL_RESTART_ENV): =true delivers progress+hint by PREFIXING the completed
+# steps' reference solutions + the new hint's reference to the ASSISTANT turn
+# (untrained response_mask=0 tokens; the fresh prompt is the bare problem) --
+# turn adv unchanged, gradient only on the model's continuation. NEEDS a
+# hint_reference parquet (dataset/*-hint-reference.parquet); this wrapper's
+# dolci-rl-zero-9517 set has none, so =true here would fall back to the
+# user-message restart on every chain. Use the dedicated wrapper instead:
+# run_auto_hint_qwen2.5-7b_async_restart_refprefix.sh.
+export HPRL_RESTART_REFERENCE_PREFIX=${HPRL_RESTART_REFERENCE_PREFIX:-false}
 
 # --- train parquet: identical to the parent wrapper (header pt. 4) -------------
 # export TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dolci-instruct-rl-492-auto-hint-qwen3-4b-le1of8.parquet"}

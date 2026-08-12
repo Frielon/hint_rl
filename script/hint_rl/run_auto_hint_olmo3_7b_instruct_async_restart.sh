@@ -57,7 +57,7 @@ HINT_RL_HOME=${HINT_RL_HOME:-"$(cd "${SCRIPT_DIR}/../.." && pwd)"}
 BASE_HOME=${BASE_HOME:-"$(cd "${HINT_RL_HOME}/../.." && pwd)"}
 
 # --- base model: Olmo-3-7B-Instruct, as-is (header pt. 1) ----------------------
-export MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Olmo-3-7B-Instruct"}
+export MODEL_PATH=${MODEL_PATH:-"${BASE_HOME}/model/Olmo-3-7B-Instruct-SFT"}
 if [ ! -f "${MODEL_PATH}/config.json" ]; then
     echo "[run_auto_hint_olmo_async_restart] ERROR: model dir not found: ${MODEL_PATH}" >&2
     exit 1
@@ -73,7 +73,7 @@ export AGENT_LOOP_CONFIG_PATH=${AGENT_LOOP_CONFIG_PATH:-"${SCRIPT_DIR}/hint_agen
 # restart_prompt_overflow counter). Live context <= 4096 + 20480 = 24576 <<
 # the 65536 YaRN ceiling.
 export max_prompt_length=${max_prompt_length:-4096}
-export max_response_length=${max_response_length:-20480}
+export max_response_length=${max_response_length:-16384}
 
 # --- async pipeline + trainer-throughput knobs ---------------------------------
 # Base layout = 4B-wrapper parity (the 2026-08-04/05 throughput fixes, devlog):
@@ -138,7 +138,7 @@ export HPRL_RESTART_POOL_WORDING=${HPRL_RESTART_POOL_WORDING:-true}
 export HPRL_RESTART_TRAIN_SEGMENTS=${HPRL_RESTART_TRAIN_SEGMENTS:-all}
 
 # --- train parquet: data-matched to the 4B restart arm (header pt. 3) ----------
-export TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dolci-instruct-rl-492-auto-hint-qwen3-4b-le1of8.parquet"}
+export TRAIN_FILE=${TRAIN_FILE:-"${HINT_RL_HOME}/dataset/dolci-rl-zero-9517-auto-hint.parquet"}
 # --- trainer resume: DEFAULT = fresh (header "START / RESUME"). ${VAR-...}
 #     (not :-) on purpose so an explicitly exported empty value stays fresh too.
 export RESUME_FROM_PATH=${RESUME_FROM_PATH-}
@@ -167,7 +167,7 @@ export HINT_GUIDANCE_FREE=${HINT_GUIDANCE_FREE:-true}
 export HPRL_STEP_ADV=${HPRL_STEP_ADV:-true}
 export HPRL_STEP_ADV_SCALE=${HPRL_STEP_ADV_SCALE:-1.0}
 export HPRL_STEP_ADV_NORM=${HPRL_STEP_ADV_NORM:-true}
-export HPRL_OVERLONG_PENALTY=${HPRL_OVERLONG_PENALTY:-0.1}
+export HPRL_OVERLONG_PENALTY=${HPRL_OVERLONG_PENALTY:-0.05}
 export HPRL_OVERLONG_PENALTY_TYPE=${HPRL_OVERLONG_PENALTY_TYPE:-value}
 export HPRL_STEP_ADV_WHOLE_TURN=${HPRL_STEP_ADV_WHOLE_TURN:-true}
 # Absolute -P_over on truncation tails inside ZEROED (no-correct) groups -- the
@@ -180,7 +180,7 @@ export HPRL_OVERLONG_ZEROED=${HPRL_OVERLONG_ZEROED:-true}
 export HPRL_LR_SCHEDULER=${HPRL_LR_SCHEDULER:-constant}
 
 # --- PER-SEGMENT generation-length cap: keep == max_response_length ------------
-export HPRL_MAX_TURN_TOKENS=${HPRL_MAX_TURN_TOKENS:-20480}
+export HPRL_MAX_TURN_TOKENS=${HPRL_MAX_TURN_TOKENS:-16384}
 
 # --- k-pack / budget-grouped sampling: async-unsupported, pinned off -----------
 export HPRL_KPACK_ENABLE=false
@@ -191,8 +191,8 @@ export HPRL_RATCHET_MODE=${HPRL_RATCHET_MODE:-adaptive}
 export HPRL_ALLOW_DECREASE=${HPRL_ALLOW_DECREASE:-false}
 
 # --- RESTART DELTA 3: distinct run labels --------------------------------------
-export project_name=${project_name:-'HPRL-AutoHint-Olmo-3-7B-Instruct-async'}
-export exp_name=${exp_name:-"HPRL-AutoHint-Olmo-3-7B-Instruct-async-restart-dolci-instruct-492-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
+export project_name=${project_name:-'HPRL-AutoHint-Olmo-3-7B-Instruct-SFT-async'}
+export exp_name=${exp_name:-"HPRL-AutoHint-Olmo-3-7B-Instruct-SFT-async-restart-dolci-10k-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
 
 echo "[run_auto_hint_olmo_async_restart] TERMINATE-AND-RESTART auto-hint mode ON  (model=${MODEL_PATH})"
 echo "[run_auto_hint_olmo_async_restart]   agent registry: ${AGENT_LOOP_CONFIG_PATH} (auto_hint -> RestartHintAgentLoop)"

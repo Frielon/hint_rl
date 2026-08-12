@@ -19,6 +19,8 @@ wandb/
 stephint/result/*
 stephint/*.parquet
 stephint_data/*.parquet
+
+reference_gen/
 # --- python ---
 __pycache__/
 *.py[cod]
