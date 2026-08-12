@@ -2,6 +2,8 @@
 data_pipeline/
 
 # --- secrets ---
+.envrc
+script/hint_rl/api_keys.sh
 
 # --- training artifacts / generated outputs ---
 logs/
