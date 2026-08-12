@@ -335,6 +335,37 @@ def hprl_update_budgets(
         metrics["hprl/turn_truncated"] = float(tt_total)
         metrics["hprl/turn_truncated_frac"] = float(tt_total / n) if n else 0.0
 
+    # -------- first-turn generation length ----------------------------------
+    # Generated tokens of each rollout's FIRST turn -- the unaided first attempt,
+    # before any hint. A restarted chain archives earlier segments, so the final
+    # row's own turn_lens describes only its LAST segment: read segment 0 from
+    # restart_segments when the chain restarted, else the row's live turn_lens[0].
+    # (turn_lens entries are pure generation counts; reference prefixes excluded.)
+    first_lens = []
+    tl_arr = ntb.get("turn_lens")
+    rs_arr = ntb.get("restart_segments")
+    for i in range(n):
+        v = None
+        segs = _to_py(rs_arr[i]) if rs_arr is not None else None
+        if segs:
+            seg0 = segs[0]
+            if isinstance(seg0, dict):
+                stl = _to_py(seg0.get("turn_lens")) or []
+                if len(stl):
+                    v = stl[0]
+                elif seg0.get("n_tokens") is not None:
+                    v = float(seg0["n_tokens"]) - float(seg0.get("prefix_tokens") or 0)
+        if v is None and tl_arr is not None:
+            tl = _to_py(tl_arr[i])
+            if tl is not None and len(tl):
+                v = tl[0]
+        if v is not None:
+            first_lens.append(float(v))
+    if first_lens:
+        metrics["hprl/first_turn_len_mean"] = float(sum(first_lens) / len(first_lens))
+        metrics["hprl/first_turn_len_max"] = float(max(first_lens))
+        metrics["hprl/first_turn_len_min"] = float(min(first_lens))
+
     # -------- out-of-hints rate: pool-exhausted hint calls ------------------
     # Hint calls that found an EMPTY candidate pool (every hint already surfaced) and
     # got the no-hint no-op instead of a selector round-trip. Kept DISTINCT from

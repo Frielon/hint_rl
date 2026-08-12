@@ -716,6 +716,45 @@ def test_truncation_frac_metrics():
 
 
 # --------------------------------------------------------------------------- #
+# first-turn generation length (hint_budget_callback.hprl_update_budgets)
+# --------------------------------------------------------------------------- #
+def test_first_turn_len_metrics():
+    # first_turn_len = the unaided FIRST attempt's generated tokens. A plain
+    # multi-turn row reads its own turn_lens[0]; a RESTARTED chain's final row
+    # describes only its last segment, so segment 0 comes from the
+    # restart_segments archive (its turn_lens preferred, n_tokens -
+    # prefix_tokens fallback).
+    ntb = {
+        "extra_info": [{"problem_id": "p1"}] * 4,
+        "acc": [0.0, 0.0, 0.0, 1.0],
+        "num_hints": [1, 0, 1, 1],
+        "turn_lens": [[100, 40], [200], [999], [7]],
+        "restart_segments": [
+            None,                                        # no archive -> live turn_lens[0]
+            [],                                          # never restarted -> live turn_lens[0]
+            [{"turn_lens": [300, 5], "n_tokens": 12}],   # archive wins over live (999)
+            [{"n_tokens": 60, "prefix_tokens": 10}],     # no archived turn_lens -> n_tokens fallback
+        ],
+    }
+    tmpdir = tempfile.mkdtemp()
+    path = os.path.join(tmpdir, "budget_state.json")
+    try:
+        bm = BudgetManager(path=path, default_budget=8, min_budget=0, max_budget=8, ratchet_mode="adaptive")
+        m = hprl_update_budgets(SimpleNamespace(non_tensor_batch=ntb), bm)
+        # firsts = [100, 200, 300, 50]
+        assert m["hprl/first_turn_len_mean"] == 162.5, m
+        assert m["hprl/first_turn_len_max"] == 300.0, m
+        assert m["hprl/first_turn_len_min"] == 50.0, m
+        # no turn_lens / restart_segments at all (non-agent-loop batch) -> skipped, no crash.
+        ntb2 = {"extra_info": [{"problem_id": "p1"}], "acc": [1.0], "num_hints": [0]}
+        m2 = hprl_update_budgets(SimpleNamespace(non_tensor_batch=ntb2), bm)
+        assert not any(k.startswith("hprl/first_turn_len") for k in m2), m2
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 # guidance-free (X.0 hint penalty -> 0) (hint_penalty.compute_hint_penalties)
 # --------------------------------------------------------------------------- #
 _PENALTY_POOL = [
