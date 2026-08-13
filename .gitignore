@@ -54,6 +54,8 @@ custom_data/
 
 stephint_data/result/
 
+tools/push_mirror.sh
+
 # --- large / generated artifacts (regenerable, multi-GB; never commit) ---
 # merged checkpoint weights + tokenizers (each shard ~4.7GB)
 eval/merged/
