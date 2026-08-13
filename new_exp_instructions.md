@@ -6,4 +6,8 @@
 
 4. For a test run, submit the script <your-dir>/project/hint_rl/script/hint_rl/launch_hprl_cluster_openai_async_restart_olmo_test.sh; it requires 24 gpus. If wandb login successfully, test is passed, and you can stop the run.
 
-5. For the real resume run, submit the script <your-dir>/project/hint_rl/script/hint_rl/launch_hprl_cluster_openai_async_restart_olmo.sh
+5. For the real resume run, submit the script <your-dir>/project/hint_rl/script/hint_rl/launch_hprl_cluster_openai_async_restart_olmo.sh; It requires 48 gpus for async training
+
+Now the training progress: 16k response length on 10k dataset.
+
+![Olmo-training](olmo-exp.png)
