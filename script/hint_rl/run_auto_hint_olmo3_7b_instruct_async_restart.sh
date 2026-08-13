@@ -192,7 +192,9 @@ export HPRL_ALLOW_DECREASE=${HPRL_ALLOW_DECREASE:-false}
 
 # --- RESTART DELTA 3: distinct run labels --------------------------------------
 export project_name=${project_name:-'HPRL-AutoHint-Olmo-3-7B-Instruct-SFT-async'}
-export exp_name=${exp_name:-"HPRL-AutoHint-Olmo-3-7B-Instruct-SFT-async-restart-dolci-10k-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
+# export exp_name=${exp_name:-"HPRL-AutoHint-Olmo-3-7B-Instruct-SFT-async-restart-dolci-10k-$(TZ='America/Los_Angeles' date +%Y%m%d-%H%M%S)"}
+export exp_name=${exp_name:-"HPRL-AutoHint-Olmo-3-7B-Instruct-SFT-async-restart-dolci-10k-20260807-020934"}
+
 
 echo "[run_auto_hint_olmo_async_restart] TERMINATE-AND-RESTART auto-hint mode ON  (model=${MODEL_PATH})"
 echo "[run_auto_hint_olmo_async_restart]   agent registry: ${AGENT_LOOP_CONFIG_PATH} (auto_hint -> RestartHintAgentLoop)"
